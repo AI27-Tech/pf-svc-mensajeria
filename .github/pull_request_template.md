@@ -1,7 +1,9 @@
 <!--
-Plantilla de Pull Request de portal-cliente (pf-web-frontend-client).
-Rellena las secciones que apliquen y borra las que no. El objetivo es que
-quien revisa entienda el porqué del cambio y pueda verificarlo sin adivinar.
+Plantilla de Pull Request del backend de AI27 (repos Go: pf-svc-* y pf-pkg-*).
+Rellena las secciones que apliquen y borra las que no. El objetivo es que quien
+revisa entienda el porqué del cambio y pueda verificarlo sin adivinar. La
+autoridad de arquitectura vive en docs/ del workspace de producto (ADR,
+decision-log, 00-indice del scaffold); no la reexpliques, enlázala.
 -->
 
 ## Resumen
@@ -10,82 +12,90 @@ quien revisa entienda el porqué del cambio y pueda verificarlo sin adivinar.
 
 ## Contexto
 
-<!--
-Enlaza el issue, la decisión abierta o el documento de arquitectura relevante.
-La autoridad vive en docs/arquitectura/ del workspace padre; no la reexpliques,
-enlázala.
--->
+<!-- Enlaza el issue/spec, el ADR o la decisión (DEC-xxx) que gobierna el cambio. -->
 
-- Issue / spec relacionado:
-- Decisión de arquitectura afectada (ADR / decisión abierta del README):
+- Issue / spec / prompt de scaffolding:
+- ADR / decisión afectada (DEC-xxx):
 
 ## Tipo de cambio
 
 - [ ] Feature
 - [ ] Bugfix
 - [ ] Refactor (sin cambio de comportamiento)
-- [ ] Estilos / UI
+- [ ] Migración de base de datos
+- [ ] Contrato (consumo de una nueva versión de pf-pkg-contracts)
 - [ ] Documentación
 - [ ] Tooling / build / CI
 - [ ] Otro:
 
 ## Cambios
 
-<!-- Lista concreta de lo que cambió. Agrupa por dominio o por capa si ayuda. -->
+<!-- Lista concreta de lo que cambió. Agrupa por paquete o por capa si ayuda. -->
 
 -
 
-## Invariantes del cliente
+## Invariantes de arquitectura
 
 <!--
-Marca solo lo que este PR toca. Si tocas alguna, explica cómo se mantiene.
-Ver README > "Reglas del cliente, y cómo están hechas cumplir".
+Marca solo lo que este PR toca y explica cómo se mantiene. Ver 00-indice.md
+(reglas 1-10) y los ADR 17/29. Si no aplica, marca la primera casilla.
 -->
 
 - [ ] No afecta ninguna invariante documentada.
-- [ ] **P4** — un solo parser de tracking para pull y push (`lib/tracking/parseTrackingPayload.ts`).
-- [ ] **P5** — orden y dedupe por secuencia de dominio, no por el `seq` del sobre.
-- [ ] **P10** — el navegador no selecciona canales arbitrarios; el filtrado por audiencia es del servidor.
-- [ ] La ausencia por degradación no se colapsa a `null` (`Fresco<T>` conserva sus tres estados).
-- [ ] El fetch se mantiene en la frontera de la ruta; las `*Section` siguen siendo presentacionales.
+- [ ] **I1 — un pool por rol de BD**, nunca compartido entre roles (ni dentro de `core`).
+- [ ] **I2 — ninguna arista no declarada** en `tools/arch-test/reglas.yaml`; no se sustituye por una llamada directa "porque están en el mismo binario".
+- [ ] **I3 — paridad de adaptadores** (en proceso y HTTP comparten presupuesto de tiempo, cancelación y taxonomía de error).
+- [ ] **I4 — no se importa `internal/` de otro módulo**; solo su superficie pública (`New`/`Routes`/`Workers`/`Consultas`) y sus `ports.go`.
+- [ ] **I5 — `cmd/api` arranca solo** y sirve `/health` y `/ready` sin `core`.
+- [ ] **Contrato primero** — ningún tipo de wire, ruta ni evento escrito a mano; lo que falte en la versión fijada de `pf-pkg-contracts` se reporta, no se inventa.
+- [ ] **Sin aristas salientes nuevas** fuera de las declaradas (y de la restringida a `identidad` para revocación, DEC-051/058).
 
-## Decisiones abiertas
+## Decisiones abiertas / brechas
 
 <!--
-¿Este PR toca alguna de las decisiones abiertas del README? ¿Introduce un supuesto
-nuevo sobre el contrato del backend, la custodia del token, el stream, etc.?
-Si es así, dilo aquí y deja el TODO en su sitio en lugar de resolverlo en silencio.
+¿El PR topa con una decisión no cerrada o una brecha de contrato? Dilo aquí y
+deja el TODO en su sitio en lugar de resolverlo en silencio. Lo que queda en
+espera de ADR 32 (broker, IdP, orquestador) también va aquí.
 -->
 
 -
+
+## Base de datos
+
+<!-- Borra si el PR no toca el esquema. -->
+
+- [ ] Las migraciones se aplican con el rol dueño del esquema; no agregan ningún `GRANT` fuera de ese rol.
+- [ ] Los datos se versionan por vigencia donde corresponde; sin `UPDATE` que pise historia ni `DELETE` en firme (P8).
+
+## Eventos / bus
+
+<!-- Borra si el PR no toca eventos. -->
+
+- [ ] El evento se escribe en la `outbox` en la **misma transacción** que el cambio de dominio (P17).
+- [ ] El tipo/versión está en el registro del contrato; el consumidor es idempotente por `evento_id` (`inbox`).
 
 ## Cómo se probó
 
 <!-- Comandos ejecutados y su resultado. No basta con que compile. -->
 
-- [ ] `pnpm run typecheck`
-- [ ] `pnpm run lint`
-- [ ] `pnpm run format:check`
-- [ ] `pnpm run test`
-- [ ] `pnpm run test:e2e`
-- [ ] Verificado a mano en `pnpm run dev:mock` (cliente@demo.ai27 / demo1234)
+- [ ] `go build ./...`
+- [ ] `go vet ./...`
+- [ ] `go test ./...` (o `-race` donde aplique)
+- [ ] `go run github.com/AI27-Tech/pf-pkg-platform-go/tools/arch-test@<version> .`
+- [ ] `gofmt` limpio
 
 Notas de la verificación:
 
-## Capturas / evidencia
-
-<!-- Para cambios de UI: antes / después. Borra si no aplica. -->
-
 ## CHANGELOG
 
-<!-- El repo exige registrar cada cambio relevante. Ver .kiro/steering/changelog.md -->
+<!-- El repo exige registrar cada cambio. Ver .kiro/steering/changelog.md -->
 
-- [ ] Agregué la entrada correspondiente en `CHANGELOG.md` (resumen + archivos modificados, entrada más reciente al inicio).
+- [ ] Agregué la entrada en `CHANGELOG.md` (fecha+hora, resumen, cambios y archivos modificados; la más reciente al inicio).
 
 ## Checklist
 
-- [ ] El cambio se limita a la audiencia cliente (nada de `panel-admin` / `Audiencia: Interno`).
-- [ ] No introduje librerías prohibidas (zustand, redux, jotai, swr, framer-motion, next-auth, aws-amplify, Radix, MUI, Chakra).
-- [ ] No importo `lib/api/generated/*` fuera de `src/lib/`.
-- [ ] Comentarios y docstrings en español; sustantivos de dominio en su forma canónica (`viaje`, `bitacora`, `conversacion`, `Audiencia`, `Fresco`, `Sobre`).
-- [ ] No commiteé artefactos generados (`src/routeTree.gen.ts`, `src/lib/api/generated/`).
+- [ ] Identificadores en inglés salvo sustantivos de dominio en español (`viaje`, `catalogos`, `operacion`, `bitacora`, `asignacion`, `custodio`, `Audiencia`, …); comentarios, README y commits en español (México).
+- [ ] `go.mod` fija versiones **exactas**; sin `replace` a rutas locales ni `go.work` versionado.
+- [ ] Ningún `pf-svc-*` importa otro `pf-svc-*` (excepto `pf-svc-core`).
+- [ ] No commiteé binarios ni artefactos generados.
+- [ ] Sin secretos, DSN ni URLs hardcodeadas.
