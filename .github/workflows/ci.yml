@@ -1,0 +1,80 @@
+# CI de pf-svc-mensajeria. Ramas de repo-convention.
+#
+# Los repos AI27-Tech/* son privados, así que resolver módulos exige un token
+# con lectura de pf-pkg-contracts y pf-pkg-platform-go. Se inyecta por el secreto
+# de repo GH_PAT (un PAT clásico con scope repo). GOPRIVATE evita que go valide
+# estos módulos contra sum.golang.org.
+name: ci
+
+on:
+  push:
+    branches: [pf-msg-m, pf-msg-d, pf-msg-q]
+  pull_request:
+    branches: [pf-msg-m, pf-msg-d, pf-msg-q]
+
+permissions:
+  contents: read
+
+env:
+  GOPRIVATE: github.com/AI27-Tech/*
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: Verificar que el secreto GH_PAT existe
+        run: |
+          if [ -z "${GH_PAT}" ]; then
+            echo "ERROR: falta el secreto de repo GH_PAT (PAT con lectura de los repos privados AI27-Tech/*)."
+            echo "Config: Settings -> Secrets and variables -> Actions -> New repository secret -> GH_PAT"
+            exit 1
+          fi
+      - name: Configurar acceso a módulos privados
+        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+      - name: Descargar dependencias
+        run: go mod download
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      # I5: cmd/api compila y arranca standalone sin core ni bus.
+      - name: Build de cmd/api (standalone)
+        run: go build ./cmd/api
+      # DEC-050 #2: la raíz de producción mensajeria arranca Workers() embebidos.
+      - name: Build de cmd/mensajeria (raíz de producción)
+        run: go build ./cmd/mensajeria
+
+  arch-test:
+    runs-on: ubuntu-latest
+    env:
+      GOPRIVATE: github.com/AI27-Tech/*
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: Verificar que el secreto GH_PAT existe
+        run: |
+          if [ -z "${GH_PAT}" ]; then
+            echo "ERROR: falta el secreto de repo GH_PAT."
+            exit 1
+          fi
+      - name: Configurar acceso a módulos privados
+        run: git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+      # mensajeria solo puede importar los clientes de catalogos e identidad
+      # (identidad restringida a revocación); arch-test lo verifica contra
+      # pf-pkg-platform-go/tools/arch-test/reglas.yaml, que ya declara la arista
+      # mensajeria: [catalogos, identidad] (00 regla 5).
+      - name: arch-test
+        run: go run github.com/AI27-Tech/pf-pkg-platform-go/tools/arch-test@v0.1.1 .
