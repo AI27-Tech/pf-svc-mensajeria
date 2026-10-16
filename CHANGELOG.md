@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 2026-10-15
+
+**Resumen:** Lado consumidor de E5-T5 (AI27-77) en `mensajeria`: caché en proceso de clientes detrás del puerto `CatalogosLector`, invalidada por el evento `catalogo.actualizado` que publica `catalogos`. El productor ya emitía el evento (E5-T1..T4); esto cierra la mitad consumidora para `mensajeria`.
+
+**Para quién:** para la ruta de bandeja/conversación que resuelve datos de cliente por lote. Antes cada lectura pegaba HTTP a `catalogos` (adaptador `CatalogosHTTP`) sin caché ni invalidación. Ahora, cuando hay bus, esas lecturas se sirven de una caché en proceso con techo de obsolescencia por TTL e invalidación por evento.
+
+**Cambios:**
+- `internal/catalogoscache/clientes.go` (nuevo): `CacheClientes` decora `CatalogosLector`, cacheando cada `Cliente` por su `id`. `ListarClientes` combina los aciertos vivos de caché con UN solo viaje a `catalogos` por los faltantes/vencidos (nunca N+1), preservando el orden pedido. TTL corto (default 30 s), reloj inyectable. Degradación (mensajeria.md (f)): si `catalogos` cae, sirve lo que haya —incluso obsoleto— y solo propaga el error degradado cuando no hay nada que servir; nunca inventa un cliente. Interfaz del puerto declarada en el propio paquete para no importar la raíz (evita ciclo).
+- `internal/consumidores/catalogo.go` (nuevo): `ConsumidorCatalogo` procesa `catalogo.actualizado`, deduplica por `evento_id` en memoria (ADR 34 / DEC-067: efecto en memoria, sin tabla `inbox_evento`) e invalida la entrada de `cliente`. Payload ilegible o incompleto se acusa sin invalidar.
+- `mensajeria.go`: con `Subscriber` y `Catalogos` presentes, `New` envuelve el puerto con la caché (misma instancia que invalida el consumidor) y abre el consumidor durable `mensajeria-catalogos` (superficie amplia, filtro `catalogo.actualizado`); `Workers()` lo expone. Sin `Subscriber` no se cachea.
+- Tests: unit de caché (hit/TTL/combina lote/degradación/invalidación/idempotencia), unit de consumidor, e2e con el bus en memoria real, y cableado del worker en `New()`/`Workers()` con y sin `Subscriber`. Los 2 tests de `Workers()` previos siguen verdes.
+
+**Alcance V1:** solo se cachea la entidad `cliente` (contrato/contacto están bloqueados por contrato, brecha C-cat: `catalogos.yaml` no los expone). Un `catalogo.actualizado` de otra entidad es no-op.
+
+**Brecha C10:** el evento no lleva campo `version` en el proto; la versión viaja en el sobre (`bus.Sobre.Version`). El consumidor invalida de forma incondicional y no la necesita.
+
+**Verificado:** `go build ./...`, `go vet ./...`, `go test ./...` (todo verde).
+
 ## 2026-10-14
 
 **Resumen:** Scaffold inicial del módulo `mensajeria` sobre el contrato `v0.1.0-tracer.7` (conversación de negocio; DEC-089). Es estructura, no comportamiento: los servicios de dominio devuelven "no implementado" salvo los dos caminos que las pruebas ejercen.

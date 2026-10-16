@@ -30,12 +30,15 @@
 package mensajeria
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/AI27-Tech/pf-pkg-platform-go/bus"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-pkg-platform-go/pgxpool"
 	"github.com/AI27-Tech/pf-pkg-platform-go/worker"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/catalogoscache"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/consumidores"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 )
@@ -80,6 +83,9 @@ type Module struct {
 	conversacion *conversacion.Servicio
 	reclamos     *reclamos.Servicio
 	relayOutbox  worker.Worker // nil sin Publisher (standalone sin bus)
+	// consumidorCatalogos es el worker durable de catalogo.actualizado que
+	// invalida la caché en proceso de clientes (E5-T5). nil sin Subscriber+Catalogos.
+	consumidorCatalogos worker.Worker
 }
 
 // New recibe los dos pools de svc_mensajeria y los puertos ya resueltos. No lee
@@ -98,6 +104,31 @@ func New(p Pools, d Deps) (*Module, error) {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el
 		// sobre de dominio; marca publicado tras el acuse del broker (ADR 29).
 		m.relayOutbox = outbox.NewRelay("outbox-relay:mensajeria", p.Chat, d.Publisher, outbox.RelayOpciones{})
+	}
+
+	// Caché de clientes + su consumidor de invalidación (E5-T5): solo con
+	// Subscriber y con un puerto Catalogos que envolver. Se envuelve el Catalogos
+	// inyectado con la caché en proceso y se guarda de vuelta en deps, de modo que
+	// toda lectura por m.deps.Catalogos use la MISMA instancia que el consumidor
+	// invalida. Sin Subscriber no se cachea: sin bus no hay evento que invalide y
+	// una caché sin invalidación solo acumularía obsolescencia.
+	if d.Subscriber != nil && d.Catalogos != nil {
+		cache := catalogoscache.Nueva(d.Catalogos, 0) // 0 ⇒ TTL por defecto
+		m.deps.Catalogos = cache
+		cons := consumidores.NuevoConsumidorCatalogo(cache)
+		handler := func(ctx context.Context, s bus.Sobre) error {
+			return cons.Procesar(ctx, s)
+		}
+		w, err := d.Subscriber.Subscribe(
+			"mensajeria-catalogos",
+			bus.SensibilidadAmplia,
+			[]string{consumidores.TipoCatalogoActualizado},
+			handler,
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.consumidorCatalogos = w
 	}
 
 	return m, nil
@@ -137,6 +168,9 @@ func (m *Module) Workers() []worker.Worker {
 	var ws []worker.Worker
 	if m.relayOutbox != nil {
 		ws = append(ws, m.relayOutbox)
+	}
+	if m.consumidorCatalogos != nil {
+		ws = append(ws, m.consumidorCatalogos)
 	}
 	return ws
 }
