@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-10-20 — cmd/migrate: bootstrap de base de datos (E0-T7, DEC-096)
+
+**Resumen:** Nuevo binario `cmd/migrate`: el bootstrap de esquema, rol y grants de `mensajeria`. Corre una vez en el despliegue con credencial administrativa (`DB_ADMIN_URL`), antes de `cmd/mensajeria`. Aplica las migraciones embebidas (`migrations.FS`) con el paquete `migrate` de platform-go (v0.1.6) y fija el `search_path` de `svc_mensajeria` para que el relay de outbox resuelva la tabla `outbox`.
+
+**Por qué un binario aparte (DEC-096):** el `0001` hace `CREATE SCHEMA`/`CREATE ROLE`, privilegio que el pool de app de `mensajeria` (rol `svc_mensajeria`, privilegio mínimo) no tiene ni debe tener (I1). `cmd/migrate` lo confina al paso de despliegue y termina; el servicio arranca después con su rol de app y asume la base migrada. Mismo patrón que `cmd/migrate` de core.
+
+**Cambios:**
+- `cmd/migrate/main.go` (nuevo): bootstrap de un esquema (`mensajeria` → `svc_mensajeria`) con una conexión admin; `ALTER ROLE ... search_path` tras aplicar (DEC-096 nota 3).
+- `cmd/mensajeria/main.go` y `cmd/api/main.go`: se retira el TODO de migraciones; se documenta que el bootstrap es externo y que el servicio asume la base migrada.
+- `go.mod`/`go.sum`: `pf-pkg-platform-go` a `v0.1.6` (trae el paquete `migrate`).
+
+**Verificado:** `go build`/`vet` en verde, `gofmt` limpio, `arch-test` OK. Bootstrap probado end-to-end contra Postgres efímero: crea el esquema y el rol, la tabla `outbox` queda con INSERT/UPDATE para el relay, el `search_path` fijado, e idempotente al reaplicar.
+
 ## 2026-10-15
 
 **Resumen:** Lado consumidor de E5-T5 (AI27-77) en `mensajeria`: caché en proceso de clientes detrás del puerto `CatalogosLector`, invalidada por el evento `catalogo.actualizado` que publica `catalogos`. El productor ya emitía el evento (E5-T1..T4); esto cierra la mitad consumidora para `mensajeria`.

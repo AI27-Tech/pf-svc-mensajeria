@@ -72,8 +72,12 @@ func run() error {
 	}
 	defer poolDespacho.Close()
 
-	// TODO(mensajeria): aplicar migrations.FS con el rol svc_mensajeria antes de
-	// servir tráfico. Pendiente del aplicador de migraciones acordado.
+	// Las migraciones NO se aplican aquí (DEC-096): el bootstrap de esquema, rol
+	// y grants corre como un paso de despliegue aparte, en `cmd/migrate`, con
+	// credencial administrativa. mensajeria arranca con su rol de app de
+	// privilegio mínimo y asume la base migrada (I1: el proceso del servicio
+	// nunca porta CREATE SCHEMA/CREATE ROLE). Los pools hacen ping arriba; una
+	// base sin migrar falla ahí de forma observable.
 
 	// Adaptador HTTP hacia catalogos (siempre HTTP; no hay adaptador en proceso).
 	cat, err := catalogoshttp.NewCatalogosHTTP(os.Getenv(envCatalogosBase), nil)

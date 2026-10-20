@@ -1,7 +1,7 @@
 github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.7 h1:mSJX1Ja25BjCjV7b3bImZFDw1XCgUCBacFzV0w3SOao=
 github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.7/go.mod h1:JlGX2WLFfC1+gxIhO+I47U002vqxhrjgCKXZZ4+wmY8=
-github.com/AI27-Tech/pf-pkg-platform-go v0.1.5 h1:TTknBpd9aRNEsbB4GHPsQc0IhKv5IS1fKLq37X0DmRg=
-github.com/AI27-Tech/pf-pkg-platform-go v0.1.5/go.mod h1:1djk0Mx1Y8AriWQdqgeRr8PnJbwa+c8dMFZFziZ993Q=
+github.com/AI27-Tech/pf-pkg-platform-go v0.1.6 h1:zOk3B1I9rXxBsMEEtaRxn9O8NYUrsxn2PCvH9xOcypY=
+github.com/AI27-Tech/pf-pkg-platform-go v0.1.6/go.mod h1:1djk0Mx1Y8AriWQdqgeRr8PnJbwa+c8dMFZFziZ993Q=
 github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
