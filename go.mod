@@ -13,7 +13,7 @@ go 1.27
 // entró en contracts v0.1.0-tracer.7; la emergencia espera tracer.9.
 require (
 	github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.7
-	github.com/AI27-Tech/pf-pkg-platform-go v0.1.5
+	github.com/AI27-Tech/pf-pkg-platform-go v0.1.6
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
 )
