@@ -18,9 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	msgmensajeria "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -58,6 +61,16 @@ type EntradaEnvio struct {
 	ActorReal       string
 	ClientMessageID string
 	Cuerpo          string
+	// AliasMostrado es la identidad comercial presentada al cliente (nombre del
+	// cliente de la conversación, Opción 2; DEC-097). Inmutable: se persiste al
+	// enviar (addendum §6). La resuelve la frontera (handler) desde catalogos; el
+	// dominio no llama a catalogos en la ruta caliente.
+	AliasMostrado string
+	// RolAlEnviar es el rol del autor en el momento del envío, inmutable
+	// (addendum §6). Vacío ⇒ NULL. La audiencia_autor del contrato se deriva de
+	// este rol al leer, no se persiste (no está en el esquema ni es un campo
+	// inmutable del addendum).
+	RolAlEnviar string
 }
 
 // ResultadoEnvio es el mensaje tal como quedó: su id y su secuencia canónica.
@@ -118,10 +131,10 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 	var mensajeID string
 	err = tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.mensaje
-		    (conversacion_id, tenant_id, actor_real, client_message_id, secuencia, cuerpo)
-		  VALUES ($1, $2, $3, $4, $5, $6)
+		    (conversacion_id, tenant_id, actor_real, client_message_id, secuencia, cuerpo, alias_mostrado, rol_al_enviar)
+		  VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''))
 		  RETURNING id`,
-		in.ConversacionID, in.TenantID, in.ActorReal, in.ClientMessageID, seq, in.Cuerpo,
+		in.ConversacionID, in.TenantID, in.ActorReal, in.ClientMessageID, seq, in.Cuerpo, in.AliasMostrado, in.RolAlEnviar,
 	).Scan(&mensajeID)
 	if err != nil {
 		// Carrera por la misma clave: el índice único la rechaza. El reintento
@@ -192,3 +205,102 @@ func esViolacionUnica(err error) bool {
 	}
 	return false
 }
+
+// ErrMensajeNoEncontrado lo devuelve MensajePorID cuando el mensaje no existe.
+var ErrMensajeNoEncontrado = errors.New("conversacion: mensaje no encontrado")
+
+// MensajePorID lee un mensaje y lo mapea al Mensaje del contrato (hidratación
+// para el handler HTTP; Enviar solo devuelve id y secuencia). La audiencia_autor
+// del contrato se DERIVA del rol_al_enviar (cliente ⇒ Cliente; resto ⇒ Interno):
+// es un campo estructural, no se persiste (no está en el esquema ni es inmutable
+// del addendum §6). alias_mostrado y rol_al_enviar salen de sus columnas.
+func (s *Servicio) MensajePorID(ctx context.Context, tenantID, mensajeID string) (*msgclient.Mensaje, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		id, convID, actorReal, clientMsgID, cuerpo string
+		alias, rol                                 *string
+		secuencia                                  int64
+		creadoEn                                   time.Time
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT id, conversacion_id, actor_real, client_message_id, secuencia, cuerpo,
+		        alias_mostrado, rol_al_enviar, creado_en
+		   FROM mensajeria.mensaje
+		  WHERE id = $1 AND tenant_id = $2`,
+		mensajeID, tenantID,
+	).Scan(&id, &convID, &actorReal, &clientMsgID, &secuencia, &cuerpo, &alias, &rol, &creadoEn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrMensajeNoEncontrado
+	}
+	if err != nil {
+		return nil, fmt.Errorf("conversacion: leer mensaje: %w", err)
+	}
+
+	actor := uuid.MustParse(actorReal)
+	m := &msgclient.Mensaje{
+		Id:              uuid.MustParse(id),
+		ConversacionId:  uuid.MustParse(convID),
+		ClientMessageId: uuid.MustParse(clientMsgID),
+		ActorReal:       &actor,
+		Secuencia:       secuencia,
+		Cuerpo:          cuerpo,
+		CreadoEn:        creadoEn,
+		AudienciaAutor:  audienciaDesdeRol(rol),
+	}
+	if alias != nil {
+		m.AliasMostrado = *alias
+	}
+	if rol != nil {
+		r := msgclient.Rol(*rol)
+		m.RolAlEnviar = &r
+	}
+	return m, nil
+}
+
+// audienciaDesdeRol mapea el rol a la Audiencia de dominio (DEC-054): solo
+// `cliente` es Cliente; los otros siete roles son Interno. Un rol nil (mensaje
+// sin rol_al_enviar) se trata como Cliente: en V1 solo el cliente escribe sin
+// rol interno registrado.
+func audienciaDesdeRol(rol *string) msgclient.Audiencia {
+	if rol != nil && *rol != "cliente" {
+		return msgclient.Audiencia("Interno")
+	}
+	return msgclient.Audiencia("Cliente")
+}
+
+// ClienteDeConversacion devuelve el cliente_id de la conversación, o cadena
+// vacía si la conversación no tiene cliente. Lo usa la frontera para resolver el
+// alias comercial del cliente (Opción 2, DEC-097) sin que el dominio llame a
+// catalogos. ErrConversacionNoEncontrada si la conversación no existe.
+func (s *Servicio) ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var clienteID *string
+	err = tx.QueryRow(ctx,
+		`SELECT cliente_id FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
+		conversacionID, tenantID,
+	).Scan(&clienteID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrConversacionNoEncontrada
+	}
+	if err != nil {
+		return "", fmt.Errorf("conversacion: leer cliente de conversacion: %w", err)
+	}
+	if clienteID == nil {
+		return "", nil
+	}
+	return *clienteID, nil
+}
+
+// ErrConversacionNoEncontrada la devuelve ClienteDeConversacion cuando la
+// conversación no existe para el tenant.
+var ErrConversacionNoEncontrada = errors.New("conversacion: no encontrada")

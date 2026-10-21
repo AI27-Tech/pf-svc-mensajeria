@@ -140,19 +140,21 @@ func New(p Pools, d Deps) (*Module, error) {
 
 // Routes monta las rutas HTTP del módulo bajo /api/v1/... en el mux dado.
 //
-// Monta ReclamarConversacion (POST /api/v1/conversaciones/{id}/reclamos) sobre
-// internal/reclamos, detrás de la guarda de internal/autorizacion (DEC-097). El
-// bff antepone auth.Middleware, así que los claims llegan en el contexto.
+// Monta ReclamarConversacion y EnviarMensaje sobre internal/reclamos e
+// internal/conversacion, detrás de la guarda de internal/autorizacion (DEC-097).
+// El bff antepone auth.Middleware, así que los claims llegan en el contexto. El
+// alias_mostrado del mensaje se resuelve en el handler desde el cliente de la
+// conversación (Opción 2, DEC-097 forma 1); el dominio no llama a catalogos.
 //
-// NO monta aún EnviarMensaje: su respuesta de contrato exige alias_mostrado
-// (identidad comercial por cliente, DEC-097 forma 1), que se persiste en el
-// camino de escritura del dominio; ese cambio va en su propio slice. Emergencia
-// (M9) y catch-up de bandeja (M3) NO se montan: esperan tracer.9 (DEC-089/090).
+// Emergencia (M9) y catch-up de bandeja (M3) NO se montan: esperan tracer.9
+// (DEC-089/090).
 func (m *Module) Routes(mux *http.ServeMux) {
 	convhttp.Handlers{
-		Autz:     m.autz,
-		Reclamos: m.reclamos,
-		Reclamo:  m.reclamos,
+		Autz:         m.autz,
+		Reclamos:     m.reclamos,
+		Reclamo:      m.reclamos,
+		Conversacion: m.conversacion,
+		Catalogos:    m.deps.Catalogos,
 	}.Montar(mux)
 }
 
