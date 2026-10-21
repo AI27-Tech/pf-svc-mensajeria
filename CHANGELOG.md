@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-10-19 — Capa HTTP de conversación: EnviarMensaje con alias por cliente (DEC-097)
+
+**Para quién:** para el flujo del ejecutivo que responde al cliente desde el panel. Con el reclamo activo, un ejecutivo envía un mensaje por HTTP y el cliente lo ve firmado con el nombre comercial de su cuenta. Completa el par con ReclamarConversacion del cambio anterior.
+
+**Alias comercial por cliente (DEC-097 forma 1, Opción 2):** el `alias_mostrado` del mensaje es el nombre del cliente de la conversación, resuelto en el handler desde `catalogos` (puerto `CatalogosLector` ya existente, tracer.7). El dominio no llama a catalogos en la ruta caliente; la frontera compone el alias y lo pasa a `Enviar`, que lo persiste (inmutable, addendum §6).
+
+**audiencia_autor derivada, no persistida:** el contrato exige `audiencia_autor`, pero el esquema no tiene esa columna y el addendum §6 solo lista tres campos inmutables (actor real, rol al enviar, alias mostrado). Se deriva del `rol_al_enviar` al leer (`cliente` ⇒ Cliente, resto ⇒ Interno): es estructural, da el mismo valor que persistir. Sin columna nueva, sin migración.
+
+**Cambios:**
+- `internal/conversacion/conversacion.go`: `EntradaEnvio` gana `AliasMostrado` y `RolAlEnviar`; el INSERT de `Enviar` los persiste (`NULLIF` para vacío ⇒ NULL). El camino caliente (idempotencia + outbox en una tx) no cambia. Nuevos lectores de hidratación `MensajePorID` (mapea al `Mensaje` del contrato, deriva la audiencia) y `ClienteDeConversacion` (da el `cliente_id` para resolver el alias).
+- `adapters/http/conversacion/conversacion.go`: handler de `POST /api/v1/conversaciones/{id}/mensajes`. Autoriza (DEC-097), resuelve el alias por cliente, delega en el dominio, hidrata el `Mensaje` y devuelve 201. Si catalogos cae o no hay cliente, el alias queda vacío y el envío sigue (degradación, mensajeria.md (f)).
+- `mensajeria.go`: `Routes` monta también EnviarMensaje, inyectando `m.conversacion` y el puerto `m.deps.Catalogos` (la misma instancia cacheada que arma `New`).
+
+**Verificado:** `go build`/`vet` verde, `gofmt` limpio, `arch-test` OK, suite completa verde con `MENSAJERIA_TEST_DB`. `TestEnviarMensajeHTTP` (nuevo) contra Postgres real: envío con reclamo activo devuelve 201 con `alias_mostrado` resuelto desde catalogos y `audiencia_autor` derivada; reintento idempotente por `client_message_id` devuelve el mismo mensaje. El test de dominio original de envío idempotente sigue verde.
+
 ## 2026-10-19 — Capa HTTP de conversación: ReclamarConversacion + autorización (DEC-097)
 
 **Para quién:** para el flujo interno de tomar una conversación desde el panel. Un Ejecutivo con membresía en el pool de la bandeja de una conversación puede reclamarla por HTTP; el bff ya tiene una ruta real que montar. Antes `Routes()` no montaba ninguna ruta de negocio y `internal/autorizacion` era un stub.

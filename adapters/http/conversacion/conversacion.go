@@ -16,11 +16,14 @@ import (
 	"errors"
 	"net/http"
 
+	catclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/catalogos"
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
+	"github.com/google/uuid"
 )
 
 // Autorizador decide el acceso a una conversación (internal/autorizacion).
@@ -41,17 +44,35 @@ type LectorReclamo interface {
 	ReclamoActivo(ctx context.Context, tenantID, conversacionID string) (*msgclient.Reclamo, error)
 }
 
+// Enviador envía un mensaje, hidrata el Mensaje del contrato y resuelve el
+// cliente de la conversación para el alias (internal/conversacion).
+type Enviador interface {
+	Enviar(ctx context.Context, in conversacion.EntradaEnvio) (conversacion.ResultadoEnvio, error)
+	MensajePorID(ctx context.Context, tenantID, mensajeID string) (*msgclient.Mensaje, error)
+	ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error)
+}
+
+// CatalogosLector lee clientes por lote (puerto de mensajeria hacia catalogos).
+// El handler lo usa para resolver el alias comercial por cliente (Opción 2,
+// DEC-097). Puede ser nil: sin él el alias queda vacío y el envío sigue.
+type CatalogosLector interface {
+	ListarClientes(ctx context.Context, ids []catclient.Id) (*catclient.PaginaClientes, error)
+}
+
 // Handlers agrupa las dependencias de los handlers de conversación.
 type Handlers struct {
-	Autz     Autorizador
-	Reclamos Reclamador
-	Reclamo  LectorReclamo
+	Autz         Autorizador
+	Reclamos     Reclamador
+	Reclamo      LectorReclamo
+	Conversacion Enviador
+	Catalogos    CatalogosLector
 }
 
 // Montar registra las rutas de conversación en el mux. El bff antepone
 // auth.Middleware, de modo que aquí los claims ya están en el contexto.
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/reclamos", h.reclamar)
+	mux.HandleFunc("POST /api/v1/conversaciones/{id}/mensajes", h.enviar)
 }
 
 // reclamar toma el reclamo activo de una conversación. Exige claims, autoriza
@@ -99,8 +120,86 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 	escribirJSON(w, http.StatusCreated, reclamo)
 }
 
+// enviar escribe un mensaje en la conversación. Exige claims, autoriza (DEC-097),
+// resuelve el alias comercial desde el cliente de la conversación (Opción 2) y
+// delega en el dominio, que persiste mensaje + outbox en una tx. Devuelve 201
+// con el Mensaje hidratado (alias y audiencia incluidos). Idempotente por
+// client_message_id: un reintento devuelve el mensaje original.
+func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	convID := r.PathValue("id")
+
+	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+		escribirError(w, err)
+		return
+	}
+
+	var entrada msgclient.EnviarMensajeEntrada
+	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
+		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
+		return
+	}
+
+	alias, err := h.resolverAlias(r.Context(), claims.TenantID, convID)
+	if err != nil {
+		escribirError(w, traducir(err))
+		return
+	}
+
+	res, err := h.Conversacion.Enviar(r.Context(), conversacion.EntradaEnvio{
+		TenantID:        claims.TenantID,
+		ConversacionID:  convID,
+		ActorReal:       claims.Subject,
+		ClientMessageID: entrada.ClientMessageId.String(),
+		Cuerpo:          entrada.Cuerpo,
+		AliasMostrado:   alias,
+		RolAlEnviar:     claims.Rol,
+	})
+	if err != nil {
+		escribirError(w, traducir(err))
+		return
+	}
+
+	mensaje, err := h.Conversacion.MensajePorID(r.Context(), claims.TenantID, res.MensajeID)
+	if err != nil {
+		escribirError(w, traducir(err))
+		return
+	}
+	escribirJSON(w, http.StatusCreated, mensaje)
+}
+
+// resolverAlias obtiene el nombre comercial que ve el cliente (Opción 2): el
+// nombre del cliente de la conversación, leído por lote desde catalogos. Sin
+// puerto de catalogos o sin cliente en la conversación, devuelve vacío: el alias
+// queda NULL y el envío sigue (la degradación de catalogos no rompe el envío,
+// mensajeria.md (f)).
+func (h Handlers) resolverAlias(ctx context.Context, tenantID, conversacionID string) (string, error) {
+	if h.Catalogos == nil {
+		return "", nil
+	}
+	clienteID, err := h.Conversacion.ClienteDeConversacion(ctx, tenantID, conversacionID)
+	if err != nil {
+		return "", err
+	}
+	if clienteID == "" {
+		return "", nil
+	}
+	id, err := uuid.Parse(clienteID)
+	if err != nil {
+		return "", nil
+	}
+	pagina, err := h.Catalogos.ListarClientes(ctx, []catclient.Id{id})
+	if err != nil || pagina == nil || len(pagina.Items) == 0 {
+		return "", nil // degradado: sin alias, no se rompe el envío
+	}
+	return pagina.Items[0].Nombre, nil
+}
+
 // traducir conserva la categoría de un PlatformError y envuelve cualquier otro
-// error como roto (502): un error de dominio sin categoría es un fallo del
 // servidor, no del llamador.
 func traducir(err error) error {
 	if platformerrors.AsCategory(err) != platformerrors.CategoryUnknown {
