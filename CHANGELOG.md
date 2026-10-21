@@ -9,6 +9,18 @@
 - `.github/workflows/promotion-pr-qm.yml` (nuevo): equivalente para `pf-msg-q → pf-msg-m`.
 
 Copiados sin cambios de `pf-svc-core` (idénticos a los de `pf-svc-reportes`): derivan las ramas del sufijo, sin prefijos hardcodeados, así que funcionan en mensajería tal cual.
+## 2026-10-19 — Ciclo de vida del reclamo por HTTP: Liberar + Transferir
+
+**Para quién:** para el ejecutivo que suelta o traspasa una conversación desde el panel. Completa el ciclo del reclamo iniciado con ReclamarConversacion: reclamar, liberar (devolver al pool) y transferir (pasar la responsabilidad a otro miembro sin perder historia).
+
+**Cambios:**
+- `internal/reclamos/reclamos.go`: `Liberar` cierra el reclamo activo exigiendo su rid y versión (concurrencia optimista); `ErrConflictoVersion` si la versión no coincide, `ErrSinReclamo` si no hay activo. `Transferir` cierra el reclamo del origen y abre uno para el destino en versión 1, en una sola transacción (addendum §4 punto 6 y §6), y audita el hecho en `auditoria_mensajeria` (addendum §11). El índice único `un_reclamo_activo_por_conversacion` garantiza a lo más uno activo; el test afirma exactamente 1 tras transferir.
+- `adapters/http/conversacion/conversacion.go`: `DELETE /api/v1/conversaciones/{id}/reclamos/{rid}?version_esperada=N` (liberar, 204) y `POST /api/v1/conversaciones/{id}/transferencias` (transferir, 201 con el nuevo Reclamo). Ambos detrás de la guarda de autorización (DEC-097). Conflicto de versión → 409, sin reclamo → 404.
+- `mensajeria.go`: las dos rutas quedan montadas por `Routes` (la interfaz `Reclamador` del adaptador gana `Liberar` y `Transferir`).
+
+**Verificado:** `go build`/`vet` verde, `gofmt` limpio, `arch-test` OK, suite completa verde con `MENSAJERIA_TEST_DB`. Tests de integración nuevos contra Postgres: dominio (`TestLiberarCierraElReclamoYDevuelveAlPool`, `TestTransferirCierraYAbreEnUnaTx`) y handler (liberar 204/404 en `TestReclamarConversacionHTTP`, `TestTransferirConversacionHTTP` 201 con responsable = destino).
+
+**Alcance:** el override auditado de Supervisor/Coordinador (enviar/transferir saltándose el reclamo) no se implementa aquí; la transferencia normal exige versión esperada. Emergencia (M9) y catch-up de bandeja (M3) siguen esperando tracer.9.
 
 ## 2026-10-19 — Capa HTTP de conversación: EnviarMensaje con alias por cliente (DEC-097)
 

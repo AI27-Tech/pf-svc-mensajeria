@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	catclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/catalogos"
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
@@ -31,9 +32,12 @@ type Autorizador interface {
 	PuedeEscribir(ctx context.Context, tenantID, conversacionID string, c *auth.Claims) error
 }
 
-// Reclamador toma el reclamo activo de una conversación (internal/reclamos).
+// Reclamador toma, libera y transfiere el reclamo de una conversación
+// (internal/reclamos).
 type Reclamador interface {
 	Reclamar(ctx context.Context, tenantID, conversacionID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error)
+	Liberar(ctx context.Context, tenantID, conversacionID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo) error
+	Transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo) error
 }
 
 // LectorReclamo hidrata el Reclamo del contrato desde la fila recién escrita. La
@@ -72,6 +76,8 @@ type Handlers struct {
 // auth.Middleware, de modo que aquí los claims ya están en el contexto.
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/reclamos", h.reclamar)
+	mux.HandleFunc("DELETE /api/v1/conversaciones/{id}/reclamos/{rid}", h.liberar)
+	mux.HandleFunc("POST /api/v1/conversaciones/{id}/transferencias", h.transferir)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/mensajes", h.enviar)
 }
 
@@ -114,6 +120,99 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 		// shortcut: hidratación en una lectura aparte del reclamo, no en la tx del
 		// Reclamar; una liberación concurrente entre ambas podría dar ErrSinReclamo.
 		// Upgrade cuando Reclamar devuelva el agregado completo en su propia tx.
+		escribirError(w, traducir(err))
+		return
+	}
+	escribirJSON(w, http.StatusCreated, reclamo)
+}
+
+// liberar cierra el reclamo activo de una conversación y lo devuelve al pool
+// (addendum §4 punto 6). DELETE sobre el reclamo por su rid, con version_esperada
+// obligatoria en el query (concurrencia optimista). Autoriza (DEC-097), traduce
+// el conflicto de versión a 409 y la ausencia de reclamo a 404, y responde 204.
+func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	convID := r.PathValue("id")
+	rid := r.PathValue("rid")
+
+	ver, err := strconv.ParseInt(r.URL.Query().Get("version_esperada"), 10, 64)
+	if err != nil {
+		escribirError(w, platformerrors.NewValidacion("version_esperada inválida o faltante"))
+		return
+	}
+
+	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+		escribirError(w, err)
+		return
+	}
+
+	err = h.Reclamos.Liberar(r.Context(), claims.TenantID, convID, rid, claims.Subject, msgtipos.VersionReclamo(ver))
+	if err != nil {
+		var conflicto reclamos.ErrConflictoVersion
+		if errors.As(err, &conflicto) {
+			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
+			return
+		}
+		if errors.Is(err, reclamos.ErrSinReclamo) {
+			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
+			return
+		}
+		escribirError(w, traducir(err))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// transferir mueve la responsabilidad de la conversación a otro miembro del pool
+// (addendum §4 punto 6). POST con TransferenciaEntrada (destino, versión
+// esperada, motivo opcional). Autoriza (DEC-097) al que transfiere, cierra y abre
+// el reclamo en una tx del dominio, y devuelve 201 con el nuevo Reclamo. Conflicto
+// de versión → 409; sin reclamo activo → 404.
+func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	convID := r.PathValue("id")
+
+	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+		escribirError(w, err)
+		return
+	}
+
+	var entrada msgclient.TransferenciaEntrada
+	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
+		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
+		return
+	}
+	motivo := ""
+	if entrada.Motivo != nil {
+		motivo = *entrada.Motivo
+	}
+
+	err := h.Reclamos.Transferir(r.Context(), claims.TenantID, convID, claims.Subject,
+		entrada.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(entrada.VersionEsperada))
+	if err != nil {
+		var conflicto reclamos.ErrConflictoVersion
+		if errors.As(err, &conflicto) {
+			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
+			return
+		}
+		if errors.Is(err, reclamos.ErrSinReclamo) {
+			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
+			return
+		}
+		escribirError(w, traducir(err))
+		return
+	}
+
+	reclamo, err := h.Reclamo.ReclamoActivo(r.Context(), claims.TenantID, convID)
+	if err != nil {
 		escribirError(w, traducir(err))
 		return
 	}
