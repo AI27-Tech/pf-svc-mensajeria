@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-10-21 — CI: workflows de promoción d→q y q→m
+
+**Para quién:** para quien promueve mensajería por el pipeline. Antes el repo solo tenía `ci.yml`; a diferencia de core y reportes, no abría el PR de promoción `-d → -q` automático, así que los cambios en `pf-msg-d` no generaban su PR de promoción y el tramo quedaba manual y fácil de olvidar.
+
+**Cambios:**
+- `.github/workflows/promotion-pr-dq.yml` (nuevo): en cada push a `pf-msg-d` mantiene abierto el PR `pf-msg-d → pf-msg-q` y reescribe su cuerpo con los feature-PRs pendientes de promover. No fusiona; la promoción se clickea a mano.
+- `.github/workflows/promotion-pr-qm.yml` (nuevo): equivalente para `pf-msg-q → pf-msg-m`.
+
+Copiados sin cambios de `pf-svc-core` (idénticos a los de `pf-svc-reportes`): derivan las ramas del sufijo, sin prefijos hardcodeados, así que funcionan en mensajería tal cual.
+
 ## 2026-10-19 — Capa HTTP de conversación: EnviarMensaje con alias por cliente (DEC-097)
 
 **Para quién:** para el flujo del ejecutivo que responde al cliente desde el panel. Con el reclamo activo, un ejecutivo envía un mensaje por HTTP y el cliente lo ve firmado con el nombre comercial de su cuenta. Completa el par con ReclamarConversacion del cambio anterior.

@@ -1,0 +1,101 @@
+# =============================================================================
+# PR de promoción d -> q: siempre abierto y con el cuerpo al día.
+#
+# En cada push a *-d, este workflow mantiene abierto UN PR de *-d hacia *-q y
+# reescribe su cuerpo con el resumen de lo que falta promover: los feature-PRs
+# que ya se fusionaron en *-d y aún no están en *-q (las unidades que revisaste).
+#
+# NO fusiona nada: la promoción d -> q la decides y la clickeas tú. El auto-merge
+# (automerge-promotion.yml) solo actúa en q -> m.
+#
+# Idéntico en los repos PPE. Sin prefijos hardcodeados: la rama -q se deriva del
+# sufijo de la rama -d que disparó el push.
+# =============================================================================
+name: promotion-pr-dq
+
+on:
+  push:
+    branches: ['*-d']
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  mantener-pr-dq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # necesitamos historia completa para el rango q..d
+
+      - name: Crear o actualizar el PR d -> q con el resumen al día
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          D_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Rama destino: mismo nombre con sufijo -q en vez de -d.
+          Q_BRANCH="${D_BRANCH%-d}-q"
+
+          if ! git ls-remote --exit-code --heads origin "$Q_BRANCH" >/dev/null 2>&1; then
+            echo "No existe la rama $Q_BRANCH; nada que promover. Se omite."
+            exit 0
+          fi
+
+          # ¿Hay algo pendiente de promover (commits en d que no están en q)?
+          pendientes=$(git rev-list --count "origin/$Q_BRANCH..origin/$D_BRANCH")
+          echo "Commits pendientes $D_BRANCH -> $Q_BRANCH: $pendientes"
+
+          # SHAs del rango q..d, para intersectar con los merge-commits de feature-PRs.
+          rango_shas=$(git rev-list "origin/$Q_BRANCH..origin/$D_BRANCH")
+
+          # Feature-PRs ya fusionados en -d (las unidades que revisaste). Nos
+          # quedamos con los cuyo merge-commit cae dentro del rango q..d.
+          lineas=""
+          if [ -n "$rango_shas" ]; then
+            merged_json=$(gh pr list --repo "$REPO" --state merged --base "$D_BRANCH" \
+              --limit 100 --json number,title,mergeCommit)
+            while IFS=$'\t' read -r num title sha; do
+              [ -z "$sha" ] && continue
+              if printf '%s\n' $rango_shas | grep -q "^$sha"; then
+                lineas="${lineas}- #${num} ${title}"$'\n'
+              fi
+            done < <(echo "$merged_json" | jq -r '.[] | [.number, .title, (.mergeCommit.oid // "")] | @tsv')
+          fi
+
+          if [ -z "$lineas" ]; then
+            # Sin feature-PRs identificables: caemos al log de commits del rango.
+            lineas=$(git log --format='- %h %s' "origin/$Q_BRANCH..origin/$D_BRANCH" | head -50)
+          fi
+          [ -z "$lineas" ] && lineas="_(sin cambios pendientes)_"
+
+          cuerpo=$(printf '%s\n' \
+            "## Promoción \`$D_BRANCH\` → \`$Q_BRANCH\`" \
+            "" \
+            "Cambios pendientes de promoción ($pendientes commits):" \
+            "" \
+            "$lineas" \
+            "" \
+            "---" \
+            "<!-- auto-generado por promotion-pr-dq.yml; se actualiza en cada push a $D_BRANCH -->" \
+            "Esta promoción **no** se auto-fusiona: revísala y fusiónala a mano cuando quieras promover.")
+
+          titulo="Promoción $D_BRANCH → $Q_BRANCH"
+
+          # ¿Ya hay un PR abierto d -> q? Create-or-update.
+          existing=$(gh pr list --repo "$REPO" --state open \
+            --base "$Q_BRANCH" --head "$D_BRANCH" --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Actualizando PR #$existing."
+            gh pr edit "$existing" --repo "$REPO" --title "$titulo" --body "$cuerpo"
+          elif [ "$pendientes" -gt 0 ]; then
+            echo "Creando PR d -> q."
+            gh pr create --repo "$REPO" --base "$Q_BRANCH" --head "$D_BRANCH" \
+              --title "$titulo" --body "$cuerpo"
+          else
+            echo "No hay PR abierto ni cambios pendientes; nada que hacer."
+          fi
