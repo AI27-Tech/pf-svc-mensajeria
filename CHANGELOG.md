@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-10-19 — Capa HTTP de conversación: ReclamarConversacion + autorización (DEC-097)
+
+**Para quién:** para el flujo interno de tomar una conversación desde el panel. Un Ejecutivo con membresía en el pool de la bandeja de una conversación puede reclamarla por HTTP; el bff ya tiene una ruta real que montar. Antes `Routes()` no montaba ninguna ruta de negocio y `internal/autorizacion` era un stub.
+
+**Qué desbloqueó (DEC-097):** Producto cerró la mecánica de autorización de mensajería. El vínculo Ejecutivo↔cliente se administra a mano en `pool_membresia` (no se deriva de otro servicio, sin arista de contrato nueva). El cliente es multiusuario y la conversación se acota por `cliente_id`. El esquema ya tenía la forma; el stub pasó a implementación.
+
+**Cambios:**
+- `internal/autorizacion/autorizacion.go` (reemplaza el stub `doc.go`): `Servicio.PuedeEscribir` decide el acceso a una conversación desde la proyección local. Rama Cliente: el `cliente_id` de la conversación iguala el `sub` del token. Rama Interno: membresía activa en el pool de la bandeja a la que la conversación está enrutada (`ruta_conversacion` activa → `pool_membresia` activa). Conversación inexistente es `no_encontrado`, sin membresía es `no_autorizado` (addendum §7: poseer el UUID no autoriza).
+- `adapters/http/conversacion/conversacion.go` (nuevo): handler de `POST /api/v1/conversaciones/{id}/reclamos`. Toma claims del contexto (los pone `auth.Middleware` en el bff), autoriza, reclama con la versión esperada e hidrata el `Reclamo` del contrato desde la fila. El conflicto de versión del dominio se traduce a 409. Helpers `escribirJSON`/`escribirError` con la forma `Error` del contrato, mismo patrón que reportes.
+- `internal/reclamos/reclamos.go`: `ReclamoActivo` lee el reclamo activo y lo mapea al `Reclamo` del contrato (hidratación para el handler; el camino caliente de `Reclamar` no cambia). `ErrSinReclamo` nuevo.
+- `mensajeria.go`: `New` construye el autorizador sobre el pool de chat; `Routes` monta el handler. EnviarMensaje NO se monta aún: su respuesta exige `alias_mostrado` (identidad comercial por cliente, DEC-097 forma 1), que se persiste en el camino de escritura; va en su propio slice. Emergencia (M9) y catch-up de bandeja (M3) siguen esperando tracer.9.
+- `go.mod`/`go.sum`: se agrega `golang-jwt/jwt/v5` (transitiva de `platform-go/auth`).
+
+**Verificado:** `go build`/`vet` en verde, `gofmt` limpio, `arch-test` OK, suite completa en verde con `MENSAJERIA_TEST_DB`. Tests de integración nuevos contra Postgres real: `TestPuedeEscribir` (5 ramas de autorización) y `TestReclamarConversacionHTTP` (401 sin membresía, 201 con `Reclamo` hidratado, 409 por conflicto de versión).
+
 ## 2026-10-20 — cmd/migrate: bootstrap de base de datos (E0-T7, DEC-096)
 
 **Resumen:** Nuevo binario `cmd/migrate`: el bootstrap de esquema, rol y grants de `mensajeria`. Corre una vez en el despliegue con credencial administrativa (`DB_ADMIN_URL`), antes de `cmd/mensajeria`. Aplica las migraciones embebidas (`migrations.FS`) con el paquete `migrate` de platform-go (v0.1.6) y fija el `search_path` de `svc_mensajeria` para que el relay de outbox resuelva la tabla `outbox`.

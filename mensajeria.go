@@ -37,6 +37,8 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-pkg-platform-go/pgxpool"
 	"github.com/AI27-Tech/pf-pkg-platform-go/worker"
+	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/catalogoscache"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/consumidores"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
@@ -82,6 +84,7 @@ type Module struct {
 	deps         Deps
 	conversacion *conversacion.Servicio
 	reclamos     *reclamos.Servicio
+	autz         *autorizacion.Servicio
 	relayOutbox  worker.Worker // nil sin Publisher (standalone sin bus)
 	// consumidorCatalogos es el worker durable de catalogo.actualizado que
 	// invalida la caché en proceso de clientes (E5-T5). nil sin Subscriber+Catalogos.
@@ -99,6 +102,7 @@ func New(p Pools, d Deps) (*Module, error) {
 	pub := outbox.NewPublisher()
 	m.conversacion = conversacion.NewServicio(p.Chat, pub)
 	m.reclamos = reclamos.NewServicio(p.Chat)
+	m.autz = autorizacion.NewServicio(p.Chat)
 
 	if d.Publisher != nil {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el
@@ -136,18 +140,20 @@ func New(p Pools, d Deps) (*Module, error) {
 
 // Routes monta las rutas HTTP del módulo bajo /api/v1/... en el mux dado.
 //
-// Scaffolding: hoy NO monta ninguna ruta. Las trece operaciones de
-// mensajeria.yaml (tracer.7) existen, pero sus casos de uso devuelven "no
-// implementado" salvo el envío y el reclamo, y el prompt pide montar SOLO rutas
-// cuyo caso de uso esté listo. Las rutas de bandeja (catch-up, M3) y de
-// emergencia (M9) NO se montan: esperan tracer.9. Cuando el camino de envío y
-// reclamo se exponga por HTTP, se montarán aquí delegando en m.conversacion y
-// m.reclamos. Las rutas de emergencia NUNCA se montan desde este scaffold.
+// Monta ReclamarConversacion (POST /api/v1/conversaciones/{id}/reclamos) sobre
+// internal/reclamos, detrás de la guarda de internal/autorizacion (DEC-097). El
+// bff antepone auth.Middleware, así que los claims llegan en el contexto.
+//
+// NO monta aún EnviarMensaje: su respuesta de contrato exige alias_mostrado
+// (identidad comercial por cliente, DEC-097 forma 1), que se persiste en el
+// camino de escritura del dominio; ese cambio va en su propio slice. Emergencia
+// (M9) y catch-up de bandeja (M3) NO se montan: esperan tracer.9 (DEC-089/090).
 func (m *Module) Routes(mux *http.ServeMux) {
-	// TODO(mensajeria): montar EnviarMensaje y ReclamarConversacion sobre los
-	// servicios ya existentes cuando se agregue la capa HTTP del scaffold; el
-	// resto de operaciones de tracer.7, cuando su caso de uso exista. Nunca
-	// montar rutas de emergencia (M9) ni de catch-up de bandeja (M3) aquí.
+	convhttp.Handlers{
+		Autz:     m.autz,
+		Reclamos: m.reclamos,
+		Reclamo:  m.reclamos,
+	}.Montar(mux)
 }
 
 // Workers devuelve los workers embebidos del módulo (ADR 29 §6), cada uno con el
