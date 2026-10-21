@@ -117,3 +117,45 @@ func (s *Servicio) internoPuede(ctx context.Context, tenantID, conversacionID, s
 	}
 	return nil
 }
+
+// PuedeVerBandeja autoriza a listar el trabajo de una bandeja: exige audiencia
+// interna y membresía ACTIVA en el pool de ESA bandeja (contrato
+// listarTrabajoBandeja, Addendum §7: el rol ejecutivo por sí solo no concede
+// acceso a todas las bandejas). Un cliente no lista bandejas (no_autorizado). La
+// bandeja inexistente para el tenant es no_encontrado, distinguida de la falta
+// de membresía con un EXISTS separado.
+func (s *Servicio) PuedeVerBandeja(ctx context.Context, tenantID, bandejaID string, c *auth.Claims) error {
+	if c == nil {
+		return platformerrors.NewNoAutorizado("autorizacion: sin claims")
+	}
+	if c.Audiencia == auth.AudienciaCliente {
+		return platformerrors.NewNoAutorizado("autorizacion: el cliente no lista bandejas")
+	}
+
+	var existe bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM mensajeria.bandeja WHERE id = $1 AND tenant_id = $2)`,
+		bandejaID, tenantID,
+	).Scan(&existe)
+	if err != nil {
+		return platformerrors.NewRotoErr(err, "autorizacion: verificar bandeja")
+	}
+	if !existe {
+		return platformerrors.NewNoEncontrado("bandeja no encontrada")
+	}
+
+	var autorizado bool
+	err = s.db.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM mensajeria.pool_membresia
+		    WHERE bandeja_id = $1 AND tenant_id = $2 AND usuario_id = $3 AND activa)`,
+		bandejaID, tenantID, c.Subject,
+	).Scan(&autorizado)
+	if err != nil {
+		return platformerrors.NewRotoErr(err, "autorizacion: verificar membresía de bandeja")
+	}
+	if !autorizado {
+		return platformerrors.NewNoAutorizado("autorizacion: sin membresía efectiva en la bandeja")
+	}
+	return nil
+}
