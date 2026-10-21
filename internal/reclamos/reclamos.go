@@ -19,8 +19,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -35,6 +38,10 @@ type ErrConflictoVersion struct {
 func (e ErrConflictoVersion) Error() string {
 	return fmt.Sprintf("reclamos: conflicto de versión: esperada %d, actual %d", e.Esperada, e.Actual)
 }
+
+// ErrSinReclamo lo devuelve ReclamoActivo cuando la conversación no tiene un
+// reclamo activo. El llamador decide si eso es no_encontrado o un estado válido.
+var ErrSinReclamo = errors.New("reclamos: sin reclamo activo")
 
 // Begin abre una transacción. El pool de chat de svc_mensajeria la satisface.
 type Begin interface {
@@ -121,6 +128,45 @@ func abrir(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actorReal s
 		return fmt.Errorf("reclamos: abrir reclamo: %w", err)
 	}
 	return nil
+}
+
+// ReclamoActivo lee el reclamo activo de la conversación y lo mapea al Reclamo
+// del contrato (hidratación para el handler HTTP; el camino caliente de Reclamar
+// solo devuelve la versión). Devuelve ErrSinReclamo si no hay reclamo activo.
+func (s *Servicio) ReclamoActivo(ctx context.Context, tenantID, conversacionID string) (*msgclient.Reclamo, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reclamos: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		id, convID, responsable string
+		version                 int64
+		abiertoEn               time.Time
+		cerradoEn               *time.Time
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT id, conversacion_id, actor_real, version, abierto_en, cerrado_en
+		   FROM mensajeria.reclamo
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL`,
+		conversacionID, tenantID,
+	).Scan(&id, &convID, &responsable, &version, &abiertoEn, &cerradoEn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSinReclamo
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reclamos: leer reclamo activo: %w", err)
+	}
+
+	return &msgclient.Reclamo{
+		Id:             uuid.MustParse(id),
+		ConversacionId: uuid.MustParse(convID),
+		ResponsableId:  uuid.MustParse(responsable),
+		Version:        version,
+		AbiertoEn:      abiertoEn,
+		CerradoEn:      cerradoEn,
+	}, nil
 }
 
 // versionActiva devuelve la versión del reclamo activo de la conversación.
