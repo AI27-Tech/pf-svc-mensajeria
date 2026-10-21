@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-10-21 — CI: workflows de promoción d→q y q→m
+
+**Para quién:** para quien promueve mensajería por el pipeline. Antes el repo solo tenía `ci.yml`; a diferencia de core y reportes, no abría el PR de promoción `-d → -q` automático, así que los cambios en `pf-msg-d` no generaban su PR de promoción y el tramo quedaba manual y fácil de olvidar.
+
+**Cambios:**
+- `.github/workflows/promotion-pr-dq.yml` (nuevo): en cada push a `pf-msg-d` mantiene abierto el PR `pf-msg-d → pf-msg-q` y reescribe su cuerpo con los feature-PRs pendientes de promover. No fusiona; la promoción se clickea a mano.
+- `.github/workflows/promotion-pr-qm.yml` (nuevo): equivalente para `pf-msg-q → pf-msg-m`.
+
+Copiados sin cambios de `pf-svc-core` (idénticos a los de `pf-svc-reportes`): derivan las ramas del sufijo, sin prefijos hardcodeados, así que funcionan en mensajería tal cual.
 ## 2026-10-19 — Ciclo de vida del reclamo por HTTP: Liberar + Transferir
 
 **Para quién:** para el ejecutivo que suelta o traspasa una conversación desde el panel. Completa el ciclo del reclamo iniciado con ReclamarConversacion: reclamar, liberar (devolver al pool) y transferir (pasar la responsabilidad a otro miembro sin perder historia).
