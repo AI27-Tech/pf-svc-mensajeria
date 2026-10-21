@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 2026-10-21 — Catch-up de la colección de bandeja (M3, contrato tracer.14)
+
+**Para quién:** para el panel interno que lista el trabajo de una bandeja y lo mantiene vivo. `listarTrabajoBandeja` deja de ser un listado plano: ahora el cliente obtiene el trabajo con la `revision` de la colección (bootstrap) y pide con `desde_revision` solo lo que cambió (catch-up), el protocolo que ADR 28 §3 exige y que la conversación ya tenía.
+
+**Pin de contrato:** `pf-pkg-contracts` de `tracer.7` a `tracer.14` (trae `TrabajoBandeja`, `RevisionBandeja`, el parámetro `desde_revision` y el `409 stream_resync_required` de bandeja).
+
+**Modelo de la revisión (Opción 1):** `ruta_conversacion` gana una columna `revision` (migración `0003`). Cada cambio de la colección avanza `bandeja.revision` y estampa esa revisión en la fila de ruta afectada, en la misma tx. El catch-up es `rutas con revision > desde`, incluidas las inactivas (bajas), para que el cliente retire lo que salió. Una baja no borra la fila: la deja `activa=false` con su revisión de cambio. Sin tabla de deltas aparte (la Opción 2 se descartó por maquinaria que M3 en V1 no pide).
+
+**Cambios:**
+- `migrations/mensajeria/0003_ruta_revision.sql` (nuevo): columna `revision` en `ruta_conversacion` + índice `(bandeja_id, revision)` para el camino caliente del catch-up. Aditivo, hereda los grants de `0002`.
+- `internal/bandejas/bandejas.go` (reemplaza el stub): `Trabajo` (bootstrap: activas + revisión de colección) y `CambiosDesde` (catch-up: rutas con `revision > desde`, incluidas bajas). Hidrata el `Conversacion` del contrato uniendo `ruta_conversacion` → `conversacion` + LEFT JOIN al reclamo activo para `version_reclamo`. Sin N+1.
+- `internal/autorizacion/autorizacion.go`: `PuedeVerBandeja` (membresía activa en ESA bandeja; el cliente no lista bandejas; bandeja inexistente → no_encontrado).
+- `adapters/http/bandejas/bandejas.go` (nuevo): `GET /api/v1/bandejas/{id}/trabajo`, autoriza, decide bootstrap vs catch-up por `desde_revision`, devuelve `TrabajoBandeja`.
+- `mensajeria.go`: `New` construye el servicio de bandejas; `Routes` monta la ruta.
+
+**Nota sobre el 409:** en V1, con revisión por fila durable y sin purga, el catch-up siempre reconstruye desde cualquier revisión, así que `fueraDeVentana` es false y el `409 stream_resync_required` no se dispara. Queda como capacidad del contrato para cuando se introduzca una ventana de retención con purga (ADR 28 §5).
+
+**Verificado:** `go build`/`vet` verde, `gofmt` limpio, `arch-test` OK, suite completa verde con `MENSAJERIA_TEST_DB`. Tests de integración contra Postgres: dominio (`TestTrabajoYCatchUp`: bootstrap, catch-up incremental, baja reportada) y handler (`TestListarTrabajoBandejaHTTP`: 401 sin membresía, 200 bootstrap con revisión, catch-up por `desde_revision`).
+
 ## 2026-10-21 — CI: workflows de promoción d→q y q→m
 
 **Para quién:** para quien promueve mensajería por el pipeline. Antes el repo solo tenía `ci.yml`; a diferencia de core y reportes, no abría el PR de promoción `-d → -q` automático, así que los cambios en `pf-msg-d` no generaban su PR de promoción y el tramo quedaba manual y fácil de olvidar.
