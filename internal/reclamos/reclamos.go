@@ -130,6 +130,114 @@ func abrir(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actorReal s
 	return nil
 }
 
+// Liberar cierra el reclamo activo de la conversación y lo devuelve al pool
+// (addendum §4 punto 6), exigiendo que el reclamo sea `rid` y su versión sea la
+// esperada (concurrencia optimista). Si otro avanzó la versión, devuelve
+// ErrConflictoVersion sin cerrar nada; si no hay reclamo activo con ese rid y
+// versión, ErrSinReclamo. Perder el reclamo NO quita la membresía (addendum §4
+// punto 7): esto solo cierra la autoridad de envío.
+func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo) error {
+	if conversacionID == "" || reclamoID == "" {
+		return fmt.Errorf("reclamos: liberación inválida: faltan conversacion_id o reclamo_id")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("reclamos: abrir transacción: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ct, err := tx.Exec(ctx,
+		`UPDATE mensajeria.reclamo
+		    SET cerrado_en = now()
+		  WHERE id = $1 AND conversacion_id = $2 AND tenant_id = $3
+		    AND cerrado_en IS NULL AND version = $4`,
+		reclamoID, conversacionID, tenantID, int64(esperada))
+	if err != nil {
+		return fmt.Errorf("reclamos: liberar: %w", err)
+	}
+
+	if ct.RowsAffected() == 0 {
+		// No se cerró: o la versión no coincide (conflicto) o no hay reclamo
+		// activo con ese rid (no encontrado). Distinguir leyendo la versión activa.
+		actual, hay, e := versionActiva(ctx, tx, tenantID, conversacionID)
+		if e != nil {
+			return e
+		}
+		if hay {
+			return ErrConflictoVersion{Esperada: esperada, Actual: actual}
+		}
+		return ErrSinReclamo
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("reclamos: commit de la liberación: %w", err)
+	}
+	return nil
+}
+
+// Transferir mueve la responsabilidad de una conversación sin perder historia
+// (addendum §4 punto 6): cierra el reclamo activo del origen y abre uno nuevo
+// para el destino en una sola transacción (addendum §6). Exige la versión
+// esperada del reclamo activo (concurrencia optimista): si otro avanzó la
+// versión, ErrConflictoVersion y no cambia nada; si no hay reclamo activo,
+// ErrSinReclamo. El nuevo reclamo abre en versión 1. El motivo, si viene, se
+// audita (hecho inmutable, addendum §11).
+func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo) error {
+	if conversacionID == "" || destino == "" {
+		return fmt.Errorf("reclamos: transferencia inválida: faltan conversacion_id o responsable_destino")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("reclamos: abrir transacción: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Cerrar el reclamo activo exigiendo la versión esperada.
+	ct, err := tx.Exec(ctx,
+		`UPDATE mensajeria.reclamo
+		    SET cerrado_en = now()
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
+		    AND version = $3`,
+		conversacionID, tenantID, int64(esperada))
+	if err != nil {
+		return fmt.Errorf("reclamos: cerrar reclamo en transferencia: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		actual, hay, e := versionActiva(ctx, tx, tenantID, conversacionID)
+		if e != nil {
+			return e
+		}
+		if hay {
+			return ErrConflictoVersion{Esperada: esperada, Actual: actual}
+		}
+		return ErrSinReclamo
+	}
+
+	// Abrir el reclamo del destino en la MISMA tx. El índice único parcial
+	// garantiza a lo más uno activo: como acabamos de cerrar el anterior, este
+	// INSERT no colisiona.
+	if err := abrir(ctx, tx, tenantID, conversacionID, destino); err != nil {
+		return err
+	}
+
+	// Auditar la transferencia (hecho inmutable, addendum §11). El motivo puede
+	// venir vacío; se registra como NULL.
+	_, err = tx.Exec(ctx,
+		`INSERT INTO mensajeria.auditoria_mensajeria (tenant_id, conversacion_id, actor_real, accion, detalle)
+		 VALUES ($1, $2, $3, 'reclamo.transferido', jsonb_build_object('destino', $4::text, 'motivo', NULLIF($5, '')))`,
+		tenantID, conversacionID, origen, destino, motivo)
+	if err != nil {
+		return fmt.Errorf("reclamos: auditar transferencia: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("reclamos: commit de la transferencia: %w", err)
+	}
+	return nil
+}
+
 // ReclamoActivo lee el reclamo activo de la conversación y lo mapea al Reclamo
 // del contrato (hidratación para el handler HTTP; el camino caliente de Reclamar
 // solo devuelve la versión). Devuelve ErrSinReclamo si no hay reclamo activo.
