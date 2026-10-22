@@ -37,8 +37,10 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-pkg-platform-go/pgxpool"
 	"github.com/AI27-Tech/pf-pkg-platform-go/worker"
+	bandejashttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/bandejas"
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/catalogoscache"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/consumidores"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
@@ -85,6 +87,7 @@ type Module struct {
 	conversacion *conversacion.Servicio
 	reclamos     *reclamos.Servicio
 	autz         *autorizacion.Servicio
+	bandejas     *bandejas.Servicio
 	relayOutbox  worker.Worker // nil sin Publisher (standalone sin bus)
 	// consumidorCatalogos es el worker durable de catalogo.actualizado que
 	// invalida la caché en proceso de clientes (E5-T5). nil sin Subscriber+Catalogos.
@@ -103,6 +106,7 @@ func New(p Pools, d Deps) (*Module, error) {
 	m.conversacion = conversacion.NewServicio(p.Chat, pub)
 	m.reclamos = reclamos.NewServicio(p.Chat)
 	m.autz = autorizacion.NewServicio(p.Chat)
+	m.bandejas = bandejas.NewServicio(p.Chat)
 
 	if d.Publisher != nil {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el
@@ -155,6 +159,11 @@ func (m *Module) Routes(mux *http.ServeMux) {
 		Reclamo:      m.reclamos,
 		Conversacion: m.conversacion,
 		Catalogos:    m.deps.Catalogos,
+	}.Montar(mux)
+
+	bandejashttp.Handlers{
+		Autz:    m.autz,
+		Bandeja: m.bandejas,
 	}.Montar(mux)
 }
 
