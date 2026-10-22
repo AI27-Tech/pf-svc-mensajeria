@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -550,6 +551,66 @@ func (s *Servicio) Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal
 		return fmt.Errorf("emergencias: commit del cierre: %w", err)
 	}
 	return nil
+}
+
+// CasoProyectado es un caso leído, con los campos que su audiencia puede ver. La
+// frontera lo mapea al CasoEmergencia del contrato. Para audiencia Cliente, los
+// campos internos (Origen, ActorReal, ReclamoActivo) van en cero y las cerradas
+// se excluyen (ADR 21 §6).
+type CasoProyectado struct {
+	ID             string
+	ViajeID        string
+	ClienteID      string
+	Estado         string
+	Origen         string
+	ActorReal      string
+	VersionReclamo msgtipos.VersionReclamo
+	ActivadaEn     time.Time
+	ResueltaEn     *time.Time
+	CerradaEn      *time.Time
+}
+
+// ListarPorViaje devuelve los casos de emergencia de un viaje. Para la vista
+// mínima del cliente (soloActivos=true, ADR 21 §6) excluye las cerradas; la
+// frontera además oculta los campos internos. El orden es por activación.
+func (s *Servicio) ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]CasoProyectado, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("emergencias: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	filtro := ""
+	if soloActivos {
+		filtro = ` AND estado <> 'cerrada'`
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT id, viaje_id, COALESCE(cliente_id::text, ''), estado, origen,
+		        actor_real::text, version_reclamo, activada_en, resuelta_en, cerrada_en
+		   FROM mensajeria.emergencia
+		  WHERE tenant_id = $1 AND viaje_id = $2`+filtro+`
+		  ORDER BY activada_en`,
+		tenantID, viajeID)
+	if err != nil {
+		return nil, fmt.Errorf("emergencias: listar casos: %w", err)
+	}
+	defer rows.Close()
+
+	var casos []CasoProyectado
+	for rows.Next() {
+		var c CasoProyectado
+		var version int64
+		if err := rows.Scan(&c.ID, &c.ViajeID, &c.ClienteID, &c.Estado, &c.Origen,
+			&c.ActorReal, &version, &c.ActivadaEn, &c.ResueltaEn, &c.CerradaEn); err != nil {
+			return nil, fmt.Errorf("emergencias: escanear caso: %w", err)
+		}
+		c.VersionReclamo = msgtipos.VersionReclamo(version)
+		casos = append(casos, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("emergencias: iterar casos: %w", err)
+	}
+	return casos, nil
 }
 
 // bandejaReaccion resuelve la bandeja de Reacción del tenant (la de tipo
