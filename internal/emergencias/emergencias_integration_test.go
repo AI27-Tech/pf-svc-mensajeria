@@ -31,6 +31,11 @@ func setup(t *testing.T, ctx context.Context) (*emergencias.Servicio, func()) {
 	dbtest.Reiniciar(t, ctx, admin)
 	dbtest.AplicarMigraciones(t, ctx, admin)
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
+	// Sembrar la bandeja de Reacción del tenant (tipo 'emergencias'): Activar la
+	// resuelve internamente, no la recibe del llamante.
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre)
+		 VALUES ('`+bandeja+`', '`+tenant+`', 'emergencias', 'Reacción')`)
 	svc := emergencias.NewServicio(pool, outbox.NewPublisher())
 	return svc, func() {
 		closePool()
@@ -42,7 +47,7 @@ func setup(t *testing.T, ctx context.Context) (*emergencias.Servicio, func()) {
 func activar(t *testing.T, ctx context.Context, svc *emergencias.Servicio, activacionID string) emergencias.ResultadoActivacion {
 	t.Helper()
 	res, err := svc.Activar(ctx, emergencias.EntradaActivacion{
-		TenantID: tenant, ViajeID: viaje, ClienteID: cliente, BandejaID: bandeja,
+		TenantID: tenant, ViajeID: viaje, ClienteID: cliente,
 		ActorReal: actorA, Origen: msgclient.OrigenActivacionOperacion, ActivacionID: activacionID,
 	})
 	if err != nil {

@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS mensajeria.emergencia (
   id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id      TEXT        NOT NULL,
   viaje_id       UUID        NOT NULL,   -- identificador, no FK
-  cliente_id     UUID        NOT NULL,   -- alcance de la vista mínima del cliente
+  cliente_id     UUID,                   -- alcance de la vista mínima; proyectado de viaje.* (nullable como en conversacion)
   bandeja_id     UUID        NOT NULL,   -- bandeja de Reacción (tipo 'emergencias')
   estado         TEXT        NOT NULL DEFAULT 'abierta',
   origen         TEXT        NOT NULL,   -- 'cliente' | 'operacion'

@@ -159,3 +159,51 @@ func (s *Servicio) PuedeVerBandeja(ctx context.Context, tenantID, bandejaID stri
 	}
 	return nil
 }
+
+// PuedeAtenderEmergencia autoriza a obrar sobre un caso de emergencia que está
+// en la cola de Reacción (reclamar, liberar, transferir, resolver): exige
+// audiencia interna y membresía ACTIVA en el pool de la bandeja del caso
+// (DEC-028: solo miembros efectivos de Reacción atienden). Un cliente no atiende
+// (no_autorizado). El caso inexistente para el tenant es no_encontrado,
+// distinguido de la falta de membresía con un EXISTS aparte, igual que las demás
+// guardas. El alcance jerárquico de mando sobre Reacción (DEC-099) no viaja en el
+// token (DEC-053) y no se decide aquí.
+func (s *Servicio) PuedeAtenderEmergencia(ctx context.Context, tenantID, emergenciaID string, c *auth.Claims) error {
+	if c == nil {
+		return platformerrors.NewNoAutorizado("autorizacion: sin claims")
+	}
+	if c.Audiencia == auth.AudienciaCliente {
+		return platformerrors.NewNoAutorizado("autorizacion: el cliente no atiende emergencias")
+	}
+
+	var existe bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM mensajeria.emergencia WHERE id = $1 AND tenant_id = $2)`,
+		emergenciaID, tenantID,
+	).Scan(&existe)
+	if err != nil {
+		return platformerrors.NewRotoErr(err, "autorizacion: verificar emergencia")
+	}
+	if !existe {
+		return platformerrors.NewNoEncontrado("emergencia no encontrada")
+	}
+
+	var autorizado bool
+	err = s.db.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1
+		     FROM mensajeria.emergencia e
+		     JOIN mensajeria.pool_membresia m
+		       ON m.bandeja_id = e.bandeja_id AND m.tenant_id = e.tenant_id
+		    WHERE e.id = $1 AND e.tenant_id = $2
+		      AND m.usuario_id = $3 AND m.activa)`,
+		emergenciaID, tenantID, c.Subject,
+	).Scan(&autorizado)
+	if err != nil {
+		return platformerrors.NewRotoErr(err, "autorizacion: verificar membresía de Reacción")
+	}
+	if !autorizado {
+		return platformerrors.NewNoAutorizado("autorizacion: sin membresía efectiva en el pool de Reacción")
+	}
+	return nil
+}

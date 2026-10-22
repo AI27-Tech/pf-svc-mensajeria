@@ -78,12 +78,14 @@ var ErrTransicionInvalida = errors.New("emergencias: transición de estado invá
 
 // EntradaActivacion es lo mínimo para activar un caso. ActivacionID es la clave
 // de idempotencia generada por el llamante (contrato ActivarEmergenciaEntrada).
-// Origen distingue cliente de operacion (ADR 21 §3).
+// Origen distingue cliente de operacion (ADR 21 §3). ClienteID puede ir vacío:
+// mensajeria no siempre conoce el cliente del viaje (lo proyecta de viaje.*); se
+// persiste NULL y la vista mínima del cliente se resuelve por el alcance del
+// token. La bandeja de Reacción NO se recibe: la resuelve el dominio (es su dato).
 type EntradaActivacion struct {
 	TenantID     string
 	ViajeID      string
 	ClienteID    string
-	BandejaID    string
 	ActorReal    string
 	Origen       msgclient.OrigenActivacion
 	ActivacionID string
@@ -101,7 +103,7 @@ type ResultadoActivacion struct {
 // emergencia.activada en una sola tx. Una pulsación nueva con otra ActivacionID
 // crea otro caso aunque ya exista uno abierto: no se deduplica por viaje.
 func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (ResultadoActivacion, error) {
-	if in.ViajeID == "" || in.ClienteID == "" || in.BandejaID == "" || in.ActorReal == "" || in.ActivacionID == "" {
+	if in.ViajeID == "" || in.ActorReal == "" || in.ActivacionID == "" {
 		return ResultadoActivacion{}, fmt.Errorf("emergencias: activación inválida: faltan campos obligatorios")
 	}
 
@@ -118,13 +120,20 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 		return ResultadoActivacion{EmergenciaID: id, Idempotente: true}, nil
 	}
 
+	// La bandeja de Reacción del tenant es dato de mensajeria: se resuelve aquí,
+	// no la trae el llamante.
+	bandejaID, err := bandejaReaccion(ctx, tx, in.TenantID)
+	if err != nil {
+		return ResultadoActivacion{}, err
+	}
+
 	var emergenciaID string
 	err = tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.emergencia
 		    (tenant_id, viaje_id, cliente_id, bandeja_id, origen, actor_real, activacion_id)
-		  VALUES ($1, $2, $3, $4, $5, $6, $7)
+		  VALUES ($1, $2, NULLIF($3, '')::uuid, $4, $5, $6, $7)
 		  RETURNING id`,
-		in.TenantID, in.ViajeID, in.ClienteID, in.BandejaID, string(in.Origen), in.ActorReal, in.ActivacionID,
+		in.TenantID, in.ViajeID, in.ClienteID, bandejaID, string(in.Origen), in.ActorReal, in.ActivacionID,
 	).Scan(&emergenciaID)
 	if err != nil {
 		// Carrera por la misma activación: el índice único la rechaza; releer el
@@ -541,6 +550,27 @@ func (s *Servicio) Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal
 		return fmt.Errorf("emergencias: commit del cierre: %w", err)
 	}
 	return nil
+}
+
+// bandejaReaccion resuelve la bandeja de Reacción del tenant (la de tipo
+// 'emergencias'). ErrNoEncontrada si el tenant no tiene una aprovisionada: en V1
+// la bandeja de Reacción se siembra como parte del alta del tenant, igual que la
+// bandeja de chat.
+func bandejaReaccion(ctx context.Context, tx pgx.Tx, tenantID string) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx,
+		`SELECT id FROM mensajeria.bandeja
+		  WHERE tenant_id = $1 AND tipo = 'emergencias'
+		  ORDER BY creado_en LIMIT 1`,
+		tenantID,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoEncontrada
+	}
+	if err != nil {
+		return "", fmt.Errorf("emergencias: resolver bandeja de Reacción: %w", err)
+	}
+	return id, nil
 }
 
 // abrirReclamo inserta el reclamo activo inicial del caso en versión 1. El índice
