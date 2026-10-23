@@ -37,6 +37,7 @@ type Emergencias interface {
 	Transferir(ctx context.Context, tenantID, emergenciaID, origen, destino string, esperada msgtipos.VersionReclamo) error
 	Resolver(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) error
 	Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal string) error
+	ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]emergencias.CasoProyectado, error)
 }
 
 // Handlers agrupa las dependencias de los handlers de emergencia.
@@ -47,6 +48,7 @@ type Handlers struct {
 
 // Montar registra las rutas de emergencia en el mux.
 func (h Handlers) Montar(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/v1/viajes/{id}/emergencias", h.listar)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias", h.activar)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/notas", h.agregarNota)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/reclamos", h.reclamar)
@@ -54,6 +56,63 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/transferencias", h.transferir)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/resolucion", h.resolver)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/cierre", h.cerrar)
+}
+
+// listar devuelve los casos de emergencia del viaje, proyectados por audiencia
+// (ADR 21 §6). Al Cliente le entrega la vista mínima: solo casos no cerrados y
+// sin los campos internos (origen, actor, reclamo). A Interno, el caso completo.
+func (h Handlers) listar(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	viajeID := r.PathValue("id")
+	esCliente := claims.Audiencia == auth.AudienciaCliente
+
+	casos, err := h.Emergencias.ListarPorViaje(r.Context(), claims.TenantID, viajeID, esCliente)
+	if err != nil {
+		escribirError(w, traducir(err))
+		return
+	}
+
+	items := make([]msgclient.CasoEmergencia, 0, len(casos))
+	for _, c := range casos {
+		items = append(items, proyectar(c, esCliente))
+	}
+	escribirJSON(w, http.StatusOK, msgclient.PaginaEmergencias{Items: items})
+}
+
+// proyectar mapea un caso leído al CasoEmergencia del contrato. Para audiencia
+// Cliente oculta los campos internos (origen, actor_real, reclamo_activo quedan
+// en su cero), que solo se entregan a Interno (ADR 21 §3, §6).
+func proyectar(c emergencias.CasoProyectado, esCliente bool) msgclient.CasoEmergencia {
+	caso := msgclient.CasoEmergencia{
+		Id:             uuidOCero(c.ID),
+		ViajeId:        uuidOCero(c.ViajeID),
+		Estado:         msgclient.EstadoEmergencia(c.Estado),
+		VersionReclamo: int64(c.VersionReclamo),
+		ActivadaEn:     c.ActivadaEn,
+		ResueltaEn:     c.ResueltaEn,
+		CerradaEn:      c.CerradaEn,
+	}
+	if c.ClienteID != "" {
+		caso.ClienteId = uuidOCero(c.ClienteID)
+	}
+	if esCliente {
+		return caso
+	}
+	// Interno ve los campos internos.
+	caso.Origen = msgclient.OrigenActivacion(c.Origen)
+	if id, err := uuid.Parse(c.ActorReal); err == nil {
+		caso.ActorReal = &id
+	}
+	return caso
+}
+
+func uuidOCero(s string) msgclient.Id {
+	id, _ := uuid.Parse(s)
+	return id
 }
 
 // activar crea un caso de emergencia sobre el viaje. Cliente dentro de su

@@ -196,3 +196,45 @@ func esConflicto(err error) bool {
 	var c emergencias.ErrConflictoVersion
 	return errors.As(err, &c)
 }
+
+// TestListarVistaMinimaExcluyeCerradas afirma que, con soloActivos=true (vista
+// mínima del cliente), un caso cerrado no aparece, mientras que con
+// soloActivos=false (interno) sí.
+func TestListarVistaMinimaExcluyeCerradas(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	svc, teardown := setup(t, ctx)
+	defer teardown()
+
+	// Un caso que llevamos hasta cerrada.
+	cerrado := activar(t, ctx, svc, activacn1)
+	if _, err := svc.Reclamar(ctx, tenant, cerrado.EmergenciaID, actorA, 0); err != nil {
+		t.Fatalf("reclamar: %v", err)
+	}
+	if err := svc.Resolver(ctx, tenant, cerrado.EmergenciaID, actorA, 1); err != nil {
+		t.Fatalf("resolver: %v", err)
+	}
+	if err := svc.Cerrar(ctx, tenant, cerrado.EmergenciaID, actorA); err != nil {
+		t.Fatalf("cerrar: %v", err)
+	}
+	// Un caso que sigue abierto.
+	abierto := activar(t, ctx, svc, activacn2)
+
+	// Vista mínima (cliente): solo el abierto.
+	minima, err := svc.ListarPorViaje(ctx, tenant, viaje, true)
+	if err != nil {
+		t.Fatalf("listar vista mínima: %v", err)
+	}
+	if len(minima) != 1 || minima[0].ID != abierto.EmergenciaID {
+		t.Fatalf("vista mínima debe traer solo el caso abierto, trajo %d", len(minima))
+	}
+
+	// Interno: ambos.
+	todos, err := svc.ListarPorViaje(ctx, tenant, viaje, false)
+	if err != nil {
+		t.Fatalf("listar interno: %v", err)
+	}
+	if len(todos) != 2 {
+		t.Fatalf("interno debe traer los dos casos, trajo %d", len(todos))
+	}
+}
