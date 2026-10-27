@@ -39,11 +39,13 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/worker"
 	bandejashttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/bandejas"
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
+	emerhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/emergencias"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/catalogoscache"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/consumidores"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 )
 
@@ -88,6 +90,7 @@ type Module struct {
 	reclamos     *reclamos.Servicio
 	autz         *autorizacion.Servicio
 	bandejas     *bandejas.Servicio
+	emergencias  *emergencias.Servicio
 	relayOutbox  worker.Worker // nil sin Publisher (standalone sin bus)
 	// consumidorCatalogos es el worker durable de catalogo.actualizado que
 	// invalida la caché en proceso de clientes (E5-T5). nil sin Subscriber+Catalogos.
@@ -107,6 +110,7 @@ func New(p Pools, d Deps) (*Module, error) {
 	m.reclamos = reclamos.NewServicio(p.Chat)
 	m.autz = autorizacion.NewServicio(p.Chat)
 	m.bandejas = bandejas.NewServicio(p.Chat)
+	m.emergencias = emergencias.NewServicio(p.Chat, pub)
 
 	if d.Publisher != nil {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el
@@ -150,8 +154,9 @@ func New(p Pools, d Deps) (*Module, error) {
 // alias_mostrado del mensaje se resuelve en el handler desde el cliente de la
 // conversación (Opción 2, DEC-097 forma 1); el dominio no llama a catalogos.
 //
-// Emergencia (M9) y catch-up de bandeja (M3) NO se montan: esperan tracer.9
-// (DEC-089/090).
+// Emergencia (M9) se monta desde tracer.17 (DEC-100): la familia
+// /api/v1/viajes/{id}/emergencias sobre internal/emergencias. El catch-up de
+// bandeja (M3) ya entró en tracer.14.
 func (m *Module) Routes(mux *http.ServeMux) {
 	convhttp.Handlers{
 		Autz:         m.autz,
@@ -164,6 +169,11 @@ func (m *Module) Routes(mux *http.ServeMux) {
 	bandejashttp.Handlers{
 		Autz:    m.autz,
 		Bandeja: m.bandejas,
+	}.Montar(mux)
+
+	emerhttp.Handlers{
+		Autz:        m.autz,
+		Emergencias: m.emergencias,
 	}.Montar(mux)
 }
 

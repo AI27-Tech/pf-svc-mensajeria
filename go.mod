@@ -12,7 +12,7 @@ go 1.27
 // Versiones fijadas por el prompt 07 (DEC-089): la conversación de mensajería
 // entró en contracts v0.1.0-tracer.7; la emergencia espera tracer.9.
 require (
-	github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.14
+	github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.17
 	github.com/AI27-Tech/pf-pkg-platform-go v0.1.6
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
