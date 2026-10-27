@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 2026-10-27 — Superficie en proceso del carril de emergencia (E7, para core)
+
+**Para quién:** para `pf-svc-core`, que al co-ubicar `mensajeria` dentro del binario compuesto necesita resolver la arista `bff→mensajeria` EN PROCESO (hasta ahora el diseño la daba por SIEMPRE HTTP). Sin esta superficie, componer `bff` v0.1.4 en core no compilaba: el puerto `bff.MensajeriaPort` no tenía a quién delegar en proceso.
+
+**Qué cambia:** `mensajeria` expone `EmergenciasAPI` (archivo `emergencias_api.go`, paquete raíz), tipada con `msgclient.*`, con la misma forma que `bff.MensajeriaPort` (los 8 métodos de emergencia). Se construye con `(*Module).Emergencias()` sobre los casos de uso que el `Module` ya tiene (`m.emergencias`, `m.autz`); no toca `New` ni abre recursos. Es el análogo de `operacion.ConsultasAPI` y `catalogos.ConsultasAPI` para la arista entrante en proceso. El adaptador en proceso vive en `pf-svc-core`.
+
+**Dónde vive la lógica de contrato:** `EmergenciasAPI` encapsula autorizar (`PuedeAtenderEmergencia`), proyectar por audiencia (ADR 21 §6: el cliente no ve origen ni actor_real), traducir errores de dominio a `PlatformError`, y orquestar `resolver = Resolver + AgregarNota(es_resolucion)`. Lee los claims del ctx (`auth.ClaimsFromContext`), igual que el handler HTTP; el `bearer` del puerto del `bff` lo consume el adaptador HTTP del `bff`, no esta superficie.
+
+**Cambios:**
+- `emergencias_api.go` (nuevo): interfaz `EmergenciasAPI`, impl `emergenciasAPI` sobre interfaces de consumidor `casoDeEmergencia`/`autorizador` (satisfechas por `*emergencias.Servicio` y `*autorizacion.Servicio`, comprobado en compilación), y las funciones puras de proyección/traducción.
+- `emergencias_api_test.go` (nuevo): comportamiento de la proyección por audiencia (cliente oculta origen/actor_real, interno los ve) y rechazo sin claims. Sin BD.
+
+**Shortcuts registrados (con su condición de upgrade, en el código):**
+1. `ReclamarEmergencia`/`TransferirEmergencia` devuelven un `msgclient.Reclamo` con solo `Version` poblada (reclamar) o vacío (transferir): el dominio no construye un Reclamo completo y el carril HTTP tampoco lo devolvía (201 sin cuerpo). Upgrade si el panel llega a consumir id/responsable/timestamps.
+2. `proyectar`/`traducir`/etc. quedan duplicadas con `adapters/http/emergencias` (funciones puras idénticas). No se dedupe porque el handler vive en un paquete que el root importa (ciclo), y extraerlas metería `auth` en el dominio y reescribiría un carril de seguridad sin tests de forma. Upgrade: extraer a `internal/emergencias` si la regla de audiencia cambia.
+
+**Verificación:** `go build/vet ./...`, `go test ./...` (unit de proyección verde, integración de dominio intacta), `arch-test` (sigue hoja: catalogos/identidad), `go build ./cmd/api ./cmd/mensajeria`.
+
 ## 2026-10-21 — Catch-up de la colección de bandeja (M3, contrato tracer.14)
 
 **Para quién:** para el panel interno que lista el trabajo de una bandeja y lo mantiene vivo. `listarTrabajoBandeja` deja de ser un listado plano: ahora el cliente obtiene el trabajo con la `revision` de la colección (bootstrap) y pide con `desde_revision` solo lo que cambió (catch-up), el protocolo que ADR 28 §3 exige y que la conversación ya tenía.
