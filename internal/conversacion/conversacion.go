@@ -421,3 +421,100 @@ func (s *Servicio) ClienteDeConversacion(ctx context.Context, tenantID, conversa
 // ErrConversacionNoEncontrada la devuelve ClienteDeConversacion cuando la
 // conversación no existe para el tenant.
 var ErrConversacionNoEncontrada = errors.New("conversacion: no encontrada")
+
+// EntradaCreacion es lo mínimo para crear la conversación de un viaje al
+// consumir viaje.mensajeria_habilitada (E3-T1). En V1 el tenant ES el cliente
+// (DEC-049): ClienteID puebla tanto tenant_id (aislamiento, P9) como cliente_id
+// (alcance, DEC-045 #8), igual que reportes.hecho_viaje (aplicarCreado). El
+// evento siempre trae cliente_id (operacion lo exige al crear), así que no hay
+// borde de arranque en frío como el de reportes.
+type EntradaCreacion struct {
+	ViajeID   string
+	ClienteID string
+}
+
+// CrearPorEvento crea la conversación de un viaje, idempotentemente. La
+// idempotencia es DURABLE y la da el índice único parcial
+// una_conversacion_activa_por_viaje (una conversación no-cerrada por
+// (tenant_id, viaje_id)): reentregar viaje.mensajeria_habilitada para el mismo
+// viaje produce un conflicto de unicidad que ON CONFLICT DO NOTHING vuelve no-op,
+// no una segunda conversación. No usa inbox_evento: el invariante de unicidad del
+// negocio ES el árbitro (mismo criterio que el envío y el consumidor de
+// emergencia; DEC-067). Devuelve creada=true si insertó, false si ya existía.
+func (s *Servicio) CrearPorEvento(ctx context.Context, in EntradaCreacion) (bool, error) {
+	if in.ViajeID == "" || in.ClienteID == "" {
+		return false, fmt.Errorf("conversacion: creación inválida: faltan viaje_id o cliente_id")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("conversacion: abrir transacción de creación: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// tenant_id = cliente_id (DEC-049: cliente = tenant), igual que reportes.
+	ct, err := tx.Exec(ctx,
+		`INSERT INTO mensajeria.conversacion (tenant_id, viaje_id, cliente_id, estado, siguiente_secuencia)
+		 VALUES ($1, $2, $3::uuid, 'abierta', 0)
+		 ON CONFLICT DO NOTHING`,
+		in.ClienteID, in.ViajeID, in.ClienteID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("conversacion: insertar conversación: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("conversacion: commit de creación: %w", err)
+	}
+	// RowsAffected 0 ⇒ ya existía una conversación activa para el viaje (ON
+	// CONFLICT no insertó): reentrega idempotente, no-op.
+	return ct.RowsAffected() == 1, nil
+}
+
+// Ventanas de escritura tras el cierre del viaje (DEC-030/DEC-041): con
+// incidencia la conversación sigue viva 6 meses; sin incidencia, 3 días. Tras el
+// límite pasa a solo_lectura (lo hará un barrido o la guarda de Enviar al vencer;
+// aquí solo se fija escritura_hasta).
+const (
+	ventanaConIncidencia = 6 * 30 * 24 * time.Hour // 6 meses (aprox. 30 días/mes)
+	ventanaSinIncidencia = 3 * 24 * time.Hour      // 3 días
+)
+
+// CerrarVentana fija escritura_hasta de la conversación del viaje al consumir
+// viaje.cerrado (E3-T1). La ventana depende del motivo de cierre: por_incidencia
+// ⇒ 6 meses, cualquier otro ⇒ 3 días (DEC-030/DEC-041). Filtra SOLO por viaje_id:
+// el evento viaje.cerrado no trae cliente_id (no hay tenant que exigir), y la
+// conversación activa por viaje es única por el índice parcial. Idempotente:
+// fijar el mismo escritura_hasta a partir del mismo cerrado_en es convergente, así
+// que reentregar viaje.cerrado no cambia el resultado. No pasa la conversación a
+// solo_lectura ahora: eso ocurre al VENCER la ventana (la guarda de Enviar ya
+// rechaza cuando estado != 'abierta'). Si no hay conversación para el viaje, es
+// no-op (un viaje sin mensajería habilitada no tiene nada que cerrar).
+func (s *Servicio) CerrarVentana(ctx context.Context, viajeID, motivoCierre string, cerradoEn time.Time) error {
+	if viajeID == "" {
+		return fmt.Errorf("conversacion: cierre inválido: falta viaje_id")
+	}
+	ventana := ventanaSinIncidencia
+	if motivoCierre == "por_incidencia" {
+		ventana = ventanaConIncidencia
+	}
+	escrituraHasta := cerradoEn.Add(ventana)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("conversacion: abrir transacción de cierre: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE mensajeria.conversacion
+		    SET escritura_hasta = $2
+		  WHERE viaje_id = $1 AND estado <> 'cerrada'`,
+		viajeID, escrituraHasta,
+	); err != nil {
+		return fmt.Errorf("conversacion: fijar escritura_hasta: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("conversacion: commit de cierre de ventana: %w", err)
+	}
+	return nil
+}

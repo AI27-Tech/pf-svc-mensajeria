@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 2026-10-28 — E3-T1: ciclo de vida de la conversación por evento del viaje
+
+**Resumen:** la conversación de un viaje ahora nace y fija su ventana de escritura por EVENTO, no por petición. Dos consumidores durables nuevos sobre la superficie amplia del bus: `viaje.mensajeria_habilitada` crea la conversación (idempotente); `viaje.cerrado` fija `escritura_hasta` (3 días sin incidencia, 6 meses con incidencia, DEC-030/DEC-041). Más la columna `legal_hold` que faltaba en la tabla. No existe endpoint para que el cliente cree una conversación: solo el evento la crea.
+
+**Para quién:** cierra el ciclo que da sustento al envío de E3-T2: antes la conversación se sembraba a mano en los tests; ahora la crea el evento real de operacion (viaje.mensajeria_habilitada, que operacion emite desde este mismo sprint).
+
+**Cambios:**
+- `migrations/mensajeria/0005_conversacion_legal_hold.sql` (nuevo): columna `legal_hold BOOLEAN NOT NULL DEFAULT false`. Solo la forma; la política de retención/legal hold sigue pendiente (DEC-016 #3).
+- `internal/conversacion/conversacion.go`: `CrearPorEvento` (INSERT idempotente por el índice único parcial `una_conversacion_activa_por_viaje`, `ON CONFLICT DO NOTHING`; tenant_id = cliente_id, DEC-049) y `CerrarVentana` (fija `escritura_hasta` según motivo_cierre, acotado por viaje_id, convergente). No usan inbox_evento: el invariante de unicidad del negocio es el árbitro (DEC-067, igual que el envío).
+- `internal/consumidores/conversacion.go` (nuevo): `ConsumidorHabilitada` y `ConsumidorCerrado`, puertos estrechos, idempotencia durable. `viaje.acceso_revocado` NO se implementa (su productor no existe en operacion; E3-T1 lo marca bloqueado).
+- `mensajeria.go`: cablea los dos consumidores en `New()` y los devuelve en `Workers()`, replicando el patrón del consumidor de catálogo.
+
+**Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. `go test ./internal/conversacion/` contra Postgres 16 real: `TestCrearPorEventoEsIdempotente` (reentrega no duplica, tenant=cliente) y `TestCerrarVentanaFijaEscrituraHasta` (3d + 6m) PASS, suite de E3-T2 intacta.
+
 ## 2026-10-28 — E3-T2: exigir reclamo activo en el envío interno; override cerrado en V1
 
 **Resumen:** completa la autorización de envío de E3-T2. Un actor interno ahora debe tener un reclamo activo propio en la versión que afirma (`version_reclamo_esperada`) para enviar; sin él recibe 409. Antes el handler ignoraba ese campo del contrato y bastaba la membresía de pool. El override de supervisor (`motivo_override`) queda **cerrado en V1**: se rechaza con 400 hasta que exista la proyección de alcance jerárquico que lo autorizaría (DEC-107).
