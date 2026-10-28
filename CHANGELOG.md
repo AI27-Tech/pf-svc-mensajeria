@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-10-28 — E3-T2: exigir reclamo activo en el envío interno; override cerrado en V1
+
+**Resumen:** completa la autorización de envío de E3-T2. Un actor interno ahora debe tener un reclamo activo propio en la versión que afirma (`version_reclamo_esperada`) para enviar; sin él recibe 409. Antes el handler ignoraba ese campo del contrato y bastaba la membresía de pool. El override de supervisor (`motivo_override`) queda **cerrado en V1**: se rechaza con 400 hasta que exista la proyección de alcance jerárquico que lo autorizaría (DEC-107).
+
+**Para quién:** para el panel interno y auditoría. Responder una conversación exige el reclamo, no solo pertenecer al pool. El cliente no cambia (no reclama). El override no se abre sin verificación de rol, por seguridad.
+
+**Cambios:**
+- `internal/conversacion/conversacion.go`: `EntradaEnvio` gana `VersionReclamoEsperada *int64` y `MotivoOverride string`. Sentinels `ErrSinReclamoActivo` y `ErrOverrideNoImplementado`. `Enviar` rechaza `motivo_override` antes de abrir la tx (override cerrado, DEC-107); para audiencia interna, `exigirReclamoActivo` verifica en la misma tx —antes de tocar la secuencia— que hay reclamo activo del propio actor en la versión esperada. Rechazo sin efecto. Helpers `esInterno` y `exigirReclamoActivo`.
+- `adapters/http/conversacion/conversacion.go`: el handler pasa `version_reclamo_esperada` y `motivo_override` del body; mapea `ErrSinReclamoActivo` a 409 `conflicto_version_reclamo` y `ErrOverrideNoImplementado` a 400. (Códigos de máquina: la plataforma solo emite el código de categoría, limitación transversal preexistente.)
+- Test `internal/conversacion/guarda_reclamo_test.go`: 6 casos (interno sin versión, versión equivocada, reclamo de otro actor, reclamo correcto, cliente sin reclamo, override cerrado rechazado sin efecto).
+
+**Decidido en esta entrega:** DEC-107 (override cerrado en V1); DEC-108 abierta (condición "pendiente de respuesta", bloqueada por contrato).
+
+**Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. Tests de integración contra Postgres 16 real: `TestEnviarGuardaReclamoInterno` (6 subcasos) PASS, y la suite previa de conversación (envío, reclamo, transferencia, guarda de estado) sigue verde — `TestEnviarMensajeHTTP` ahora ejercita la guarda de reclamo que antes ignoraba.
+
+## 2026-10-28 — E3-T2: guarda de estado en el envío (rechaza conversación no `abierta`)
+
+**Resumen:** cierra un hueco de seguridad del envío: hasta ahora un mensaje sobre una conversación `solo_lectura` o `cerrada` se aceptaba e insertaba. Ahora `Enviar` rechaza cualquier conversación que no esté `abierta`, sin crear mensaje, sin incrementar `siguiente_secuencia` y sin publicar `mensaje.creado`. Es parte del criterio de autorización de envío de E3-T2 (AI27-61); la guarda de reclamo activo + versión esperada (interno) sigue pendiente en su propia unidad.
+
+**Para quién:** para el cliente y el panel interno, que al intentar escribir en una conversación cuya ventana operativa venció (DEC-030/DEC-041) reciben 409, no un mensaje fantasma. Para auditoría: ya no entran mensajes a conversaciones cerradas.
+
+**Cambios:**
+- `internal/conversacion/conversacion.go`: nuevo sentinel `ErrConversacionSoloLectura`. La guarda viaja en el mismo `UPDATE ... WHERE estado = 'abierta'` que toma el lock de fila y asigna la secuencia (atómico, sin lectura previa que abriría una carrera). Si no toca fila, `noAbiertaOInexistente` desambigua en la misma tx inexistente (no_encontrado) vs no-abierta (`ErrConversacionSoloLectura`), solo en el camino de rechazo.
+- `adapters/http/conversacion/conversacion.go`: el handler `enviar` mapea `ErrConversacionSoloLectura` a 409. Nota: el `codigo` de máquina del contrato (`conversacion_solo_lectura`) no se emite literal; la taxonomía de la plataforma solo expone el código de categoría (`conflicto`), limitación transversal preexistente (igual que `conflicto_version_reclamo` en el handler de reclamo).
+- Tests (integración contra Postgres): `internal/conversacion/guarda_estado_test.go` (dominio, casos `solo_lectura` y `cerrada`, afirma efectos nulos); `adapters/http/conversacion/enviar_integration_test.go` suma `TestEnviarMensajeHTTPConversacionSoloLectura` (409 por HTTP).
+
+**Vocabulario del contrato (no inventado):** `EstadoConversacion` enum `[abierta, solo_lectura, cerrada]` y el código `conversacion_solo_lectura` salen de `mensajeria.yaml` (tracer.21).
+
+**Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. Tests de integración ejecutados contra Postgres 16 real: `TestEnviarRechazaConversacionNoAbierta` (solo_lectura + cerrada), `TestEnviarMensajeHTTPConversacionSoloLectura`, y los dos del camino feliz ya existentes, todos PASS.
+
 ## 2026-10-28 — tracer.21: subir el pin de contrato
 
 **Resumen:** se sube el pin de `pf-pkg-contracts` de `v0.1.0-tracer.17` a `v0.1.0-tracer.21` (+4 olas: .18 a .21). Aditivo para `mensajeria`; su superficie (conversación, bandeja, emergencia) no cambia entre .17 y .21. Solo `go.mod`/`go.sum`.
