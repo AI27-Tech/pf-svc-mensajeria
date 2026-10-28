@@ -1,5 +1,5 @@
-github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.17 h1:0ePwmvvJaz/p/QZtGdOYIzZYimoSh7fnaCM/ZeqZI4A=
-github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.17/go.mod h1:JlGX2WLFfC1+gxIhO+I47U002vqxhrjgCKXZZ4+wmY8=
+github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.21 h1:YByiBfCLP9Si3JrZx1A1qVLk/Ooyg/3S0Qpk9i22S5A=
+github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.21/go.mod h1:JlGX2WLFfC1+gxIhO+I47U002vqxhrjgCKXZZ4+wmY8=
 github.com/AI27-Tech/pf-pkg-platform-go v0.1.6 h1:zOk3B1I9rXxBsMEEtaRxn9O8NYUrsxn2PCvH9xOcypY=
 github.com/AI27-Tech/pf-pkg-platform-go v0.1.6/go.mod h1:1djk0Mx1Y8AriWQdqgeRr8PnJbwa+c8dMFZFziZ993Q=
 github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=

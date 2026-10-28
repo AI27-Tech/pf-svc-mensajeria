@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-10-28 — tracer.21: subir el pin de contrato
+
+**Resumen:** se sube el pin de `pf-pkg-contracts` de `v0.1.0-tracer.17` a `v0.1.0-tracer.21` (+4 olas: .18 a .21). Aditivo para `mensajeria`; su superficie (conversación, bandeja, emergencia) no cambia entre .17 y .21. Solo `go.mod`/`go.sum`.
+
+**Para quién:** alineación de versión de contrato con el resto del backend.
+
+**Cambios:**
+- `go.mod`/`go.sum`: `api-client-go` `v0.1.0-tracer.17` → `v0.1.0-tracer.21`.
+
+**Verificación:** `go build/vet ./...`, `go test ./...` (10 paquetes ok), `gofmt` limpio, `arch-test` (v0.1.1) PASS. Sin renombres de enum (§8): el build quedó verde sin tocar constantes, pese al salto de 4 olas.
+
 ## 2026-10-27 — Superficie en proceso del carril de emergencia (E7, para core)
 
 **Para quién:** para `pf-svc-core`, que al co-ubicar `mensajeria` dentro del binario compuesto necesita resolver la arista `bff→mensajeria` EN PROCESO (hasta ahora el diseño la daba por SIEMPRE HTTP). Sin esta superficie, componer `bff` v0.1.4 en core no compilaba: el puerto `bff.MensajeriaPort` no tenía a quién delegar en proceso.
