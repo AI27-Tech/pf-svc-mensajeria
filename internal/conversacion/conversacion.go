@@ -71,6 +71,20 @@ type EntradaEnvio struct {
 	// este rol al leer, no se persiste (no está en el esquema ni es un campo
 	// inmutable del addendum).
 	RolAlEnviar string
+	// VersionReclamoEsperada es la versión del reclamo activo que el actor INTERNO
+	// afirma tener al enviar (concurrencia optimista; contrato
+	// EnviarMensajeEntrada.version_reclamo_esperada, "obligatoria para audiencia
+	// Interno"). nil para el cliente (no requiere reclamo) y para el interno que
+	// invoca override. El dominio exige, para audiencia interna sin override, un
+	// reclamo activo del propio actor en esta versión.
+	VersionReclamoEsperada *int64
+	// MotivoOverride, si no es vacío, pide el override explícito de supervisor
+	// (contrato motivo_override). CERRADO en V1: Enviar lo rechaza con
+	// ErrOverrideNoImplementado, porque verificar que el actor es supervisor con
+	// mando sobre el reclamo exige una proyección de alcance jerárquico que
+	// mensajeria no tiene (DEC-053 §3, DEC-045 #4). Abrirlo sin esa verificación
+	// sería un override invocable por cualquier interno.
+	MotivoOverride string
 }
 
 // ResultadoEnvio es el mensaje tal como quedó: su id y su secuencia canónica.
@@ -95,6 +109,16 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: envío inválido: faltan conversacion_id, actor_real o client_message_id")
 	}
 
+	// Override de supervisor CERRADO en V1: enviar con motivo_override exigiría
+	// verificar que el actor es supervisor con mando sobre el reclamo, y esa
+	// verificación necesita una proyección de alcance jerárquico que mensajeria no
+	// tiene (DEC-053 §3, DEC-045 #4). Permitirlo sin esa verificación sería un
+	// override que cualquier interno podría invocar. Se rechaza hasta que exista
+	// la proyección; no se audita un camino que no se abre.
+	if in.MotivoOverride != "" {
+		return ResultadoEnvio{}, ErrOverrideNoImplementado
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: abrir transacción: %w", err)
@@ -110,6 +134,17 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 	} else if ok {
 		res.Idempotente = true
 		return res, nil
+	}
+
+	// Guarda de envío interno (contrato enviarMensaje, Addendum §7): un actor
+	// interno debe tener un reclamo activo propio en la versión que afirma. Se
+	// verifica DENTRO de la tx, antes de tocar la secuencia, para que un rechazo
+	// no deje efecto (ni incremento ni mensaje). El cliente no pasa por aquí (no
+	// reclama). El override quedó rechazado antes de abrir la tx (V1 cerrado).
+	if esInterno(in.RolAlEnviar) {
+		if err := exigirReclamoActivo(ctx, tx, in); err != nil {
+			return ResultadoEnvio{}, err
+		}
 	}
 
 	// Asignar secuencia bajo el bloqueo de fila de la conversación. La guarda de
@@ -211,6 +246,42 @@ func esViolacionUnica(err error) bool {
 	return false
 }
 
+// esInterno indica si el rol corresponde a un actor interno (cualquiera salvo
+// `cliente`). Mismo criterio que audienciaDesdeRol, en positivo: un rol vacío se
+// trata como cliente (en V1 solo el cliente escribe sin rol interno registrado),
+// así que no interno.
+func esInterno(rol string) bool {
+	return rol != "" && rol != "cliente"
+}
+
+// exigirReclamoActivo verifica, en la tx del envío, que el actor interno tiene un
+// reclamo activo propio en la versión esperada. Devuelve ErrSinReclamoActivo si
+// falta la versión esperada, si no hay reclamo activo, si su versión no coincide
+// o si el reclamo es de otro actor. El contrato pide version_reclamo_esperada
+// obligatoria para audiencia interna, así que su ausencia ya es rechazo.
+func exigirReclamoActivo(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error {
+	if in.VersionReclamoEsperada == nil {
+		return fmt.Errorf("conversacion: envío interno sin version_reclamo_esperada: %w", ErrSinReclamoActivo)
+	}
+	var actorReclamo string
+	var version int64
+	err := tx.QueryRow(ctx,
+		`SELECT actor_real, version FROM mensajeria.reclamo
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL`,
+		in.ConversacionID, in.TenantID,
+	).Scan(&actorReclamo, &version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("conversacion: sin reclamo activo: %w", ErrSinReclamoActivo)
+	}
+	if err != nil {
+		return fmt.Errorf("conversacion: leer reclamo activo para el envío: %w", err)
+	}
+	if actorReclamo != in.ActorReal || version != *in.VersionReclamoEsperada {
+		return fmt.Errorf("conversacion: reclamo de otro actor o versión distinta (actor %s v%d): %w", actorReclamo, version, ErrSinReclamoActivo)
+	}
+	return nil
+}
+
 // noAbiertaOInexistente explica por qué el UPDATE con guarda `estado = 'abierta'`
 // no tocó fila: la conversación no existe para el tenant, o existe pero no está
 // `abierta`. Lee en la MISMA tx (el lector llega aquí solo en el camino de
@@ -242,6 +313,18 @@ var ErrMensajeNoEncontrado = errors.New("conversacion: mensaje no encontrado")
 // ni outbox). El contrato lo expone como 409 con `codigo` conversacion_solo_lectura
 // (mensajeria.yaml; DEC-030/DEC-041).
 var ErrConversacionSoloLectura = errors.New("conversacion: la conversación no admite escritura")
+
+// ErrSinReclamoActivo lo devuelve Enviar cuando un actor INTERNO (sin override)
+// intenta enviar sin un reclamo activo propio en la versión esperada: o no hay
+// reclamo activo, o la versión no coincide, o el reclamo es de otro actor. El
+// contrato lo expone como 409 `conflicto_version_reclamo` (mensajeria.yaml,
+// Addendum §7). El cliente NO pasa por esta guarda (no reclama).
+var ErrSinReclamoActivo = errors.New("conversacion: envío interno sin reclamo activo en la versión esperada")
+
+// ErrOverrideNoImplementado lo devuelve Enviar cuando se pide un override de
+// supervisor (motivo_override presente). V1 no lo implementa: ver EntradaEnvio.
+// MotivoOverride. El handler lo mapea a 501 no implementado.
+var ErrOverrideNoImplementado = errors.New("conversacion: override de supervisor no implementado en V1")
 
 // MensajePorID lee un mensaje y lo mapea al Mensaje del contrato (hidratación
 // para el handler HTTP; Enviar solo devuelve id y secuencia). La audiencia_autor

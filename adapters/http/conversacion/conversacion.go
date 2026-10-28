@@ -249,14 +249,26 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var versionEsperada *int64
+	if entrada.VersionReclamoEsperada != nil {
+		v := int64(*entrada.VersionReclamoEsperada)
+		versionEsperada = &v
+	}
+	motivoOverride := ""
+	if entrada.MotivoOverride != nil {
+		motivoOverride = *entrada.MotivoOverride
+	}
+
 	res, err := h.Conversacion.Enviar(r.Context(), conversacion.EntradaEnvio{
-		TenantID:        claims.TenantID,
-		ConversacionID:  convID,
-		ActorReal:       claims.Subject,
-		ClientMessageID: entrada.ClientMessageId.String(),
-		Cuerpo:          entrada.Cuerpo,
-		AliasMostrado:   alias,
-		RolAlEnviar:     claims.Rol,
+		TenantID:               claims.TenantID,
+		ConversacionID:         convID,
+		ActorReal:              claims.Subject,
+		ClientMessageID:        entrada.ClientMessageId.String(),
+		Cuerpo:                 entrada.Cuerpo,
+		AliasMostrado:          alias,
+		RolAlEnviar:            claims.Rol,
+		VersionReclamoEsperada: versionEsperada,
+		MotivoOverride:         motivoOverride,
 	})
 	if err != nil {
 		// Conversación no `abierta` (solo_lectura/cerrada): 409, como el conflicto
@@ -266,6 +278,21 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		// conflicto_version_reclamo (no se resuelve en esta historia).
 		if errors.Is(err, conversacion.ErrConversacionSoloLectura) {
 			escribirError(w, platformerrors.NewConflicto("conversacion_solo_lectura"))
+			return
+		}
+		// Envío interno sin reclamo activo en la versión esperada: 409
+		// conflicto_version_reclamo (Addendum §7). Misma limitación del código de
+		// máquina que arriba: se emite la categoría conflicto.
+		if errors.Is(err, conversacion.ErrSinReclamoActivo) {
+			escribirError(w, platformerrors.NewConflicto("conflicto_version_reclamo"))
+			return
+		}
+		// Override de supervisor no implementado en V1 (cerrado hasta que exista la
+		// proyección de alcance jerárquico). Se rechaza como petición inválida: el
+		// campo motivo_override no es procesable en esta versión. 400 está en el
+		// contrato de enviarMensaje; no se inventa un 501 fuera de contrato.
+		if errors.Is(err, conversacion.ErrOverrideNoImplementado) {
+			escribirError(w, platformerrors.NewValidacion("motivo_override no está disponible en V1"))
 			return
 		}
 		escribirError(w, traducir(err))
