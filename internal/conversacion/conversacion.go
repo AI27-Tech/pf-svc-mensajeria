@@ -112,17 +112,22 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		return res, nil
 	}
 
-	// Asignar secuencia bajo el bloqueo de fila de la conversación.
+	// Asignar secuencia bajo el bloqueo de fila de la conversación. La guarda de
+	// estado viaja en el mismo UPDATE (AND estado = 'abierta'): toma el lock y
+	// aplica la condición atómicamente, sin una lectura previa que abriría una
+	// carrera entre leer el estado y escribir. Si no toca fila, puede ser que la
+	// conversación no exista o que exista pero no esté `abierta`; se desambigua
+	// con una lectura solo en ese camino de rechazo (el camino feliz no paga).
 	var seq int64
 	err = tx.QueryRow(ctx,
 		`UPDATE mensajeria.conversacion
 		    SET siguiente_secuencia = siguiente_secuencia + 1
-		  WHERE id = $1 AND tenant_id = $2
+		  WHERE id = $1 AND tenant_id = $2 AND estado = 'abierta'
 		  RETURNING siguiente_secuencia`,
 		in.ConversacionID, in.TenantID,
 	).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ResultadoEnvio{}, fmt.Errorf("conversacion: %s no existe para el tenant %s", in.ConversacionID, in.TenantID)
+		return ResultadoEnvio{}, noAbiertaOInexistente(ctx, tx, in)
 	}
 	if err != nil {
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: asignar secuencia: %w", err)
@@ -206,8 +211,37 @@ func esViolacionUnica(err error) bool {
 	return false
 }
 
+// noAbiertaOInexistente explica por qué el UPDATE con guarda `estado = 'abierta'`
+// no tocó fila: la conversación no existe para el tenant, o existe pero no está
+// `abierta`. Lee en la MISMA tx (el lector llega aquí solo en el camino de
+// rechazo, así que la lectura extra no pesa en el envío normal). Devuelve
+// ErrConversacionSoloLectura cuando existe y no está abierta; el error de
+// inexistencia conserva el texto previo.
+func noAbiertaOInexistente(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error {
+	var estado string
+	err := tx.QueryRow(ctx,
+		`SELECT estado FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
+		in.ConversacionID, in.TenantID,
+	).Scan(&estado)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("conversacion: %s no existe para el tenant %s", in.ConversacionID, in.TenantID)
+	}
+	if err != nil {
+		return fmt.Errorf("conversacion: desambiguar estado del envío: %w", err)
+	}
+	// Existe pero el UPDATE la excluyó: su estado no es `abierta`.
+	return fmt.Errorf("conversacion: %s en estado %q: %w", in.ConversacionID, estado, ErrConversacionSoloLectura)
+}
+
 // ErrMensajeNoEncontrado lo devuelve MensajePorID cuando el mensaje no existe.
 var ErrMensajeNoEncontrado = errors.New("conversacion: mensaje no encontrado")
+
+// ErrConversacionSoloLectura lo devuelve Enviar cuando la conversación existe
+// pero no está `abierta` (quedó `solo_lectura` al vencer escritura_hasta, o
+// `cerrada`): el envío se rechaza sin ningún efecto (ni mensaje, ni secuencia,
+// ni outbox). El contrato lo expone como 409 con `codigo` conversacion_solo_lectura
+// (mensajeria.yaml; DEC-030/DEC-041).
+var ErrConversacionSoloLectura = errors.New("conversacion: la conversación no admite escritura")
 
 // MensajePorID lee un mensaje y lo mapea al Mensaje del contrato (hidratación
 // para el handler HTTP; Enviar solo devuelve id y secuencia). La audiencia_autor

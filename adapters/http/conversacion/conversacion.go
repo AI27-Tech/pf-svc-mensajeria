@@ -259,6 +259,15 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		RolAlEnviar:     claims.Rol,
 	})
 	if err != nil {
+		// Conversación no `abierta` (solo_lectura/cerrada): 409, como el conflicto
+		// de versión de reclamo. El contrato lo marca con `codigo`
+		// conversacion_solo_lectura; la taxonomía de la plataforma solo expone el
+		// código de categoría (`conflicto`), limitación transversal igual que en
+		// conflicto_version_reclamo (no se resuelve en esta historia).
+		if errors.Is(err, conversacion.ErrConversacionSoloLectura) {
+			escribirError(w, platformerrors.NewConflicto("conversacion_solo_lectura"))
+			return
+		}
 		escribirError(w, traducir(err))
 		return
 	}
