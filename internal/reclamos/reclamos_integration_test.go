@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/dbtest"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 )
@@ -48,7 +49,7 @@ func TestReclamoConcurrenteProduceGanadorYConflicto(t *testing.T) {
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
-	svc := reclamos.NewServicio(pool)
+	svc := reclamos.NewServicio(pool, outbox.NewPublisher())
 
 	// Dos reclamos concurrentes exigiendo la MISMA versión esperada (1).
 	type salida struct {
@@ -125,7 +126,7 @@ func TestLiberarCierraElReclamoYDevuelveAlPool(t *testing.T) {
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
-	svc := reclamos.NewServicio(pool)
+	svc := reclamos.NewServicio(pool, outbox.NewPublisher())
 
 	// El reclamo activo existe; obtener su id para liberar por rid.
 	activo, err := svc.ReclamoActivo(ctx, tenant, convID)
@@ -188,7 +189,7 @@ func TestTransferirCierraYAbreEnUnaTx(t *testing.T) {
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
-	svc := reclamos.NewServicio(pool)
+	svc := reclamos.NewServicio(pool, outbox.NewPublisher())
 
 	// Versión vieja (0): conflicto, el reclamo del origen sigue activo.
 	if err := svc.Transferir(ctx, tenant, convID, origen, destino, "", 0); !esConflicto(err) {
@@ -229,5 +230,99 @@ func TestTransferirCierraYAbreEnUnaTx(t *testing.T) {
 	}
 	if activos != 1 {
 		t.Fatalf("debe haber exactamente 1 reclamo activo tras transferir, hay %d", activos)
+	}
+}
+
+// TestEventosDeReclamoSeEscribenEnOutbox cubre E3-T3: cada mutación del reclamo
+// publica su evento de dominio en el outbox DENTRO de su tx (reclamar →
+// conversacion.reclamada, liberar → conversacion.liberada, transferir →
+// conversacion.transferida). Es la pieza que realtime (consumidor durable del
+// contrato tracer.21) necesita para reflejar quién responde la conversación.
+//
+// Prueba de comportamiento contra Postgres real: afirma, por cada operación, que
+// quedó EXACTAMENTE una fila del tipo esperado, restringida, con agregado_id =
+// conversacion_id, y con el payload que el contrato define. Se salta sin
+// MENSAJERIA_TEST_DB.
+func TestEventosDeReclamoSeEscribenEnOutbox(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dbtest.Serializar(t, ctx)
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	dbtest.Reiniciar(t, ctx, admin)
+	defer dbtest.Reiniciar(t, ctx, admin)
+	dbtest.AplicarMigraciones(t, ctx, admin)
+
+	tenant := "t1"
+	convID := "11111111-1111-1111-1111-111111111111"
+	actor := "22222222-2222-2222-2222-222222222222"
+	destino := "33333333-3333-3333-3333-333333333333"
+
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.conversacion (id, tenant_id, viaje_id, estado, siguiente_secuencia)
+		 VALUES ('`+convID+`', '`+tenant+`', gen_random_uuid(), 'abierta', 0)`)
+
+	pool, closePool := dbtest.PoolComoRol(t, ctx)
+	defer closePool()
+	svc := reclamos.NewServicio(pool, outbox.NewPublisher())
+
+	// contarEvento devuelve cuántas filas del tipo dado hay en el outbox para esta
+	// conversación, exigiendo la sensibilidad y el agregado del contrato.
+	contarEvento := func(tipo string) int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM mensajeria.outbox
+			  WHERE tipo = $1 AND agregado_id = $2
+			    AND sensibilidad = 'restringida'`,
+			tipo, convID,
+		).Scan(&n); err != nil {
+			t.Fatalf("contar evento %s: %v", tipo, err)
+		}
+		return n
+	}
+
+	// Reclamar (primer reclamo): 1 evento conversacion.reclamada.
+	if _, err := svc.Reclamar(ctx, tenant, convID, actor, 0); err != nil {
+		t.Fatalf("reclamar: %v", err)
+	}
+	if n := contarEvento("conversacion.reclamada"); n != 1 {
+		t.Fatalf("tras reclamar quiere 1 conversacion.reclamada, hay %d", n)
+	}
+
+	// El payload lleva el responsable y la versión resultante (1).
+	var payload map[string]any
+	if err := pool.QueryRow(ctx,
+		`SELECT payload FROM mensajeria.outbox WHERE tipo = 'conversacion.reclamada' AND agregado_id = $1`,
+		convID,
+	).Scan(&payload); err != nil {
+		t.Fatalf("leer payload de reclamada: %v", err)
+	}
+	if payload["responsable_id"] != actor {
+		t.Fatalf("payload.responsable_id = %v, quiere %s", payload["responsable_id"], actor)
+	}
+	if v, ok := payload["version_reclamo"].(float64); !ok || v != 1 {
+		t.Fatalf("payload.version_reclamo = %v, quiere 1", payload["version_reclamo"])
+	}
+
+	// Transferir (versión 1): 1 evento conversacion.transferida al destino.
+	if err := svc.Transferir(ctx, tenant, convID, actor, destino, "escalamiento", 1); err != nil {
+		t.Fatalf("transferir: %v", err)
+	}
+	if n := contarEvento("conversacion.transferida"); n != 1 {
+		t.Fatalf("tras transferir quiere 1 conversacion.transferida, hay %d", n)
+	}
+
+	// Liberar el reclamo del destino (versión 1): 1 evento conversacion.liberada.
+	activo, err := svc.ReclamoActivo(ctx, tenant, convID)
+	if err != nil {
+		t.Fatalf("leer reclamo activo del destino: %v", err)
+	}
+	if err := svc.Liberar(ctx, tenant, convID, activo.Id.String(), destino, 1); err != nil {
+		t.Fatalf("liberar: %v", err)
+	}
+	if n := contarEvento("conversacion.liberada"); n != 1 {
+		t.Fatalf("tras liberar quiere 1 conversacion.liberada, hay %d", n)
 	}
 }
