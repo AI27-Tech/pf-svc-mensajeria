@@ -147,17 +147,20 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		}
 	}
 
-	// Asignar secuencia bajo el bloqueo de fila de la conversación. La guarda de
-	// estado viaja en el mismo UPDATE (AND estado = 'abierta'): toma el lock y
-	// aplica la condición atómicamente, sin una lectura previa que abriría una
-	// carrera entre leer el estado y escribir. Si no toca fila, puede ser que la
-	// conversación no exista o que exista pero no esté `abierta`; se desambigua
-	// con una lectura solo en ese camino de rechazo (el camino feliz no paga).
+	// Asignar secuencia bajo el bloqueo de fila de la conversación. Dos guardas
+	// viajan en el mismo UPDATE, atómicamente, sin lectura previa que abriría una
+	// carrera: el estado debe ser 'abierta' Y la ventana de escritura no debe haber
+	// vencido (escritura_hasta nula = sin límite aún, o en el futuro). Una
+	// conversación 'abierta' cuyo escritura_hasta ya pasó se rechaza igual que una
+	// 'solo_lectura' (DEC-030/041): el estado materializado llega después por
+	// barrido, pero el envío no espera a él. Si no toca fila, se desambigua con una
+	// lectura solo en ese camino de rechazo (el camino feliz no paga).
 	var seq int64
 	err = tx.QueryRow(ctx,
 		`UPDATE mensajeria.conversacion
 		    SET siguiente_secuencia = siguiente_secuencia + 1
 		  WHERE id = $1 AND tenant_id = $2 AND estado = 'abierta'
+		    AND (escritura_hasta IS NULL OR escritura_hasta > now())
 		  RETURNING siguiente_secuencia`,
 		in.ConversacionID, in.TenantID,
 	).Scan(&seq)
@@ -282,25 +285,31 @@ func exigirReclamoActivo(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error 
 	return nil
 }
 
-// noAbiertaOInexistente explica por qué el UPDATE con guarda `estado = 'abierta'`
-// no tocó fila: la conversación no existe para el tenant, o existe pero no está
-// `abierta`. Lee en la MISMA tx (el lector llega aquí solo en el camino de
-// rechazo, así que la lectura extra no pesa en el envío normal). Devuelve
-// ErrConversacionSoloLectura cuando existe y no está abierta; el error de
-// inexistencia conserva el texto previo.
+// noAbiertaOInexistente explica por qué el UPDATE con las guardas
+// (estado = 'abierta' AND ventana vigente) no tocó fila: la conversación no
+// existe para el tenant, o existe pero no admite escritura (estado no abierto, o
+// abierto con escritura_hasta vencida). Lee en la MISMA tx (el lector llega aquí
+// solo en el camino de rechazo, así que la lectura extra no pesa en el envío
+// normal). Devuelve ErrConversacionSoloLectura cuando existe y no admite
+// escritura; el error de inexistencia conserva el texto previo.
 func noAbiertaOInexistente(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error {
 	var estado string
+	var escrituraHasta *time.Time
 	err := tx.QueryRow(ctx,
-		`SELECT estado FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
+		`SELECT estado, escritura_hasta FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
 		in.ConversacionID, in.TenantID,
-	).Scan(&estado)
+	).Scan(&estado, &escrituraHasta)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("conversacion: %s no existe para el tenant %s", in.ConversacionID, in.TenantID)
 	}
 	if err != nil {
 		return fmt.Errorf("conversacion: desambiguar estado del envío: %w", err)
 	}
-	// Existe pero el UPDATE la excluyó: su estado no es `abierta`.
+	// Existe pero el UPDATE la excluyó: su estado no es `abierta`, o su ventana de
+	// escritura venció. Ambos casos son "no admite escritura" (ErrConversacionSoloLectura).
+	if estado == "abierta" {
+		return fmt.Errorf("conversacion: %s con ventana de escritura vencida: %w", in.ConversacionID, ErrConversacionSoloLectura)
+	}
 	return fmt.Errorf("conversacion: %s en estado %q: %w", in.ConversacionID, estado, ErrConversacionSoloLectura)
 }
 

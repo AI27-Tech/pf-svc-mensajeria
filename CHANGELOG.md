@@ -11,6 +11,7 @@
 - `internal/conversacion/conversacion.go`: `CrearPorEvento` (INSERT idempotente por el índice único parcial `una_conversacion_activa_por_viaje`, `ON CONFLICT DO NOTHING`; tenant_id = cliente_id, DEC-049) y `CerrarVentana` (fija `escritura_hasta` según motivo_cierre, acotado por viaje_id, convergente). No usan inbox_evento: el invariante de unicidad del negocio es el árbitro (DEC-067, igual que el envío).
 - `internal/consumidores/conversacion.go` (nuevo): `ConsumidorHabilitada` y `ConsumidorCerrado`, puertos estrechos, idempotencia durable. `viaje.acceso_revocado` NO se implementa (su productor no existe en operacion; E3-T1 lo marca bloqueado).
 - `mensajeria.go`: cablea los dos consumidores en `New()` y los devuelve en `Workers()`, replicando el patrón del consumidor de catálogo.
+- `internal/conversacion/conversacion.go` (`Enviar`): la guarda de envío ahora también rechaza si `escritura_hasta` ya venció (no solo si el estado no es `abierta`), con `ErrConversacionSoloLectura`. Cierra el hueco entre el vencimiento de la ventana y el barrido que materializará `solo_lectura`: el estado se deriva de `escritura_hasta` en el momento del envío. La condición viaja en el mismo `UPDATE` (atómica, sin lectura previa).
 
 **Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. `go test ./internal/conversacion/` contra Postgres 16 real: `TestCrearPorEventoEsIdempotente` (reentrega no duplica, tenant=cliente) y `TestCerrarVentanaFijaEscrituraHasta` (3d + 6m) PASS, suite de E3-T2 intacta.
 
