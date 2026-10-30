@@ -367,8 +367,16 @@ func (s *Servicio) MensajePorID(ctx context.Context, tenantID, mensajeID string)
 		return nil, fmt.Errorf("conversacion: leer mensaje: %w", err)
 	}
 
+	m := mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo, secuencia, alias, rol, creadoEn)
+	return &m, nil
+}
+
+// mapearMensaje hidrata un msgclient.Mensaje desde las columnas de una fila de
+// mensajeria.mensaje. Misma forma que MensajePorID (AudienciaAutor derivada del
+// rol); se extrae para reusarla al listar.
+func mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo string, secuencia int64, alias, rol *string, creadoEn time.Time) msgclient.Mensaje {
 	actor := uuid.MustParse(actorReal)
-	m := &msgclient.Mensaje{
+	m := msgclient.Mensaje{
 		Id:              uuid.MustParse(id),
 		ConversacionId:  uuid.MustParse(convID),
 		ClientMessageId: uuid.MustParse(clientMsgID),
@@ -385,7 +393,183 @@ func (s *Servicio) MensajePorID(ctx context.Context, tenantID, mensajeID string)
 		r := msgclient.Rol(*rol)
 		m.RolAlEnviar = &r
 	}
-	return m, nil
+	return m
+}
+
+// ListarMensajes devuelve una página de mensajes de la conversación, ordenados
+// por secuencia canónica ascendente (contrato listarMensajes). `antesDe` pagina
+// hacia atrás (secuencia menor); `despuesDe` recupera tras reconexión (secuencia
+// mayor); son mutuamente excluyentes y sin ninguno devuelve los más recientes.
+// `hayMas` indica si quedan mensajes en la dirección pedida: se pide un elemento
+// extra (limite+1) y se recorta. No decide ACCESO: eso lo hace la frontera con
+// autorizacion.PuedeEscribir antes de llamar aquí (addendum §7).
+func (s *Servicio) ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error) {
+	if limite <= 0 {
+		limite = 50
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// `despues_de` ordena ascendente desde la secuencia dada; `antes_de` toma las
+	// secuencias menores pero devolviéndolas ascendentes (se ordena DESC para el
+	// LIMIT y se invierte después); sin cursor, los más recientes en orden ascendente.
+	var filas []msgclient.Mensaje
+	base := `SELECT id, conversacion_id, actor_real, client_message_id, secuencia, cuerpo,
+	                alias_mostrado, rol_al_enviar, creado_en
+	           FROM mensajeria.mensaje
+	          WHERE conversacion_id = $1 AND tenant_id = $2`
+	var rows pgx.Rows
+	switch {
+	case despuesDe != nil:
+		rows, err = tx.Query(ctx, base+` AND secuencia > $3 ORDER BY secuencia ASC LIMIT $4`,
+			conversacionID, tenantID, *despuesDe, limite+1)
+	case antesDe != nil:
+		rows, err = tx.Query(ctx, base+` AND secuencia < $3 ORDER BY secuencia DESC LIMIT $4`,
+			conversacionID, tenantID, *antesDe, limite+1)
+	default:
+		rows, err = tx.Query(ctx, base+` ORDER BY secuencia DESC LIMIT $3`,
+			conversacionID, tenantID, limite+1)
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("conversacion: listar mensajes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id, convID, actorReal, clientMsgID, cuerpo string
+			alias, rol                                 *string
+			secuencia                                  int64
+			creadoEn                                   time.Time
+		)
+		if err := rows.Scan(&id, &convID, &actorReal, &clientMsgID, &secuencia, &cuerpo, &alias, &rol, &creadoEn); err != nil {
+			return nil, false, fmt.Errorf("conversacion: escanear mensaje: %w", err)
+		}
+		filas = append(filas, mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo, secuencia, alias, rol, creadoEn))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("conversacion: filas de mensaje: %w", err)
+	}
+
+	hayMas := len(filas) > limite
+	if hayMas {
+		filas = filas[:limite]
+	}
+	// `antes_de` y el default consultaron DESC para el LIMIT; el contrato entrega
+	// siempre orden ascendente de secuencia, así que se invierte.
+	if despuesDe == nil {
+		for i, j := 0, len(filas)-1; i < j; i, j = i+1, j-1 {
+			filas[i], filas[j] = filas[j], filas[i]
+		}
+	}
+	if filas == nil {
+		filas = []msgclient.Mensaje{}
+	}
+	return filas, hayMas, nil
+}
+
+// ObtenerConversacion hidrata el agregado Conversacion del contrato para el
+// bootstrap de la conversación. Lee la conversación, su marca de atendida
+// (estado_atendido, LEFT JOIN) y su reclamo activo (version + agregado) en una
+// sola lectura. `ultima_secuencia` = siguiente_secuencia - 1, con clamp a 0
+// cuando no hay mensajes (siguiente_secuencia arranca en 0). `version_reclamo`
+// es 0 si nunca se reclamó (contrato). Devuelve el agregado COMPLETO, incluidos
+// los campos solo-interno (bandeja_id, reclamo_activo); el recorte por audiencia
+// lo hace el consumidor (el `bff` arma su propio schema de cliente). No decide
+// ACCESO: lo hace la frontera con autorizacion.PuedeEscribir.
+func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		id, viajeID, estado string
+		clienteID           *string
+		siguienteSecuencia  int64
+		escrituraHasta      *time.Time
+		creadoEn            time.Time
+		atendidaEn          *time.Time
+		bandejaID           *string
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
+		        c.escritura_hasta, c.creado_en, a.atendida_en, r.bandeja_id
+		   FROM mensajeria.conversacion c
+		   LEFT JOIN mensajeria.estado_atendido a
+		          ON a.conversacion_id = c.id AND a.tenant_id = c.tenant_id AND a.atendida
+		   LEFT JOIN mensajeria.ruta_conversacion r
+		          ON r.conversacion_id = c.id AND r.tenant_id = c.tenant_id AND r.activa
+		  WHERE c.id = $1 AND c.tenant_id = $2`,
+		conversacionID, tenantID,
+	).Scan(&id, &viajeID, &clienteID, &estado, &siguienteSecuencia, &escrituraHasta, &creadoEn, &atendidaEn, &bandejaID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrConversacionNoEncontrada
+	}
+	if err != nil {
+		return nil, fmt.Errorf("conversacion: leer conversacion: %w", err)
+	}
+
+	// ultima_secuencia: `siguiente_secuencia` es un contador que se incrementa y
+	// cuyo valor ASIGNADO es la última secuencia del último mensaje (Enviar hace
+	// `SET siguiente_secuencia = siguiente_secuencia + 1 RETURNING ...` y asigna
+	// ese valor al mensaje). Así, con N mensajes vale N, y sin mensajes vale 0: es
+	// directamente la última secuencia. El nombre engaña (no es "la próxima").
+	ultimaSecuencia := siguienteSecuencia
+	if ultimaSecuencia < 0 {
+		ultimaSecuencia = 0
+	}
+
+	conv := &msgclient.Conversacion{
+		Id:              uuid.MustParse(id),
+		ViajeId:         uuid.MustParse(viajeID),
+		Estado:          msgclient.EstadoConversacion(estado),
+		UltimaSecuencia: ultimaSecuencia,
+		EscrituraHasta:  escrituraHasta,
+		AtendidaEn:      atendidaEn,
+		AbiertaEn:       creadoEn,
+	}
+	if clienteID != nil {
+		conv.ClienteId = uuid.MustParse(*clienteID)
+	}
+	if bandejaID != nil {
+		b := uuid.MustParse(*bandejaID)
+		conv.BandejaId = &b
+	}
+
+	// Reclamo activo (solo-interno): version_reclamo + el agregado. 0 si no hay.
+	var (
+		rid, rconv, rresp string
+		rversion          int64
+		rabierto          time.Time
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT id, conversacion_id, actor_real, version, abierto_en
+		   FROM mensajeria.reclamo
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL`,
+		conversacionID, tenantID,
+	).Scan(&rid, &rconv, &rresp, &rversion, &rabierto)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		conv.VersionReclamo = 0 // nunca reclamado (contrato)
+	case err != nil:
+		return nil, fmt.Errorf("conversacion: leer reclamo activo: %w", err)
+	default:
+		conv.VersionReclamo = rversion
+		conv.ReclamoActivo = &msgclient.Reclamo{
+			Id:             uuid.MustParse(rid),
+			ConversacionId: uuid.MustParse(rconv),
+			ResponsableId:  uuid.MustParse(rresp),
+			Version:        rversion,
+			AbiertoEn:      rabierto,
+		}
+	}
+
+	return conv, nil
 }
 
 // audienciaDesdeRol mapea el rol a la Audiencia de dominio (DEC-054): solo
