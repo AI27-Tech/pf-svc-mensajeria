@@ -113,7 +113,7 @@ func New(p Pools, d Deps) (*Module, error) {
 
 	pub := outbox.NewPublisher()
 	m.conversacion = conversacion.NewServicio(p.Chat, pub)
-	m.reclamos = reclamos.NewServicio(p.Chat)
+	m.reclamos = reclamos.NewServicio(p.Chat, pub)
 	m.autz = autorizacion.NewServicio(p.Chat)
 	m.bandejas = bandejas.NewServicio(p.Chat)
 	m.emergencias = emergencias.NewServicio(p.Chat, pub)

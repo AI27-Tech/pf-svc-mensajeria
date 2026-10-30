@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-10-29 — E3-T3: eventos de reclamo publicados por outbox
+
+**Resumen:** cada mutación del reclamo de una conversación ahora publica su evento de dominio en el outbox DENTRO de su misma transacción: `Reclamar` emite `conversacion.reclamada`, `Liberar` emite `conversacion.liberada`, `Transferir` emite `conversacion.transferida`. Antes `internal/reclamos` solo escribía el reclamo (y auditoría en la transferencia), sin dejar rastro en el bus. Completa el criterio de E3-T3 "Eventos conversacion.reclamada/liberada/transferida publicados por outbox".
+
+**Para quién:** para `realtime` (y `reportes` en la transferencia), que el contrato tracer.21 declara consumidores durables de estos tres eventos. Es el puente hacia E3-T5: sin estos eventos, realtime no puede reflejar quién responde la conversación. El camino HTTP y la semántica de concurrencia no cambian; solo se añade la publicación.
+
+**Cambios:**
+- `internal/reclamos/reclamos.go`: `Servicio` gana un `Publicador` (interfaz mínima de un método declarada por el consumidor, satisfecha por `*outbox.Publisher`); `NewServicio(pool, pub)`. `Reclamar`, `Liberar` y `Transferir` publican su evento en la tx existente, con `sensibilidad=restringida`, `agregado_id=conversacion_id` y el payload que define el contrato (`conversacion_id`, `reclamo_id`/`reclamo_anterior_id`, `responsable_id`, `version_reclamo`). `abrir` y el cierre de transferencia ahora devuelven el `id` del reclamo vía `RETURNING id` para el payload. `Reclamar` emite el evento en sus dos caminos (abrir el primer reclamo y reasignar/avanzar uno activo), porque ambos cambian el responsable que realtime muestra.
+- `mensajeria.go`: cablea el `Publisher` existente en `reclamos.NewServicio` (mismo `pub` que ya usa `conversacion`).
+- `internal/reclamos/reclamos_integration_test.go`: los tres tests existentes migran al nuevo constructor. Nuevo `TestEventosDeReclamoSeEscribenEnOutbox`: tras reclamar/transferir/liberar afirma exactamente una fila del tipo esperado en `mensajeria.outbox`, restringida, con el payload del contrato (responsable y versión).
+
+**Fuera de alcance (no es trabajo del Lead):** el override auditado de supervisor sigue cerrado (`ErrOverrideNoImplementado`, DEC-107): requiere la proyección de alcance jerárquico que mensajeria no tiene (DEC-053/DEC-045). Es bloqueo de producto, no de este slice.
+
+**Verificación:** `gofmt`, `go build ./...`, `go vet ./...` verdes. Suite completa contra Postgres 16 real (Docker efímero): `TestEventosDeReclamoSeEscribenEnOutbox` PASS y las pruebas de concurrencia/liberar/transferir/HTTP intactas.
+
 ## 2026-10-28 — E3-T1: ciclo de vida de la conversación por evento del viaje
 
 **Resumen:** la conversación de un viaje ahora nace y fija su ventana de escritura por EVENTO, no por petición. Dos consumidores durables nuevos sobre la superficie amplia del bus: `viaje.mensajeria_habilitada` crea la conversación (idempotente); `viaje.cerrado` fija `escritura_hasta` (3 días sin incidencia, 6 meses con incidencia, DEC-030/DEC-041). Más la columna `legal_hold` que faltaba en la tabla. No existe endpoint para que el cliente cree una conversación: solo el evento la crea.
