@@ -1,5 +1,83 @@
 # CHANGELOG
 
+## 2026-10-29 — E9-T8 (B.0): lectura de la conversación del viaje (obtenerConversacion, listarMensajes)
+
+**Resumen:** monta los dos GET de lectura de conversación que el contrato (tracer.21) ya definía pero el servicio no servía: `GET /api/v1/conversaciones/{id}` (`obtenerConversacion`) y `GET /api/v1/conversaciones/{id}/mensajes` (`listarMensajes`). Es el pre-requisito de servicio (paso B.0) para exponer la conversación del viaje al portal cliente (E9-T8) a través del `bff`.
+
+**Para quién:** desbloquea la Ola B. Cuando el `bff` proyecte la superficie de cliente, podrá leer la conversación y su historia reenviando a estos GET. La escritura (`enviarMensaje`) ya existía.
+
+**Cambios:**
+- `internal/conversacion`: `ObtenerConversacion` hidrata el agregado `Conversacion` (conversación + `estado_atendido` + ruta activa + reclamo activo en una lectura); `ultima_secuencia` = `siguiente_secuencia` (la última secuencia asignada; 0 sin mensajes); `version_reclamo` 0 si no hay reclamo. `ListarMensajes` pagina por secuencia canónica (`antes_de`/`despues_de`/`limite`, mutuamente excluyentes), orden de salida siempre ascendente, `hay_mas` por `limite+1`. Se extrae `mapearMensaje` (reusada por `MensajePorID`). `audiencia_autor` se deriva del rol al leer, como ya hacía el envío.
+- `adapters/http/conversacion`: handlers `obtener` y `listarMensajes` + sus rutas; autorización de ACCESO reusando `PuedeEscribir` (cliente dueño o membresía de pool).
+
+**Alcance (recorte ratificado):** B.0 hace solo los dos GET. `marcarAtendida` se difiere: es acción interna del Ejecutivo (superficie E3), no del portal cliente, y arrastra una regla de producto sin levantar (si exige el reclamo activo del propio actor). El campo "atendido" ya se expone en la lectura (`atendida_en`), null mientras nadie lo marque.
+
+**Nota de seguridad (hallazgo):** el aislamiento del cliente sigue el criterio preexistente de `autorizacion`: 404 si la conversación no existe, 401 si existe pero el cliente no es el dueño. Difiere del 404-para-ajeno que usa `operacion` (E9-T7); unificar el criterio entre superficies de cliente es una decisión aparte, registrada en el plan de olas.
+
+**Devuelve el agregado completo; el `bff` recorta por audiencia** para su schema de cliente (no expone `bandeja_id` ni `reclamo_activo`). El servicio no recorta.
+
+**Verificación:** `gofmt`, `go vet ./...`, `go build ./...`, `go test ./...` en verde contra Postgres 16. Tests de dominio (hidratación, clamp de secuencia, orden/paginación/`hay_mas`, vacío, inexistente) y de handler (dueño ve 200, cliente ajeno 401).
+
+## 2026-10-29 — E3-T3: eventos de reclamo publicados por outbox
+
+**Resumen:** cada mutación del reclamo de una conversación ahora publica su evento de dominio en el outbox DENTRO de su misma transacción: `Reclamar` emite `conversacion.reclamada`, `Liberar` emite `conversacion.liberada`, `Transferir` emite `conversacion.transferida`. Antes `internal/reclamos` solo escribía el reclamo (y auditoría en la transferencia), sin dejar rastro en el bus. Completa el criterio de E3-T3 "Eventos conversacion.reclamada/liberada/transferida publicados por outbox".
+
+**Para quién:** para `realtime` (y `reportes` en la transferencia), que el contrato tracer.21 declara consumidores durables de estos tres eventos. Es el puente hacia E3-T5: sin estos eventos, realtime no puede reflejar quién responde la conversación. El camino HTTP y la semántica de concurrencia no cambian; solo se añade la publicación.
+
+**Cambios:**
+- `internal/reclamos/reclamos.go`: `Servicio` gana un `Publicador` (interfaz mínima de un método declarada por el consumidor, satisfecha por `*outbox.Publisher`); `NewServicio(pool, pub)`. `Reclamar`, `Liberar` y `Transferir` publican su evento en la tx existente, con `sensibilidad=restringida`, `agregado_id=conversacion_id` y el payload que define el contrato (`conversacion_id`, `reclamo_id`/`reclamo_anterior_id`, `responsable_id`, `version_reclamo`). `abrir` y el cierre de transferencia ahora devuelven el `id` del reclamo vía `RETURNING id` para el payload. `Reclamar` emite el evento en sus dos caminos (abrir el primer reclamo y reasignar/avanzar uno activo), porque ambos cambian el responsable que realtime muestra.
+- `mensajeria.go`: cablea el `Publisher` existente en `reclamos.NewServicio` (mismo `pub` que ya usa `conversacion`).
+- `internal/reclamos/reclamos_integration_test.go`: los tres tests existentes migran al nuevo constructor. Nuevo `TestEventosDeReclamoSeEscribenEnOutbox`: tras reclamar/transferir/liberar afirma exactamente una fila del tipo esperado en `mensajeria.outbox`, restringida, con el payload del contrato (responsable y versión).
+
+**Fuera de alcance (no es trabajo del Lead):** el override auditado de supervisor sigue cerrado (`ErrOverrideNoImplementado`, DEC-107): requiere la proyección de alcance jerárquico que mensajeria no tiene (DEC-053/DEC-045). Es bloqueo de producto, no de este slice.
+
+**Verificación:** `gofmt`, `go build ./...`, `go vet ./...` verdes. Suite completa contra Postgres 16 real (Docker efímero): `TestEventosDeReclamoSeEscribenEnOutbox` PASS y las pruebas de concurrencia/liberar/transferir/HTTP intactas.
+
+## 2026-10-28 — E3-T1: ciclo de vida de la conversación por evento del viaje
+
+**Resumen:** la conversación de un viaje ahora nace y fija su ventana de escritura por EVENTO, no por petición. Dos consumidores durables nuevos sobre la superficie amplia del bus: `viaje.mensajeria_habilitada` crea la conversación (idempotente); `viaje.cerrado` fija `escritura_hasta` (3 días sin incidencia, 6 meses con incidencia, DEC-030/DEC-041). Más la columna `legal_hold` que faltaba en la tabla. No existe endpoint para que el cliente cree una conversación: solo el evento la crea.
+
+**Para quién:** cierra el ciclo que da sustento al envío de E3-T2: antes la conversación se sembraba a mano en los tests; ahora la crea el evento real de operacion (viaje.mensajeria_habilitada, que operacion emite desde este mismo sprint).
+
+**Cambios:**
+- `migrations/mensajeria/0005_conversacion_legal_hold.sql` (nuevo): columna `legal_hold BOOLEAN NOT NULL DEFAULT false`. Solo la forma; la política de retención/legal hold sigue pendiente (DEC-016 #3).
+- `internal/conversacion/conversacion.go`: `CrearPorEvento` (INSERT idempotente por el índice único parcial `una_conversacion_activa_por_viaje`, `ON CONFLICT DO NOTHING`; tenant_id = cliente_id, DEC-049) y `CerrarVentana` (fija `escritura_hasta` según motivo_cierre, acotado por viaje_id, convergente). No usan inbox_evento: el invariante de unicidad del negocio es el árbitro (DEC-067, igual que el envío).
+- `internal/consumidores/conversacion.go` (nuevo): `ConsumidorHabilitada` y `ConsumidorCerrado`, puertos estrechos, idempotencia durable. `viaje.acceso_revocado` NO se implementa (su productor no existe en operacion; E3-T1 lo marca bloqueado).
+- `mensajeria.go`: cablea los dos consumidores en `New()` y los devuelve en `Workers()`, replicando el patrón del consumidor de catálogo.
+- `internal/conversacion/conversacion.go` (`Enviar`): la guarda de envío ahora también rechaza si `escritura_hasta` ya venció (no solo si el estado no es `abierta`), con `ErrConversacionSoloLectura`. Cierra el hueco entre el vencimiento de la ventana y el barrido que materializará `solo_lectura`: el estado se deriva de `escritura_hasta` en el momento del envío. La condición viaja en el mismo `UPDATE` (atómica, sin lectura previa).
+
+**Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. `go test ./internal/conversacion/` contra Postgres 16 real: `TestCrearPorEventoEsIdempotente` (reentrega no duplica, tenant=cliente) y `TestCerrarVentanaFijaEscrituraHasta` (3d + 6m) PASS, suite de E3-T2 intacta.
+
+## 2026-10-28 — E3-T2: exigir reclamo activo en el envío interno; override cerrado en V1
+
+**Resumen:** completa la autorización de envío de E3-T2. Un actor interno ahora debe tener un reclamo activo propio en la versión que afirma (`version_reclamo_esperada`) para enviar; sin él recibe 409. Antes el handler ignoraba ese campo del contrato y bastaba la membresía de pool. El override de supervisor (`motivo_override`) queda **cerrado en V1**: se rechaza con 400 hasta que exista la proyección de alcance jerárquico que lo autorizaría (DEC-107).
+
+**Para quién:** para el panel interno y auditoría. Responder una conversación exige el reclamo, no solo pertenecer al pool. El cliente no cambia (no reclama). El override no se abre sin verificación de rol, por seguridad.
+
+**Cambios:**
+- `internal/conversacion/conversacion.go`: `EntradaEnvio` gana `VersionReclamoEsperada *int64` y `MotivoOverride string`. Sentinels `ErrSinReclamoActivo` y `ErrOverrideNoImplementado`. `Enviar` rechaza `motivo_override` antes de abrir la tx (override cerrado, DEC-107); para audiencia interna, `exigirReclamoActivo` verifica en la misma tx —antes de tocar la secuencia— que hay reclamo activo del propio actor en la versión esperada. Rechazo sin efecto. Helpers `esInterno` y `exigirReclamoActivo`.
+- `adapters/http/conversacion/conversacion.go`: el handler pasa `version_reclamo_esperada` y `motivo_override` del body; mapea `ErrSinReclamoActivo` a 409 `conflicto_version_reclamo` y `ErrOverrideNoImplementado` a 400. (Códigos de máquina: la plataforma solo emite el código de categoría, limitación transversal preexistente.)
+- Test `internal/conversacion/guarda_reclamo_test.go`: 6 casos (interno sin versión, versión equivocada, reclamo de otro actor, reclamo correcto, cliente sin reclamo, override cerrado rechazado sin efecto).
+
+**Decidido en esta entrega:** DEC-107 (override cerrado en V1); DEC-108 abierta (condición "pendiente de respuesta", bloqueada por contrato).
+
+**Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. Tests de integración contra Postgres 16 real: `TestEnviarGuardaReclamoInterno` (6 subcasos) PASS, y la suite previa de conversación (envío, reclamo, transferencia, guarda de estado) sigue verde — `TestEnviarMensajeHTTP` ahora ejercita la guarda de reclamo que antes ignoraba.
+
+## 2026-10-28 — E3-T2: guarda de estado en el envío (rechaza conversación no `abierta`)
+
+**Resumen:** cierra un hueco de seguridad del envío: hasta ahora un mensaje sobre una conversación `solo_lectura` o `cerrada` se aceptaba e insertaba. Ahora `Enviar` rechaza cualquier conversación que no esté `abierta`, sin crear mensaje, sin incrementar `siguiente_secuencia` y sin publicar `mensaje.creado`. Es parte del criterio de autorización de envío de E3-T2 (AI27-61); la guarda de reclamo activo + versión esperada (interno) sigue pendiente en su propia unidad.
+
+**Para quién:** para el cliente y el panel interno, que al intentar escribir en una conversación cuya ventana operativa venció (DEC-030/DEC-041) reciben 409, no un mensaje fantasma. Para auditoría: ya no entran mensajes a conversaciones cerradas.
+
+**Cambios:**
+- `internal/conversacion/conversacion.go`: nuevo sentinel `ErrConversacionSoloLectura`. La guarda viaja en el mismo `UPDATE ... WHERE estado = 'abierta'` que toma el lock de fila y asigna la secuencia (atómico, sin lectura previa que abriría una carrera). Si no toca fila, `noAbiertaOInexistente` desambigua en la misma tx inexistente (no_encontrado) vs no-abierta (`ErrConversacionSoloLectura`), solo en el camino de rechazo.
+- `adapters/http/conversacion/conversacion.go`: el handler `enviar` mapea `ErrConversacionSoloLectura` a 409. Nota: el `codigo` de máquina del contrato (`conversacion_solo_lectura`) no se emite literal; la taxonomía de la plataforma solo expone el código de categoría (`conflicto`), limitación transversal preexistente (igual que `conflicto_version_reclamo` en el handler de reclamo).
+- Tests (integración contra Postgres): `internal/conversacion/guarda_estado_test.go` (dominio, casos `solo_lectura` y `cerrada`, afirma efectos nulos); `adapters/http/conversacion/enviar_integration_test.go` suma `TestEnviarMensajeHTTPConversacionSoloLectura` (409 por HTTP).
+
+**Vocabulario del contrato (no inventado):** `EstadoConversacion` enum `[abierta, solo_lectura, cerrada]` y el código `conversacion_solo_lectura` salen de `mensajeria.yaml` (tracer.21).
+
+**Verificación:** `go build/vet ./...`, `gofmt`, `arch-test` verdes. Tests de integración ejecutados contra Postgres 16 real: `TestEnviarRechazaConversacionNoAbierta` (solo_lectura + cerrada), `TestEnviarMensajeHTTPConversacionSoloLectura`, y los dos del camino feliz ya existentes, todos PASS.
+
 ## 2026-10-28 — tracer.21: subir el pin de contrato
 
 **Resumen:** se sube el pin de `pf-pkg-contracts` de `v0.1.0-tracer.17` a `v0.1.0-tracer.21` (+4 olas: .18 a .21). Aditivo para `mensajeria`; su superficie (conversación, bandeja, emergencia) no cambia entre .17 y .21. Solo `go.mod`/`go.sum`.

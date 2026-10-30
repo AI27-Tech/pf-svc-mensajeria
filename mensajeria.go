@@ -95,6 +95,12 @@ type Module struct {
 	// consumidorCatalogos es el worker durable de catalogo.actualizado que
 	// invalida la caché en proceso de clientes (E5-T5). nil sin Subscriber+Catalogos.
 	consumidorCatalogos worker.Worker
+	// consumidorHabilitada y consumidorCerrado son los workers durables del ciclo
+	// de vida de la conversación por evento del viaje (E3-T1): crear al recibir
+	// viaje.mensajeria_habilitada y fijar la ventana al recibir viaje.cerrado. nil
+	// sin Subscriber.
+	consumidorHabilitada worker.Worker
+	consumidorCerrado    worker.Worker
 }
 
 // New recibe los dos pools de svc_mensajeria y los puertos ya resueltos. No lee
@@ -107,7 +113,7 @@ func New(p Pools, d Deps) (*Module, error) {
 
 	pub := outbox.NewPublisher()
 	m.conversacion = conversacion.NewServicio(p.Chat, pub)
-	m.reclamos = reclamos.NewServicio(p.Chat)
+	m.reclamos = reclamos.NewServicio(p.Chat, pub)
 	m.autz = autorizacion.NewServicio(p.Chat)
 	m.bandejas = bandejas.NewServicio(p.Chat)
 	m.emergencias = emergencias.NewServicio(p.Chat, pub)
@@ -141,6 +147,38 @@ func New(p Pools, d Deps) (*Module, error) {
 			return nil, err
 		}
 		m.consumidorCatalogos = w
+	}
+
+	// Ciclo de vida de la conversación dirigido por eventos del viaje (E3-T1),
+	// sobre el servicio de conversación (mismo m.conversacion que el envío). Dos
+	// consumidores durables sobre la superficie amplia: viaje.mensajeria_habilitada
+	// crea la conversación; viaje.cerrado fija su ventana de escritura. Idempotencia
+	// durable (índice único / UPDATE convergente), sin inbox_evento (DEC-067). Solo
+	// con Subscriber.
+	if d.Subscriber != nil {
+		consHab := consumidores.NuevoConsumidorHabilitada(m.conversacion)
+		wHab, err := d.Subscriber.Subscribe(
+			"mensajeria-conversacion-habilitada",
+			bus.SensibilidadAmplia,
+			[]string{consumidores.TipoViajeMensajeriaHabilitada},
+			func(ctx context.Context, s bus.Sobre) error { return consHab.Procesar(ctx, s) },
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.consumidorHabilitada = wHab
+
+		consCer := consumidores.NuevoConsumidorCerrado(m.conversacion)
+		wCer, err := d.Subscriber.Subscribe(
+			"mensajeria-conversacion-cerrada",
+			bus.SensibilidadAmplia,
+			[]string{consumidores.TipoViajeCerrado},
+			func(ctx context.Context, s bus.Sobre) error { return consCer.Procesar(ctx, s) },
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.consumidorCerrado = wCer
 	}
 
 	return m, nil
@@ -183,11 +221,13 @@ func (m *Module) Routes(mux *http.ServeMux) {
 //
 // En V1 devuelve, cuando la raíz inyectó el bus:
 //   - el publicador de outbox (relay), presente si hay Deps.Publisher;
-//   - (pendiente de cableado al bus) un consumidor por suscripción durable
-//     contratada —viaje.*, sesion.revocada, eventos de identidad— y el difusor
-//     interno de sesion.revocada a réplicas (ADR 26). Sus efectos de dominio y su
-//     snapshot inicial están sin implementar en el scaffold, así que todavía no
-//     se abren suscripciones que no apliquen nada.
+//   - el consumidor durable de catalogo.actualizado (invalida caché de clientes);
+//   - los dos consumidores durables del ciclo de vida de la conversación por
+//     evento del viaje (E3-T1): viaje.mensajeria_habilitada y viaje.cerrado.
+//
+// Pendiente de cableado: sesion.revocada y los eventos de identidad para la
+// proyección de membresía, y viaje.acceso_revocado (su productor no existe en
+// operacion todavía; E3-T1 lo marca bloqueado).
 //
 // NO devuelve worker de despacho externo (DEC-023 #2): la mampara existe en
 // internal/despacho sin worker activo ni destinatario cliente.
@@ -198,6 +238,12 @@ func (m *Module) Workers() []worker.Worker {
 	}
 	if m.consumidorCatalogos != nil {
 		ws = append(ws, m.consumidorCatalogos)
+	}
+	if m.consumidorHabilitada != nil {
+		ws = append(ws, m.consumidorHabilitada)
+	}
+	if m.consumidorCerrado != nil {
+		ws = append(ws, m.consumidorCerrado)
 	}
 	return ws
 }

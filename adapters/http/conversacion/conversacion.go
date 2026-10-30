@@ -49,11 +49,14 @@ type LectorReclamo interface {
 }
 
 // Enviador envía un mensaje, hidrata el Mensaje del contrato y resuelve el
-// cliente de la conversación para el alias (internal/conversacion).
+// cliente de la conversación para el alias (internal/conversacion). También lee
+// la conversación y su historia de mensajes (E9-T8, lectura).
 type Enviador interface {
 	Enviar(ctx context.Context, in conversacion.EntradaEnvio) (conversacion.ResultadoEnvio, error)
 	MensajePorID(ctx context.Context, tenantID, mensajeID string) (*msgclient.Mensaje, error)
 	ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error)
+	ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error)
+	ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error)
 }
 
 // CatalogosLector lee clientes por lote (puerto de mensajeria hacia catalogos).
@@ -75,10 +78,106 @@ type Handlers struct {
 // Montar registra las rutas de conversación en el mux. El bff antepone
 // auth.Middleware, de modo que aquí los claims ya están en el contexto.
 func (h Handlers) Montar(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/v1/conversaciones/{id}", h.obtener)
+	mux.HandleFunc("GET /api/v1/conversaciones/{id}/mensajes", h.listarMensajes)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/reclamos", h.reclamar)
 	mux.HandleFunc("DELETE /api/v1/conversaciones/{id}/reclamos/{rid}", h.liberar)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/transferencias", h.transferir)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/mensajes", h.enviar)
+}
+
+// obtener atiende GET /api/v1/conversaciones/{id}: hidrata el agregado
+// Conversacion para el bootstrap. Autoriza el ACCESO (DEC-097: cliente dueño o
+// membresía de pool); un sin-acceso recibe el mismo 404 que si no existiera
+// (Addendum §7, poseer el UUID no autoriza). Devuelve el agregado completo; el
+// consumidor (bff) recorta por audiencia para su schema de cliente.
+func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	convID := r.PathValue("id")
+
+	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+		escribirError(w, err)
+		return
+	}
+
+	conv, err := h.Conversacion.ObtenerConversacion(r.Context(), claims.TenantID, convID)
+	if err != nil {
+		if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
+			escribirError(w, platformerrors.NewNoEncontrado("conversacion no encontrada"))
+			return
+		}
+		escribirError(w, traducir(err))
+		return
+	}
+	escribirJSON(w, http.StatusOK, conv)
+}
+
+// listarMensajes atiende GET /api/v1/conversaciones/{id}/mensajes: historia por
+// secuencia canónica. `antes_de`/`despues_de`/`limite` vienen del query (son
+// mutuamente excluyentes; la validación fina vive en el dominio). Autoriza el
+// ACCESO igual que obtener. El orden de salida es siempre ascendente por
+// secuencia (contrato).
+func (h Handlers) listarMensajes(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	convID := r.PathValue("id")
+
+	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+		escribirError(w, err)
+		return
+	}
+
+	antesDe, err := queryInt(r, "antes_de")
+	if err != nil {
+		escribirError(w, platformerrors.NewValidacion("antes_de inválido"))
+		return
+	}
+	despuesDe, err := queryInt(r, "despues_de")
+	if err != nil {
+		escribirError(w, platformerrors.NewValidacion("despues_de inválido"))
+		return
+	}
+	if antesDe != nil && despuesDe != nil {
+		escribirError(w, platformerrors.NewValidacion("antes_de y despues_de son mutuamente excluyentes"))
+		return
+	}
+	limite, err := queryInt(r, "limite")
+	if err != nil {
+		escribirError(w, platformerrors.NewValidacion("limite inválido"))
+		return
+	}
+	lim := 50
+	if limite != nil {
+		lim = int(*limite)
+	}
+
+	items, hayMas, err := h.Conversacion.ListarMensajes(r.Context(), claims.TenantID, convID, antesDe, despuesDe, lim)
+	if err != nil {
+		escribirError(w, traducir(err))
+		return
+	}
+	escribirJSON(w, http.StatusOK, msgclient.PaginaMensajes{Items: items, HayMas: hayMas})
+}
+
+// queryInt lee un parámetro de query entero opcional. nil si ausente; error si
+// está presente pero no es un entero.
+func queryInt(r *http.Request, nombre string) (*int64, error) {
+	raw := r.URL.Query().Get(nombre)
+	if raw == "" {
+		return nil, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 // reclamar toma el reclamo activo de una conversación. Exige claims, autoriza
@@ -249,16 +348,52 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var versionEsperada *int64
+	if entrada.VersionReclamoEsperada != nil {
+		v := int64(*entrada.VersionReclamoEsperada)
+		versionEsperada = &v
+	}
+	motivoOverride := ""
+	if entrada.MotivoOverride != nil {
+		motivoOverride = *entrada.MotivoOverride
+	}
+
 	res, err := h.Conversacion.Enviar(r.Context(), conversacion.EntradaEnvio{
-		TenantID:        claims.TenantID,
-		ConversacionID:  convID,
-		ActorReal:       claims.Subject,
-		ClientMessageID: entrada.ClientMessageId.String(),
-		Cuerpo:          entrada.Cuerpo,
-		AliasMostrado:   alias,
-		RolAlEnviar:     claims.Rol,
+		TenantID:               claims.TenantID,
+		ConversacionID:         convID,
+		ActorReal:              claims.Subject,
+		ClientMessageID:        entrada.ClientMessageId.String(),
+		Cuerpo:                 entrada.Cuerpo,
+		AliasMostrado:          alias,
+		RolAlEnviar:            claims.Rol,
+		VersionReclamoEsperada: versionEsperada,
+		MotivoOverride:         motivoOverride,
 	})
 	if err != nil {
+		// Conversación no `abierta` (solo_lectura/cerrada): 409, como el conflicto
+		// de versión de reclamo. El contrato lo marca con `codigo`
+		// conversacion_solo_lectura; la taxonomía de la plataforma solo expone el
+		// código de categoría (`conflicto`), limitación transversal igual que en
+		// conflicto_version_reclamo (no se resuelve en esta historia).
+		if errors.Is(err, conversacion.ErrConversacionSoloLectura) {
+			escribirError(w, platformerrors.NewConflicto("conversacion_solo_lectura"))
+			return
+		}
+		// Envío interno sin reclamo activo en la versión esperada: 409
+		// conflicto_version_reclamo (Addendum §7). Misma limitación del código de
+		// máquina que arriba: se emite la categoría conflicto.
+		if errors.Is(err, conversacion.ErrSinReclamoActivo) {
+			escribirError(w, platformerrors.NewConflicto("conflicto_version_reclamo"))
+			return
+		}
+		// Override de supervisor no implementado en V1 (cerrado hasta que exista la
+		// proyección de alcance jerárquico). Se rechaza como petición inválida: el
+		// campo motivo_override no es procesable en esta versión. 400 está en el
+		// contrato de enviarMensaje; no se inventa un 501 fuera de contrato.
+		if errors.Is(err, conversacion.ErrOverrideNoImplementado) {
+			escribirError(w, platformerrors.NewValidacion("motivo_override no está disponible en V1"))
+			return
+		}
 		escribirError(w, traducir(err))
 		return
 	}
