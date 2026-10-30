@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 2026-10-30 — E9-T8: lectura de la conversación y marcarAtendida
+
+**Resumen:** se montan las tres operaciones de lectura/estado que el contrato ya definía pero el servicio no exponía: `GET /api/v1/conversaciones/{id}` (`obtenerConversacion`), `GET /api/v1/conversaciones/{id}/mensajes` (`listarMensajes`) y `POST /api/v1/conversaciones/{id}/atendida` (`marcarAtendida`). Antes `Montar()` solo registraba reclamo, transferencia y envío; ahora el `bff` puede proyectar al cliente el detalle de la conversación, su historia de mensajes y el indicador de "atendido" (DEC-014/Q113). El envío (`enviarMensaje`, E3-T2) no se rehace.
+
+**Para quién:** para el `bff` y, a través de él, para el portal cliente (E9) y el panel interno. La lectura funciona en los tres estados del ciclo de vida (`abierta`/`solo_lectura`/`cerrada`); la escritura de envío sigue rechazando `solo_lectura`/`cerrada` con 409 `conversacion_solo_lectura` (guarda preexistente de E3-T2, verificada: sentinel `ErrConversacionSoloLectura` + `codigo` del contrato, DEC-030/DEC-041).
+
+**Proyección por audiencia (contrato Conversacion/Mensaje; patrón de `emergencias`):**
+- Un lector **Cliente** recibe la vista mínima: `Conversacion` sin `bandeja_id` ni `reclamo_activo`; cada `Mensaje` sin `actor_real` ni `rol_al_enviar`. Sí recibe `version_reclamo`, el estado atendido (`atendida_en`) y, en cada mensaje, `audiencia_autor` —el "de_cliente": quién escribió, lado Cliente o AI27—, derivado del `rol_al_enviar` (cliente ⇒ Cliente; resto ⇒ Interno), nunca de `actor_real`.
+- Un lector **Interno** recibe la vista completa (bandeja de la ruta activa y reclamo activo hidratado).
+
+**Autorización:** las lecturas y `marcarAtendida` pasan por la guarda de acceso existente (`autorizacion.PuedeEscribir`, DEC-097: cliente dueño o membresía efectiva de pool). En las lecturas, "sin acceso efectivo" se traduce a **404**, no 401: poseer el UUID no autoriza y el servidor no revela existencia por el código (contrato `obtenerConversacion`/`listarMensajes`, Addendum §7). `marcarAtendida` exige además, en el dominio, que el actor sea el **responsable del reclamo activo** con la versión esperada (concurrencia optimista, igual que el envío interno): sin reclamo propio → 404; versión equivocada → 409 `conflicto_version_reclamo`.
+
+**Cambios:**
+- `internal/conversacion/conversacion.go`: `ObtenerConversacion` (cabecera + reclamo activo + bandeja de ruta activa + marca de `estado_atendido`, en una tx coherente; `ConversacionProyectada` con todos los campos de dominio). `ListarMensajes` (`EntradaListado`/`ResultadoListado`: paginación por cursor `antes_de`/`despues_de` mutuamente excluyentes, `limite` 1..200; orden siempre por `secuencia`, nunca por `creado_en`; `hay_mas` por el truco de pedir `limite+1`). `MarcarAtendida` (guarda de responsable + versión, upsert idempotente de `estado_atendido`; sentinel `ErrNoEsResponsable` y error tipado `ErrConflictoVersionAtendida`).
+- `adapters/http/conversacion/conversacion.go`: `Montar()` registra las tres rutas. Handlers `obtener`, `listarMensajes`, `marcarAtendida`; proyectores `proyectarConversacion` y `proyectarMensaje` por audiencia; helpers `secuenciaQuery` y `ocultarAccesoEnLectura` (no_autorizado → no_encontrado en lectura). Se actualizó el doc del paquete (estaba desfasado: afirmaba que el envío no se montaba).
+- `adapters/http/conversacion/lectura_integration_test.go` (nuevo): `TestListarMensajesHTTP` (historia por secuencia con `audiencia_autor` correcto; Cliente no ve `actor_real`/`rol_al_enviar`, Interno sí), `TestObtenerConversacionProyeccionHTTP` (Cliente sin campos internos, Interno con ellos; aislamiento por tenant y por alcance → 404), `TestMarcarAtendidaHTTP` (responsable prende el indicador; sin reclamo propio → 404; versión equivocada → 409; idempotente; `obtenerConversacion` refleja `atendida_en`).
+
+**Contrato:** el pin de `go.mod` ya estaba en `v0.1.0-tracer.21` en la rama base `pf-msg-d` (commit `0721f3c`), que ya trae `obtenerConversacion`, `listarMensajes` y `marcarAtendida`; no requirió subirlo. Entre `tracer.21` y el `tracer.23` vigente, `mensajeria.yaml` no cambió funcionalmente (solo `bff.yaml`/`operacion.yaml` de otras historias), así que se mantiene el pin.
+
+**Verificación:** `go build ./...`, `go vet ./...`, `gofmt -l .` (limpio) y `arch-test: OK` verdes. Suite completa (`go test ./...`) contra Postgres 17 real (DSN local): las tres pruebas nuevas PASS y la suite previa (envío, reclamo, transferencia, guardas de estado/reclamo, emergencia, consumidores) intacta.
+
 ## 2026-10-29 — E3-T3: eventos de reclamo publicados por outbox
 
 **Resumen:** cada mutación del reclamo de una conversación ahora publica su evento de dominio en el outbox DENTRO de su misma transacción: `Reclamar` emite `conversacion.reclamada`, `Liberar` emite `conversacion.liberada`, `Transferir` emite `conversacion.transferida`. Antes `internal/reclamos` solo escribía el reclamo (y auditoría en la transferencia), sin dejar rastro en el bus. Completa el criterio de E3-T3 "Eventos conversacion.reclamada/liberada/transferida publicados por outbox".
