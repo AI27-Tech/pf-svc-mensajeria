@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 2026-10-29 — E9-T8 (B.0): lectura de la conversación del viaje (obtenerConversacion, listarMensajes)
+
+**Resumen:** monta los dos GET de lectura de conversación que el contrato (tracer.21) ya definía pero el servicio no servía: `GET /api/v1/conversaciones/{id}` (`obtenerConversacion`) y `GET /api/v1/conversaciones/{id}/mensajes` (`listarMensajes`). Es el pre-requisito de servicio (paso B.0) para exponer la conversación del viaje al portal cliente (E9-T8) a través del `bff`.
+
+**Para quién:** desbloquea la Ola B. Cuando el `bff` proyecte la superficie de cliente, podrá leer la conversación y su historia reenviando a estos GET. La escritura (`enviarMensaje`) ya existía.
+
+**Cambios:**
+- `internal/conversacion`: `ObtenerConversacion` hidrata el agregado `Conversacion` (conversación + `estado_atendido` + ruta activa + reclamo activo en una lectura); `ultima_secuencia` = `siguiente_secuencia` (la última secuencia asignada; 0 sin mensajes); `version_reclamo` 0 si no hay reclamo. `ListarMensajes` pagina por secuencia canónica (`antes_de`/`despues_de`/`limite`, mutuamente excluyentes), orden de salida siempre ascendente, `hay_mas` por `limite+1`. Se extrae `mapearMensaje` (reusada por `MensajePorID`). `audiencia_autor` se deriva del rol al leer, como ya hacía el envío.
+- `adapters/http/conversacion`: handlers `obtener` y `listarMensajes` + sus rutas; autorización de ACCESO reusando `PuedeEscribir` (cliente dueño o membresía de pool).
+
+**Alcance (recorte ratificado):** B.0 hace solo los dos GET. `marcarAtendida` se difiere: es acción interna del Ejecutivo (superficie E3), no del portal cliente, y arrastra una regla de producto sin levantar (si exige el reclamo activo del propio actor). El campo "atendido" ya se expone en la lectura (`atendida_en`), null mientras nadie lo marque.
+
+**Nota de seguridad (hallazgo):** el aislamiento del cliente sigue el criterio preexistente de `autorizacion`: 404 si la conversación no existe, 401 si existe pero el cliente no es el dueño. Difiere del 404-para-ajeno que usa `operacion` (E9-T7); unificar el criterio entre superficies de cliente es una decisión aparte, registrada en el plan de olas.
+
+**Devuelve el agregado completo; el `bff` recorta por audiencia** para su schema de cliente (no expone `bandeja_id` ni `reclamo_activo`). El servicio no recorta.
+
+**Verificación:** `gofmt`, `go vet ./...`, `go build ./...`, `go test ./...` en verde contra Postgres 16. Tests de dominio (hidratación, clamp de secuencia, orden/paginación/`hay_mas`, vacío, inexistente) y de handler (dueño ve 200, cliente ajeno 401).
+
 ## 2026-10-29 — E3-T3: eventos de reclamo publicados por outbox
 
 **Resumen:** cada mutación del reclamo de una conversación ahora publica su evento de dominio en el outbox DENTRO de su misma transacción: `Reclamar` emite `conversacion.reclamada`, `Liberar` emite `conversacion.liberada`, `Transferir` emite `conversacion.transferida`. Antes `internal/reclamos` solo escribía el reclamo (y auditoría en la transferencia), sin dejar rastro en el bus. Completa el criterio de E3-T3 "Eventos conversacion.reclamada/liberada/transferida publicados por outbox".
