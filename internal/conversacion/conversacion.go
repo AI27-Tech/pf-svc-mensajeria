@@ -71,6 +71,20 @@ type EntradaEnvio struct {
 	// este rol al leer, no se persiste (no está en el esquema ni es un campo
 	// inmutable del addendum).
 	RolAlEnviar string
+	// VersionReclamoEsperada es la versión del reclamo activo que el actor INTERNO
+	// afirma tener al enviar (concurrencia optimista; contrato
+	// EnviarMensajeEntrada.version_reclamo_esperada, "obligatoria para audiencia
+	// Interno"). nil para el cliente (no requiere reclamo) y para el interno que
+	// invoca override. El dominio exige, para audiencia interna sin override, un
+	// reclamo activo del propio actor en esta versión.
+	VersionReclamoEsperada *int64
+	// MotivoOverride, si no es vacío, pide el override explícito de supervisor
+	// (contrato motivo_override). CERRADO en V1: Enviar lo rechaza con
+	// ErrOverrideNoImplementado, porque verificar que el actor es supervisor con
+	// mando sobre el reclamo exige una proyección de alcance jerárquico que
+	// mensajeria no tiene (DEC-053 §3, DEC-045 #4). Abrirlo sin esa verificación
+	// sería un override invocable por cualquier interno.
+	MotivoOverride string
 }
 
 // ResultadoEnvio es el mensaje tal como quedó: su id y su secuencia canónica.
@@ -95,6 +109,16 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: envío inválido: faltan conversacion_id, actor_real o client_message_id")
 	}
 
+	// Override de supervisor CERRADO en V1: enviar con motivo_override exigiría
+	// verificar que el actor es supervisor con mando sobre el reclamo, y esa
+	// verificación necesita una proyección de alcance jerárquico que mensajeria no
+	// tiene (DEC-053 §3, DEC-045 #4). Permitirlo sin esa verificación sería un
+	// override que cualquier interno podría invocar. Se rechaza hasta que exista
+	// la proyección; no se audita un camino que no se abre.
+	if in.MotivoOverride != "" {
+		return ResultadoEnvio{}, ErrOverrideNoImplementado
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: abrir transacción: %w", err)
@@ -112,17 +136,36 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		return res, nil
 	}
 
-	// Asignar secuencia bajo el bloqueo de fila de la conversación.
+	// Guarda de envío interno (contrato enviarMensaje, Addendum §7): un actor
+	// interno debe tener un reclamo activo propio en la versión que afirma. Se
+	// verifica DENTRO de la tx, antes de tocar la secuencia, para que un rechazo
+	// no deje efecto (ni incremento ni mensaje). El cliente no pasa por aquí (no
+	// reclama). El override quedó rechazado antes de abrir la tx (V1 cerrado).
+	if esInterno(in.RolAlEnviar) {
+		if err := exigirReclamoActivo(ctx, tx, in); err != nil {
+			return ResultadoEnvio{}, err
+		}
+	}
+
+	// Asignar secuencia bajo el bloqueo de fila de la conversación. Dos guardas
+	// viajan en el mismo UPDATE, atómicamente, sin lectura previa que abriría una
+	// carrera: el estado debe ser 'abierta' Y la ventana de escritura no debe haber
+	// vencido (escritura_hasta nula = sin límite aún, o en el futuro). Una
+	// conversación 'abierta' cuyo escritura_hasta ya pasó se rechaza igual que una
+	// 'solo_lectura' (DEC-030/041): el estado materializado llega después por
+	// barrido, pero el envío no espera a él. Si no toca fila, se desambigua con una
+	// lectura solo en ese camino de rechazo (el camino feliz no paga).
 	var seq int64
 	err = tx.QueryRow(ctx,
 		`UPDATE mensajeria.conversacion
 		    SET siguiente_secuencia = siguiente_secuencia + 1
-		  WHERE id = $1 AND tenant_id = $2
+		  WHERE id = $1 AND tenant_id = $2 AND estado = 'abierta'
+		    AND (escritura_hasta IS NULL OR escritura_hasta > now())
 		  RETURNING siguiente_secuencia`,
 		in.ConversacionID, in.TenantID,
 	).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ResultadoEnvio{}, fmt.Errorf("conversacion: %s no existe para el tenant %s", in.ConversacionID, in.TenantID)
+		return ResultadoEnvio{}, noAbiertaOInexistente(ctx, tx, in)
 	}
 	if err != nil {
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: asignar secuencia: %w", err)
@@ -206,8 +249,91 @@ func esViolacionUnica(err error) bool {
 	return false
 }
 
+// esInterno indica si el rol corresponde a un actor interno (cualquiera salvo
+// `cliente`). Mismo criterio que audienciaDesdeRol, en positivo: un rol vacío se
+// trata como cliente (en V1 solo el cliente escribe sin rol interno registrado),
+// así que no interno.
+func esInterno(rol string) bool {
+	return rol != "" && rol != "cliente"
+}
+
+// exigirReclamoActivo verifica, en la tx del envío, que el actor interno tiene un
+// reclamo activo propio en la versión esperada. Devuelve ErrSinReclamoActivo si
+// falta la versión esperada, si no hay reclamo activo, si su versión no coincide
+// o si el reclamo es de otro actor. El contrato pide version_reclamo_esperada
+// obligatoria para audiencia interna, así que su ausencia ya es rechazo.
+func exigirReclamoActivo(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error {
+	if in.VersionReclamoEsperada == nil {
+		return fmt.Errorf("conversacion: envío interno sin version_reclamo_esperada: %w", ErrSinReclamoActivo)
+	}
+	var actorReclamo string
+	var version int64
+	err := tx.QueryRow(ctx,
+		`SELECT actor_real, version FROM mensajeria.reclamo
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL`,
+		in.ConversacionID, in.TenantID,
+	).Scan(&actorReclamo, &version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("conversacion: sin reclamo activo: %w", ErrSinReclamoActivo)
+	}
+	if err != nil {
+		return fmt.Errorf("conversacion: leer reclamo activo para el envío: %w", err)
+	}
+	if actorReclamo != in.ActorReal || version != *in.VersionReclamoEsperada {
+		return fmt.Errorf("conversacion: reclamo de otro actor o versión distinta (actor %s v%d): %w", actorReclamo, version, ErrSinReclamoActivo)
+	}
+	return nil
+}
+
+// noAbiertaOInexistente explica por qué el UPDATE con las guardas
+// (estado = 'abierta' AND ventana vigente) no tocó fila: la conversación no
+// existe para el tenant, o existe pero no admite escritura (estado no abierto, o
+// abierto con escritura_hasta vencida). Lee en la MISMA tx (el lector llega aquí
+// solo en el camino de rechazo, así que la lectura extra no pesa en el envío
+// normal). Devuelve ErrConversacionSoloLectura cuando existe y no admite
+// escritura; el error de inexistencia conserva el texto previo.
+func noAbiertaOInexistente(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error {
+	var estado string
+	var escrituraHasta *time.Time
+	err := tx.QueryRow(ctx,
+		`SELECT estado, escritura_hasta FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
+		in.ConversacionID, in.TenantID,
+	).Scan(&estado, &escrituraHasta)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("conversacion: %s no existe para el tenant %s", in.ConversacionID, in.TenantID)
+	}
+	if err != nil {
+		return fmt.Errorf("conversacion: desambiguar estado del envío: %w", err)
+	}
+	// Existe pero el UPDATE la excluyó: su estado no es `abierta`, o su ventana de
+	// escritura venció. Ambos casos son "no admite escritura" (ErrConversacionSoloLectura).
+	if estado == "abierta" {
+		return fmt.Errorf("conversacion: %s con ventana de escritura vencida: %w", in.ConversacionID, ErrConversacionSoloLectura)
+	}
+	return fmt.Errorf("conversacion: %s en estado %q: %w", in.ConversacionID, estado, ErrConversacionSoloLectura)
+}
+
 // ErrMensajeNoEncontrado lo devuelve MensajePorID cuando el mensaje no existe.
 var ErrMensajeNoEncontrado = errors.New("conversacion: mensaje no encontrado")
+
+// ErrConversacionSoloLectura lo devuelve Enviar cuando la conversación existe
+// pero no está `abierta` (quedó `solo_lectura` al vencer escritura_hasta, o
+// `cerrada`): el envío se rechaza sin ningún efecto (ni mensaje, ni secuencia,
+// ni outbox). El contrato lo expone como 409 con `codigo` conversacion_solo_lectura
+// (mensajeria.yaml; DEC-030/DEC-041).
+var ErrConversacionSoloLectura = errors.New("conversacion: la conversación no admite escritura")
+
+// ErrSinReclamoActivo lo devuelve Enviar cuando un actor INTERNO (sin override)
+// intenta enviar sin un reclamo activo propio en la versión esperada: o no hay
+// reclamo activo, o la versión no coincide, o el reclamo es de otro actor. El
+// contrato lo expone como 409 `conflicto_version_reclamo` (mensajeria.yaml,
+// Addendum §7). El cliente NO pasa por esta guarda (no reclama).
+var ErrSinReclamoActivo = errors.New("conversacion: envío interno sin reclamo activo en la versión esperada")
+
+// ErrOverrideNoImplementado lo devuelve Enviar cuando se pide un override de
+// supervisor (motivo_override presente). V1 no lo implementa: ver EntradaEnvio.
+// MotivoOverride. El handler lo mapea a 501 no implementado.
+var ErrOverrideNoImplementado = errors.New("conversacion: override de supervisor no implementado en V1")
 
 // MensajePorID lee un mensaje y lo mapea al Mensaje del contrato (hidratación
 // para el handler HTTP; Enviar solo devuelve id y secuencia). La audiencia_autor
@@ -241,8 +367,16 @@ func (s *Servicio) MensajePorID(ctx context.Context, tenantID, mensajeID string)
 		return nil, fmt.Errorf("conversacion: leer mensaje: %w", err)
 	}
 
+	m := mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo, secuencia, alias, rol, creadoEn)
+	return &m, nil
+}
+
+// mapearMensaje hidrata un msgclient.Mensaje desde las columnas de una fila de
+// mensajeria.mensaje. Misma forma que MensajePorID (AudienciaAutor derivada del
+// rol); se extrae para reusarla al listar.
+func mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo string, secuencia int64, alias, rol *string, creadoEn time.Time) msgclient.Mensaje {
 	actor := uuid.MustParse(actorReal)
-	m := &msgclient.Mensaje{
+	m := msgclient.Mensaje{
 		Id:              uuid.MustParse(id),
 		ConversacionId:  uuid.MustParse(convID),
 		ClientMessageId: uuid.MustParse(clientMsgID),
@@ -259,7 +393,183 @@ func (s *Servicio) MensajePorID(ctx context.Context, tenantID, mensajeID string)
 		r := msgclient.Rol(*rol)
 		m.RolAlEnviar = &r
 	}
-	return m, nil
+	return m
+}
+
+// ListarMensajes devuelve una página de mensajes de la conversación, ordenados
+// por secuencia canónica ascendente (contrato listarMensajes). `antesDe` pagina
+// hacia atrás (secuencia menor); `despuesDe` recupera tras reconexión (secuencia
+// mayor); son mutuamente excluyentes y sin ninguno devuelve los más recientes.
+// `hayMas` indica si quedan mensajes en la dirección pedida: se pide un elemento
+// extra (limite+1) y se recorta. No decide ACCESO: eso lo hace la frontera con
+// autorizacion.PuedeEscribir antes de llamar aquí (addendum §7).
+func (s *Servicio) ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error) {
+	if limite <= 0 {
+		limite = 50
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// `despues_de` ordena ascendente desde la secuencia dada; `antes_de` toma las
+	// secuencias menores pero devolviéndolas ascendentes (se ordena DESC para el
+	// LIMIT y se invierte después); sin cursor, los más recientes en orden ascendente.
+	var filas []msgclient.Mensaje
+	base := `SELECT id, conversacion_id, actor_real, client_message_id, secuencia, cuerpo,
+	                alias_mostrado, rol_al_enviar, creado_en
+	           FROM mensajeria.mensaje
+	          WHERE conversacion_id = $1 AND tenant_id = $2`
+	var rows pgx.Rows
+	switch {
+	case despuesDe != nil:
+		rows, err = tx.Query(ctx, base+` AND secuencia > $3 ORDER BY secuencia ASC LIMIT $4`,
+			conversacionID, tenantID, *despuesDe, limite+1)
+	case antesDe != nil:
+		rows, err = tx.Query(ctx, base+` AND secuencia < $3 ORDER BY secuencia DESC LIMIT $4`,
+			conversacionID, tenantID, *antesDe, limite+1)
+	default:
+		rows, err = tx.Query(ctx, base+` ORDER BY secuencia DESC LIMIT $3`,
+			conversacionID, tenantID, limite+1)
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("conversacion: listar mensajes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id, convID, actorReal, clientMsgID, cuerpo string
+			alias, rol                                 *string
+			secuencia                                  int64
+			creadoEn                                   time.Time
+		)
+		if err := rows.Scan(&id, &convID, &actorReal, &clientMsgID, &secuencia, &cuerpo, &alias, &rol, &creadoEn); err != nil {
+			return nil, false, fmt.Errorf("conversacion: escanear mensaje: %w", err)
+		}
+		filas = append(filas, mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo, secuencia, alias, rol, creadoEn))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("conversacion: filas de mensaje: %w", err)
+	}
+
+	hayMas := len(filas) > limite
+	if hayMas {
+		filas = filas[:limite]
+	}
+	// `antes_de` y el default consultaron DESC para el LIMIT; el contrato entrega
+	// siempre orden ascendente de secuencia, así que se invierte.
+	if despuesDe == nil {
+		for i, j := 0, len(filas)-1; i < j; i, j = i+1, j-1 {
+			filas[i], filas[j] = filas[j], filas[i]
+		}
+	}
+	if filas == nil {
+		filas = []msgclient.Mensaje{}
+	}
+	return filas, hayMas, nil
+}
+
+// ObtenerConversacion hidrata el agregado Conversacion del contrato para el
+// bootstrap de la conversación. Lee la conversación, su marca de atendida
+// (estado_atendido, LEFT JOIN) y su reclamo activo (version + agregado) en una
+// sola lectura. `ultima_secuencia` = siguiente_secuencia - 1, con clamp a 0
+// cuando no hay mensajes (siguiente_secuencia arranca en 0). `version_reclamo`
+// es 0 si nunca se reclamó (contrato). Devuelve el agregado COMPLETO, incluidos
+// los campos solo-interno (bandeja_id, reclamo_activo); el recorte por audiencia
+// lo hace el consumidor (el `bff` arma su propio schema de cliente). No decide
+// ACCESO: lo hace la frontera con autorizacion.PuedeEscribir.
+func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		id, viajeID, estado string
+		clienteID           *string
+		siguienteSecuencia  int64
+		escrituraHasta      *time.Time
+		creadoEn            time.Time
+		atendidaEn          *time.Time
+		bandejaID           *string
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
+		        c.escritura_hasta, c.creado_en, a.atendida_en, r.bandeja_id
+		   FROM mensajeria.conversacion c
+		   LEFT JOIN mensajeria.estado_atendido a
+		          ON a.conversacion_id = c.id AND a.tenant_id = c.tenant_id AND a.atendida
+		   LEFT JOIN mensajeria.ruta_conversacion r
+		          ON r.conversacion_id = c.id AND r.tenant_id = c.tenant_id AND r.activa
+		  WHERE c.id = $1 AND c.tenant_id = $2`,
+		conversacionID, tenantID,
+	).Scan(&id, &viajeID, &clienteID, &estado, &siguienteSecuencia, &escrituraHasta, &creadoEn, &atendidaEn, &bandejaID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrConversacionNoEncontrada
+	}
+	if err != nil {
+		return nil, fmt.Errorf("conversacion: leer conversacion: %w", err)
+	}
+
+	// ultima_secuencia: `siguiente_secuencia` es un contador que se incrementa y
+	// cuyo valor ASIGNADO es la última secuencia del último mensaje (Enviar hace
+	// `SET siguiente_secuencia = siguiente_secuencia + 1 RETURNING ...` y asigna
+	// ese valor al mensaje). Así, con N mensajes vale N, y sin mensajes vale 0: es
+	// directamente la última secuencia. El nombre engaña (no es "la próxima").
+	ultimaSecuencia := siguienteSecuencia
+	if ultimaSecuencia < 0 {
+		ultimaSecuencia = 0
+	}
+
+	conv := &msgclient.Conversacion{
+		Id:              uuid.MustParse(id),
+		ViajeId:         uuid.MustParse(viajeID),
+		Estado:          msgclient.EstadoConversacion(estado),
+		UltimaSecuencia: ultimaSecuencia,
+		EscrituraHasta:  escrituraHasta,
+		AtendidaEn:      atendidaEn,
+		AbiertaEn:       creadoEn,
+	}
+	if clienteID != nil {
+		conv.ClienteId = uuid.MustParse(*clienteID)
+	}
+	if bandejaID != nil {
+		b := uuid.MustParse(*bandejaID)
+		conv.BandejaId = &b
+	}
+
+	// Reclamo activo (solo-interno): version_reclamo + el agregado. 0 si no hay.
+	var (
+		rid, rconv, rresp string
+		rversion          int64
+		rabierto          time.Time
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT id, conversacion_id, actor_real, version, abierto_en
+		   FROM mensajeria.reclamo
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL`,
+		conversacionID, tenantID,
+	).Scan(&rid, &rconv, &rresp, &rversion, &rabierto)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		conv.VersionReclamo = 0 // nunca reclamado (contrato)
+	case err != nil:
+		return nil, fmt.Errorf("conversacion: leer reclamo activo: %w", err)
+	default:
+		conv.VersionReclamo = rversion
+		conv.ReclamoActivo = &msgclient.Reclamo{
+			Id:             uuid.MustParse(rid),
+			ConversacionId: uuid.MustParse(rconv),
+			ResponsableId:  uuid.MustParse(rresp),
+			Version:        rversion,
+			AbiertoEn:      rabierto,
+		}
+	}
+
+	return conv, nil
 }
 
 // audienciaDesdeRol mapea el rol a la Audiencia de dominio (DEC-054): solo
@@ -304,3 +614,100 @@ func (s *Servicio) ClienteDeConversacion(ctx context.Context, tenantID, conversa
 // ErrConversacionNoEncontrada la devuelve ClienteDeConversacion cuando la
 // conversación no existe para el tenant.
 var ErrConversacionNoEncontrada = errors.New("conversacion: no encontrada")
+
+// EntradaCreacion es lo mínimo para crear la conversación de un viaje al
+// consumir viaje.mensajeria_habilitada (E3-T1). En V1 el tenant ES el cliente
+// (DEC-049): ClienteID puebla tanto tenant_id (aislamiento, P9) como cliente_id
+// (alcance, DEC-045 #8), igual que reportes.hecho_viaje (aplicarCreado). El
+// evento siempre trae cliente_id (operacion lo exige al crear), así que no hay
+// borde de arranque en frío como el de reportes.
+type EntradaCreacion struct {
+	ViajeID   string
+	ClienteID string
+}
+
+// CrearPorEvento crea la conversación de un viaje, idempotentemente. La
+// idempotencia es DURABLE y la da el índice único parcial
+// una_conversacion_activa_por_viaje (una conversación no-cerrada por
+// (tenant_id, viaje_id)): reentregar viaje.mensajeria_habilitada para el mismo
+// viaje produce un conflicto de unicidad que ON CONFLICT DO NOTHING vuelve no-op,
+// no una segunda conversación. No usa inbox_evento: el invariante de unicidad del
+// negocio ES el árbitro (mismo criterio que el envío y el consumidor de
+// emergencia; DEC-067). Devuelve creada=true si insertó, false si ya existía.
+func (s *Servicio) CrearPorEvento(ctx context.Context, in EntradaCreacion) (bool, error) {
+	if in.ViajeID == "" || in.ClienteID == "" {
+		return false, fmt.Errorf("conversacion: creación inválida: faltan viaje_id o cliente_id")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("conversacion: abrir transacción de creación: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// tenant_id = cliente_id (DEC-049: cliente = tenant), igual que reportes.
+	ct, err := tx.Exec(ctx,
+		`INSERT INTO mensajeria.conversacion (tenant_id, viaje_id, cliente_id, estado, siguiente_secuencia)
+		 VALUES ($1, $2, $3::uuid, 'abierta', 0)
+		 ON CONFLICT DO NOTHING`,
+		in.ClienteID, in.ViajeID, in.ClienteID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("conversacion: insertar conversación: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("conversacion: commit de creación: %w", err)
+	}
+	// RowsAffected 0 ⇒ ya existía una conversación activa para el viaje (ON
+	// CONFLICT no insertó): reentrega idempotente, no-op.
+	return ct.RowsAffected() == 1, nil
+}
+
+// Ventanas de escritura tras el cierre del viaje (DEC-030/DEC-041): con
+// incidencia la conversación sigue viva 6 meses; sin incidencia, 3 días. Tras el
+// límite pasa a solo_lectura (lo hará un barrido o la guarda de Enviar al vencer;
+// aquí solo se fija escritura_hasta).
+const (
+	ventanaConIncidencia = 6 * 30 * 24 * time.Hour // 6 meses (aprox. 30 días/mes)
+	ventanaSinIncidencia = 3 * 24 * time.Hour      // 3 días
+)
+
+// CerrarVentana fija escritura_hasta de la conversación del viaje al consumir
+// viaje.cerrado (E3-T1). La ventana depende del motivo de cierre: por_incidencia
+// ⇒ 6 meses, cualquier otro ⇒ 3 días (DEC-030/DEC-041). Filtra SOLO por viaje_id:
+// el evento viaje.cerrado no trae cliente_id (no hay tenant que exigir), y la
+// conversación activa por viaje es única por el índice parcial. Idempotente:
+// fijar el mismo escritura_hasta a partir del mismo cerrado_en es convergente, así
+// que reentregar viaje.cerrado no cambia el resultado. No pasa la conversación a
+// solo_lectura ahora: eso ocurre al VENCER la ventana (la guarda de Enviar ya
+// rechaza cuando estado != 'abierta'). Si no hay conversación para el viaje, es
+// no-op (un viaje sin mensajería habilitada no tiene nada que cerrar).
+func (s *Servicio) CerrarVentana(ctx context.Context, viajeID, motivoCierre string, cerradoEn time.Time) error {
+	if viajeID == "" {
+		return fmt.Errorf("conversacion: cierre inválido: falta viaje_id")
+	}
+	ventana := ventanaSinIncidencia
+	if motivoCierre == "por_incidencia" {
+		ventana = ventanaConIncidencia
+	}
+	escrituraHasta := cerradoEn.Add(ventana)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("conversacion: abrir transacción de cierre: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE mensajeria.conversacion
+		    SET escritura_hasta = $2
+		  WHERE viaje_id = $1 AND estado <> 'cerrada'`,
+		viajeID, escrituraHasta,
+	); err != nil {
+		return fmt.Errorf("conversacion: fijar escritura_hasta: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("conversacion: commit de cierre de ventana: %w", err)
+	}
+	return nil
+}

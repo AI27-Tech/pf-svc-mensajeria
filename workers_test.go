@@ -46,21 +46,33 @@ func TestWorkersVacioSinBus(t *testing.T) {
 	}
 }
 
-// suscriptorFake implementa bus.Subscriber capturando los parámetros del
-// Subscribe para verificar el cableado del consumidor de catálogos. Devuelve un
-// worker cuyo nombre refleja el durableName (como el adaptador real:
+// suscriptorFake implementa bus.Subscriber capturando CADA Subscribe (New puede
+// abrir varios consumidores durables), para verificar el cableado de cada uno.
+// Devuelve un worker cuyo nombre refleja el durableName (como el adaptador real:
 // "bus-durable:"+durableName).
-type suscriptorFake struct {
+type suscripcion struct {
 	durableName string
 	superficie  bus.Sensibilidad
 	filtro      []string
 }
 
+type suscriptorFake struct {
+	subs []suscripcion
+}
+
 func (s *suscriptorFake) Subscribe(durableName string, superficie bus.Sensibilidad, filtroTipos []string, h bus.Handler) (worker.Worker, error) {
-	s.durableName = durableName
-	s.superficie = superficie
-	s.filtro = filtroTipos
+	s.subs = append(s.subs, suscripcion{durableName: durableName, superficie: superficie, filtro: filtroTipos})
 	return workerConNombre{nombre: "bus-durable:" + durableName}, nil
+}
+
+// por devuelve la suscripción con ese durableName, o nil si no se abrió.
+func (s *suscriptorFake) por(durableName string) *suscripcion {
+	for i := range s.subs {
+		if s.subs[i].durableName == durableName {
+			return &s.subs[i]
+		}
+	}
+	return nil
 }
 
 type workerConNombre struct{ nombre string }
@@ -88,14 +100,15 @@ func TestWorkersConSubscriberArrancaConsumidorCatalogos(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if sub.durableName != "mensajeria-catalogos" {
-		t.Errorf("durableName = %q, want mensajeria-catalogos", sub.durableName)
+	cat := sub.por("mensajeria-catalogos")
+	if cat == nil {
+		t.Fatalf("no se abrió la suscripción mensajeria-catalogos; abiertas: %v", sub.subs)
 	}
-	if sub.superficie != bus.SensibilidadAmplia {
-		t.Errorf("superficie = %q, want amplia", sub.superficie)
+	if cat.superficie != bus.SensibilidadAmplia {
+		t.Errorf("superficie = %q, want amplia", cat.superficie)
 	}
-	if len(sub.filtro) != 1 || sub.filtro[0] != "catalogo.actualizado" {
-		t.Errorf("filtro = %v, want [catalogo.actualizado]", sub.filtro)
+	if len(cat.filtro) != 1 || cat.filtro[0] != "catalogo.actualizado" {
+		t.Errorf("filtro = %v, want [catalogo.actualizado]", cat.filtro)
 	}
 	var tiene bool
 	for _, w := range m.Workers() {
@@ -105,6 +118,50 @@ func TestWorkersConSubscriberArrancaConsumidorCatalogos(t *testing.T) {
 	}
 	if !tiene {
 		t.Error("falta el consumidor de catálogos en Workers()")
+	}
+}
+
+// TestWorkersConSubscriberArrancaConsumidoresConversacion fija que, con
+// Subscriber, mensajeria expone los dos consumidores durables del ciclo de vida
+// de la conversación por evento del viaje (E3-T1): viaje.mensajeria_habilitada y
+// viaje.cerrado, cada uno sobre la superficie amplia con su propio durableName y
+// filtro. No dependen de Catalogos (a diferencia del de catálogos).
+func TestWorkersConSubscriberArrancaConsumidoresConversacion(t *testing.T) {
+	sub := &suscriptorFake{}
+	m, err := New(Pools{}, Deps{Subscriber: sub})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	casos := []struct {
+		durableName string
+		tipo        string
+	}{
+		{"mensajeria-conversacion-habilitada", "viaje.mensajeria_habilitada"},
+		{"mensajeria-conversacion-cerrada", "viaje.cerrado"},
+	}
+	for _, c := range casos {
+		s := sub.por(c.durableName)
+		if s == nil {
+			t.Errorf("no se abrió la suscripción %s; abiertas: %v", c.durableName, sub.subs)
+			continue
+		}
+		if s.superficie != bus.SensibilidadAmplia {
+			t.Errorf("%s: superficie = %q, want amplia", c.durableName, s.superficie)
+		}
+		if len(s.filtro) != 1 || s.filtro[0] != c.tipo {
+			t.Errorf("%s: filtro = %v, want [%s]", c.durableName, s.filtro, c.tipo)
+		}
+		nombre := "bus-durable:" + c.durableName
+		var tiene bool
+		for _, w := range m.Workers() {
+			if w.Name() == nombre {
+				tiene = true
+			}
+		}
+		if !tiene {
+			t.Errorf("falta %s en Workers()", nombre)
+		}
 	}
 }
 

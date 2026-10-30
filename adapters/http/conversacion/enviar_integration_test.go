@@ -138,3 +138,72 @@ func TestEnviarMensajeHTTP(t *testing.T) {
 		t.Fatalf("reintento devolvió otro mensaje: %s != %s", m2.Id, m.Id)
 	}
 }
+
+// TestEnviarMensajeHTTPConversacionSoloLectura prueba la guarda de estado por el
+// camino HTTP (E3-T2): un envío sobre una conversación `solo_lectura` responde
+// 409, sin crear mensaje. El cliente autorizado (dueño de la conversación) llega
+// hasta el dominio; la guarda rechaza por estado, no por autorización.
+//
+// Se salta si MENSAJERIA_TEST_DB no está definido.
+func TestEnviarMensajeHTTPConversacionSoloLectura(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dbtest.Serializar(t, ctx)
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	dbtest.Reiniciar(t, ctx, admin)
+	defer dbtest.Reiniciar(t, ctx, admin)
+	dbtest.AplicarMigraciones(t, ctx, admin)
+
+	const (
+		tenant  = "t1"
+		conv    = "11111111-1111-1111-1111-111111111111"
+		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+		cmid    = "99999999-9999-9999-9999-999999999999"
+	)
+	// Conversación del cliente, en solo_lectura (venció escritura_hasta).
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.conversacion (id, tenant_id, viaje_id, cliente_id, estado, siguiente_secuencia)
+		 VALUES ('`+conv+`', '`+tenant+`', gen_random_uuid(), '`+cliente+`', 'solo_lectura', 0)`)
+
+	pool, closePool := dbtest.PoolComoRol(t, ctx)
+	defer closePool()
+
+	chat := &platformpgx.Pool{Pool: pool}
+	mod, err := mensajeria.New(
+		mensajeria.Pools{Chat: chat, Despacho: chat},
+		mensajeria.Deps{Catalogos: catalogosFalso{nombre: "Tu equipo AI27 – Bimbo"}},
+	)
+	if err != nil {
+		t.Fatalf("construir módulo: %v", err)
+	}
+	mux := http.NewServeMux()
+	mod.Routes(mux)
+
+	// El cliente dueño de la conversación: pasa la autorización, lo frena el estado.
+	claims := &auth.Claims{Subject: cliente, TenantID: tenant, Rol: "cliente", Audiencia: auth.AudienciaCliente}
+
+	body, _ := json.Marshal(msgclient.EnviarMensajeEntrada{
+		ClientMessageId: uuid.MustParse(cmid),
+		Cuerpo:          "no debería entrar",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/conversaciones/"+conv+"/mensajes", bytes.NewReader(body))
+	req = req.WithContext(auth.ContextWithClaims(ctx, claims))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("envío a solo_lectura: status %d, quiere 409; cuerpo %s", rec.Code, rec.Body.String())
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM mensajeria.mensaje WHERE conversacion_id = $1`, conv,
+	).Scan(&n); err != nil {
+		t.Fatalf("contar mensajes: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("no debería haberse creado mensaje, hay %d", n)
+	}
+}

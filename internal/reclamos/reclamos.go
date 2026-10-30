@@ -13,6 +13,12 @@
 // Perder el reclamo NO es perder la membresía (Addendum §4 puntos 7 y 8): son
 // dos efectos distintos. reclamos solo quita autoridad de envío; la membresía
 // vive en internal/pool.
+//
+// Cada mutación publica su evento de dominio por outbox EN LA MISMA tx (E3-T3):
+// conversacion.reclamada al abrir, conversacion.liberada al cerrar,
+// conversacion.transferida al transferir. El contrato (tracer.21) los define con
+// sensibilidad restringida, agregado conversacion_id y consumidor durable
+// realtime (y reportes en transferida), que es el puente hacia E3-T5.
 package reclamos
 
 import (
@@ -22,6 +28,7 @@ import (
 	"time"
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
+	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -48,14 +55,22 @@ type Begin interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
+// Publicador escribe un evento de dominio en el outbox dentro de la tx dada
+// (P17). Lo satisface *outbox.Publisher de pf-pkg-platform-go. Interfaz mínima
+// declarada por el consumidor (golang-best-practices §6).
+type Publicador interface {
+	Publish(ctx context.Context, tx pgx.Tx, events ...outbox.Event) error
+}
+
 // Servicio gestiona reclamos sobre el pool de chat de svc_mensajeria.
 type Servicio struct {
 	pool Begin
+	pub  Publicador
 }
 
 // NewServicio construye el servicio de reclamos.
-func NewServicio(pool Begin) *Servicio {
-	return &Servicio{pool: pool}
+func NewServicio(pool Begin, pub Publicador) *Servicio {
+	return &Servicio{pool: pool, pub: pub}
 }
 
 // Reclamar toma el reclamo activo de una conversación exigiendo la versión
@@ -78,14 +93,15 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, conversacionID, actor
 
 	// Avanza la versión del reclamo activo solo si la versión esperada coincide.
 	var nueva int64
+	var reclamoID string
 	err = tx.QueryRow(ctx,
 		`UPDATE mensajeria.reclamo
 		    SET version = version + 1, actor_real = $3
 		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
 		    AND version = $4
-		  RETURNING version`,
+		  RETURNING id, version`,
 		conversacionID, tenantID, actorReal, int64(esperada),
-	).Scan(&nueva)
+	).Scan(&reclamoID, &nueva)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		// O no hay reclamo activo con esa versión (lo tomó otro: conflicto), o no
@@ -101,12 +117,31 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, conversacionID, actor
 		if esperada != 0 {
 			return 0, ErrConflictoVersion{Esperada: esperada, Actual: 0}
 		}
-		if err := abrir(ctx, tx, tenantID, conversacionID, actorReal); err != nil {
+		reclamoID, err = abrir(ctx, tx, tenantID, conversacionID, actorReal)
+		if err != nil {
 			return 0, err
 		}
 		nueva = 1
 	} else if err != nil {
 		return 0, fmt.Errorf("reclamos: reclamar: %w", err)
+	}
+
+	// Publica conversacion.reclamada en la MISMA tx (E3-T3). Refleja quién
+	// responde ahora y en qué versión: lo emiten los dos caminos (abrir el primer
+	// reclamo y reasignar/avanzar uno activo), porque ambos cambian el responsable
+	// que realtime debe mostrar.
+	if err := s.pub.Publish(ctx, tx, outbox.Event{
+		Tipo:         "conversacion.reclamada",
+		AgregadoID:   conversacionID,
+		Sensibilidad: outbox.SensibilidadRestringida,
+		Payload: map[string]any{
+			"conversacion_id": conversacionID,
+			"reclamo_id":      reclamoID,
+			"responsable_id":  actorReal,
+			"version_reclamo": nueva,
+		},
+	}); err != nil {
+		return 0, fmt.Errorf("reclamos: publicar conversacion.reclamada: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -115,19 +150,21 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, conversacionID, actor
 	return msgtipos.VersionReclamo(nueva), nil
 }
 
-// abrir inserta el reclamo activo inicial. El índice único parcial
-// un_reclamo_activo_por_conversacion garantiza a lo más uno activo: si dos
-// abren a la vez, uno recibe violación de unicidad (lo trata el llamador como
+// abrir inserta el reclamo activo inicial y devuelve su id. El índice único
+// parcial un_reclamo_activo_por_conversacion garantiza a lo más uno activo: si
+// dos abren a la vez, uno recibe violación de unicidad (lo trata el llamador como
 // conflicto en una versión completa; en el scaffold se propaga).
-func abrir(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actorReal string) error {
-	_, err := tx.Exec(ctx,
+func abrir(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actorReal string) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.reclamo (conversacion_id, tenant_id, actor_real, version)
-		 VALUES ($1, $2, $3, 1)`,
-		conversacionID, tenantID, actorReal)
+		 VALUES ($1, $2, $3, 1)
+		 RETURNING id`,
+		conversacionID, tenantID, actorReal).Scan(&id)
 	if err != nil {
-		return fmt.Errorf("reclamos: abrir reclamo: %w", err)
+		return "", fmt.Errorf("reclamos: abrir reclamo: %w", err)
 	}
-	return nil
+	return id, nil
 }
 
 // Liberar cierra el reclamo activo de la conversación y lo devuelve al pool
@@ -170,6 +207,21 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclam
 		return ErrSinReclamo
 	}
 
+	// Publica conversacion.liberada en la MISMA tx (E3-T3): la conversación
+	// vuelve al pool. version_reclamo es la versión cerrada (la esperada).
+	if err := s.pub.Publish(ctx, tx, outbox.Event{
+		Tipo:         "conversacion.liberada",
+		AgregadoID:   conversacionID,
+		Sensibilidad: outbox.SensibilidadRestringida,
+		Payload: map[string]any{
+			"conversacion_id": conversacionID,
+			"reclamo_id":      reclamoID,
+			"version_reclamo": int64(esperada),
+		},
+	}); err != nil {
+		return fmt.Errorf("reclamos: publicar conversacion.liberada: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("reclamos: commit de la liberación: %w", err)
 	}
@@ -195,16 +247,16 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, ori
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Cerrar el reclamo activo exigiendo la versión esperada.
-	ct, err := tx.Exec(ctx,
+	var anteriorID string
+	err = tx.QueryRow(ctx,
 		`UPDATE mensajeria.reclamo
 		    SET cerrado_en = now()
 		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
-		    AND version = $3`,
-		conversacionID, tenantID, int64(esperada))
-	if err != nil {
-		return fmt.Errorf("reclamos: cerrar reclamo en transferencia: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
+		    AND version = $3
+		  RETURNING id`,
+		conversacionID, tenantID, int64(esperada),
+	).Scan(&anteriorID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		actual, hay, e := versionActiva(ctx, tx, tenantID, conversacionID)
 		if e != nil {
 			return e
@@ -214,11 +266,15 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, ori
 		}
 		return ErrSinReclamo
 	}
+	if err != nil {
+		return fmt.Errorf("reclamos: cerrar reclamo en transferencia: %w", err)
+	}
 
 	// Abrir el reclamo del destino en la MISMA tx. El índice único parcial
 	// garantiza a lo más uno activo: como acabamos de cerrar el anterior, este
 	// INSERT no colisiona.
-	if err := abrir(ctx, tx, tenantID, conversacionID, destino); err != nil {
+	nuevoID, err := abrir(ctx, tx, tenantID, conversacionID, destino)
+	if err != nil {
 		return err
 	}
 
@@ -230,6 +286,23 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, ori
 		tenantID, conversacionID, origen, destino, motivo)
 	if err != nil {
 		return fmt.Errorf("reclamos: auditar transferencia: %w", err)
+	}
+
+	// Publica conversacion.transferida en la MISMA tx (E3-T3): lleva el reclamo
+	// cerrado y el abierto. El nuevo reclamo abre en versión 1.
+	if err := s.pub.Publish(ctx, tx, outbox.Event{
+		Tipo:         "conversacion.transferida",
+		AgregadoID:   conversacionID,
+		Sensibilidad: outbox.SensibilidadRestringida,
+		Payload: map[string]any{
+			"conversacion_id":     conversacionID,
+			"reclamo_anterior_id": anteriorID,
+			"reclamo_id":          nuevoID,
+			"responsable_id":      destino,
+			"version_reclamo":     int64(1),
+		},
+	}); err != nil {
+		return fmt.Errorf("reclamos: publicar conversacion.transferida: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
