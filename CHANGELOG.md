@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## 2026-10-30 — Bandeja del pool sin {id}: resolución por membresía (E8-T15, DEC-103)
+
+**Para quién:** el bff (y a través de él, el portal interno), que ya expone `GET /api/v1/bandeja/trabajo` sin `{id}`. mensajeria ahora sirve esa ruta: resuelve la bandeja de chat del sujeto por su membresía efectiva del pool, sin que el llamante nombre la bandeja (cola única e implícita, DEC-103).
+
+**Resumen:** cierra el hueco de E8-T15 (opción A) del lado de mensajeria. Monta `GET /api/v1/bandeja/trabajo` (hermana sin `{id}` de `listarTrabajoBandeja`). El handler resuelve la bandeja de chat del sujeto y comparte el resto de la lógica (bootstrap/catch-up) con la ruta por `{id}`, que se conserva para uso administrativo.
+
+**Resolución y autorización:** `ResolverMiBandeja` consulta `pool_membresia ⋈ bandeja` filtrando `tipo = 'chat'` (no Reacción). Resolver la bandeja ES la autorización: si hay bandeja, el sujeto es miembro activo por construcción, así que no se añade una guarda `PuedeVerBandeja` aparte. Sin membresía de chat → 404 (como bandeja inexistente), incluida la membresía solo en una bandeja de otro tipo. Membresía activa en más de una bandeja de chat → error interno (`ErrMembresiaAmbigua`): es un dato inconsistente con la cola única y no se elige una en silencio.
+
+**Cambios:**
+- `internal/bandejas/bandejas.go`: `ResolverMiBandeja`, `ErrMembresiaAmbigua`.
+- `adapters/http/bandejas/bandejas.go`: handler `miTrabajo`, ruta `GET /api/v1/bandeja/trabajo`, helper común `servirTrabajo` extraído de `trabajo`.
+- `internal/bandejas/bandejas_integration_test.go`: `TestResolverMiBandeja` (resuelve, sin pool → 404, solo emergencias → 404, dos chat → ambigua).
+
+**Verificación:** `gofmt`, `go vet ./...`, `go build ./...`, `go test ./...` (integración contra Postgres real, incluido el test nuevo), `arch-test` en verde.
+
+**Pin de contrato:** sigue en `tracer.21`. El handler monta la ruta a mano y usa tipos de dominio que ya existen, así que no necesita el pin de `tracer.31` (que añade el operationId al spec). El pin se sube cuando `tracer.31` llegue a `-m` y tenga tag, para no fijar una pseudo-version.
+
 ## 2026-10-29 — E9-T8 (B.0): lectura de la conversación del viaje (obtenerConversacion, listarMensajes)
 
 **Resumen:** monta los dos GET de lectura de conversación que el contrato (tracer.21) ya definía pero el servicio no servía: `GET /api/v1/conversaciones/{id}` (`obtenerConversacion`) y `GET /api/v1/conversaciones/{id}/mensajes` (`listarMensajes`). Es el pre-requisito de servicio (paso B.0) para exponer la conversación del viaje al portal cliente (E9-T8) a través del `bff`.

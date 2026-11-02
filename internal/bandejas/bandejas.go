@@ -47,6 +47,53 @@ func NewServicio(db Consultor) *Servicio {
 // existe para el tenant. El llamador la mapea a no_encontrado.
 var ErrBandejaNoEncontrada = errors.New("bandejas: bandeja no encontrada")
 
+// ErrMembresiaAmbigua la devuelve ResolverMiBandeja cuando un sujeto tiene
+// membresía activa en MÁS de una bandeja de chat. Con cola única e implícita
+// (DEC-103) el invariante es exactamente una; más de una es un dato
+// inconsistente que un administrador debe corregir, no una ambigüedad que el
+// servidor pueda resolver eligiendo una en silencio.
+var ErrMembresiaAmbigua = errors.New("bandejas: el sujeto tiene membresía activa en más de una bandeja de chat")
+
+// ResolverMiBandeja devuelve el id de la bandeja de chat del sujeto, derivado de
+// su membresía efectiva del pool (cola única e implícita, DEC-103): el llamante
+// no nombra la bandeja. Filtra por tipo 'chat' para no devolver una bandeja de
+// Reacción. Sin membresía activa en ninguna bandeja de chat -> ErrBandejaNoEncontrada
+// (el llamador lo mapea a 404, como una bandeja inexistente). Más de una ->
+// ErrMembresiaAmbigua (dato inconsistente; no se elige una en silencio).
+func (s *Servicio) ResolverMiBandeja(ctx context.Context, tenantID, usuarioID string) (string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT b.id
+		   FROM mensajeria.pool_membresia m
+		   JOIN mensajeria.bandeja b
+		     ON b.id = m.bandeja_id AND b.tenant_id = m.tenant_id
+		  WHERE m.usuario_id = $1 AND m.tenant_id = $2 AND m.activa
+		    AND b.tipo = 'chat'`,
+		usuarioID, tenantID)
+	if err != nil {
+		return "", fmt.Errorf("bandejas: resolver bandeja del sujeto: %w", err)
+	}
+	defer rows.Close()
+
+	var bandejaID string
+	n := 0
+	for rows.Next() {
+		n++
+		if n > 1 {
+			return "", ErrMembresiaAmbigua
+		}
+		if err := rows.Scan(&bandejaID); err != nil {
+			return "", fmt.Errorf("bandejas: escanear bandeja del sujeto: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("bandejas: iterar membresía: %w", err)
+	}
+	if n == 0 {
+		return "", ErrBandejaNoEncontrada
+	}
+	return bandejaID, nil
+}
+
 // Trabajo es el BOOTSTRAP de una bandeja (ADR 28 §2): las conversaciones con
 // ruta ACTIVA en la bandeja y la revisión actual de la colección, que el cliente
 // usa como desde_revision en el siguiente catch-up. El orden es por revisión de
