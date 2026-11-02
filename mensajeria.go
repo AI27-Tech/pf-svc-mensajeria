@@ -196,18 +196,8 @@ func New(p Pools, d Deps) (*Module, error) {
 // /api/v1/viajes/{id}/emergencias sobre internal/emergencias. El catch-up de
 // bandeja (M3) ya entró en tracer.14.
 func (m *Module) Routes(mux *http.ServeMux) {
-	convhttp.Handlers{
-		Autz:         m.autz,
-		Reclamos:     m.reclamos,
-		Reclamo:      m.reclamos,
-		Conversacion: m.conversacion,
-		Catalogos:    m.deps.Catalogos,
-	}.Montar(mux)
-
-	bandejashttp.Handlers{
-		Autz:    m.autz,
-		Bandeja: m.bandejas,
-	}.Montar(mux)
+	m.handlersConversacion().Montar(mux)
+	m.handlersBandeja().Montar(mux)
 
 	emerhttp.Handlers{
 		Autz:        m.autz,
@@ -253,3 +243,26 @@ func (m *Module) Workers() []worker.Worker {
 // de mensajeria es bff → mensajeria, y es SIEMPRE HTTP (05, 09): su adaptador
 // vive en pf-svc-bff, no hay consumidor en proceso. Por eso mensajeria no expone
 // Consultas(). (Interpretación registrada para que 00 la precise; ver README.)
+// Superado en el despliegue compuesto: core resuelve bff→mensajeria en proceso
+// por Emergencias() y Conversaciones(), no por un Consultas() genérico.
+
+// handlersConversacion y handlersBandeja son el ÚNICO cableado de dependencias
+// de la conversación y la bandeja. Los usan Routes (HTTP) y Conversaciones() (en
+// proceso), de modo que ambas superficies llamen a las mismas instancias de los
+// casos de uso.
+func (m *Module) handlersConversacion() convhttp.Handlers {
+	return convhttp.Handlers{
+		Autz:         m.autz,
+		Reclamos:     m.reclamos,
+		Reclamo:      m.reclamos,
+		Conversacion: m.conversacion,
+		Catalogos:    m.deps.Catalogos,
+	}
+}
+
+func (m *Module) handlersBandeja() bandejashttp.Handlers {
+	return bandejashttp.Handlers{
+		Autz:    m.autz,
+		Bandeja: m.bandejas,
+	}
+}
