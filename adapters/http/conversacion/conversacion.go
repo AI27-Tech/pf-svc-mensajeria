@@ -342,7 +342,7 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	alias, err := h.resolverAlias(r.Context(), claims.TenantID, convID)
+	alias, err := h.ResolverAlias(r.Context(), claims.TenantID, convID)
 	if err != nil {
 		escribirError(w, traducir(err))
 		return
@@ -406,12 +406,13 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 	escribirJSON(w, http.StatusCreated, mensaje)
 }
 
-// resolverAlias obtiene el nombre comercial que ve el cliente (Opción 2): el
+// ResolverAlias obtiene el nombre comercial que ve el cliente (Opción 2): el
 // nombre del cliente de la conversación, leído por lote desde catalogos. Sin
 // puerto de catalogos o sin cliente en la conversación, devuelve vacío: el alias
 // queda NULL y el envío sigue (la degradación de catalogos no rompe el envío,
-// mensajeria.md (f)).
-func (h Handlers) resolverAlias(ctx context.Context, tenantID, conversacionID string) (string, error) {
+// mensajeria.md (f)). Exportada para que la superficie en proceso
+// (mensajeria.ConversacionesAPI) aplique la MISMA regla de alias que el handler.
+func (h Handlers) ResolverAlias(ctx context.Context, tenantID, conversacionID string) (string, error) {
 	if h.Catalogos == nil {
 		return "", nil
 	}

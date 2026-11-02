@@ -2,6 +2,7 @@ package bandejas_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -106,5 +107,82 @@ func TestTrabajoYCatchUp(t *testing.T) {
 	}
 	if len(activas) != 1 || activas[0].Id.String() != convB {
 		t.Fatalf("bootstrap tras baja debe traer solo convB, trajo %d", len(activas))
+	}
+}
+
+// TestResolverMiBandeja prueba la resolución de la bandeja de chat del sujeto
+// por membresía efectiva del pool (E8-T15, cola única DEC-103), contra Postgres
+// real. Afirma:
+//   - sujeto con membresía activa en una bandeja de chat -> devuelve esa bandeja;
+//   - sujeto sin membresía de chat -> ErrBandejaNoEncontrada (el handler lo mapea
+//     a 404), aunque sea miembro de una bandeja de OTRO tipo (emergencias);
+//   - sujeto con membresía activa en dos bandejas de chat -> ErrMembresiaAmbigua
+//     (dato inconsistente con la cola única; no se elige una en silencio).
+//
+// Se salta si MENSAJERIA_TEST_DB no está definido.
+func TestResolverMiBandeja(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dbtest.Serializar(t, ctx)
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	dbtest.Reiniciar(t, ctx, admin)
+	defer dbtest.Reiniciar(t, ctx, admin)
+	dbtest.AplicarMigraciones(t, ctx, admin)
+
+	const (
+		tenant      = "t1"
+		bandejaChat = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		bandejaEmer = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		ejecutivo   = "11111111-1111-1111-1111-111111111111"
+		reaccion    = "22222222-2222-2222-2222-222222222222"
+		ajeno       = "33333333-3333-3333-3333-333333333333"
+	)
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision) VALUES
+		 ('`+bandejaChat+`', '`+tenant+`', 'chat', 'pool chat', 0),
+		 ('`+bandejaEmer+`', '`+tenant+`', 'emergencias', 'pool reacción', 0)`)
+	// ejecutivo: membresía activa en la bandeja de chat.
+	// reaccion: membresía activa solo en la de emergencias (no es de chat).
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, activa) VALUES
+		 ('`+bandejaChat+`', '`+ejecutivo+`', '`+tenant+`', 'ejecutivo', true),
+		 ('`+bandejaEmer+`', '`+reaccion+`', '`+tenant+`', 'reaccion', true)`)
+
+	pool, closePool := dbtest.PoolComoRol(t, ctx)
+	defer closePool()
+	svc := bandejas.NewServicio(pool)
+
+	// Caso 1: el ejecutivo resuelve su bandeja de chat.
+	got, err := svc.ResolverMiBandeja(ctx, tenant, ejecutivo)
+	if err != nil {
+		t.Fatalf("ResolverMiBandeja (ejecutivo): %v", err)
+	}
+	if got != bandejaChat {
+		t.Fatalf("bandeja resuelta = %q, quiere %q", got, bandejaChat)
+	}
+
+	// Caso 2a: un sujeto ajeno, sin ninguna membresía, no tiene bandeja.
+	if _, err := svc.ResolverMiBandeja(ctx, tenant, ajeno); !errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
+		t.Fatalf("sujeto sin membresía: err = %v, quiere ErrBandejaNoEncontrada", err)
+	}
+
+	// Caso 2b: membresía SOLO en una bandeja de emergencias no cuenta como de chat.
+	if _, err := svc.ResolverMiBandeja(ctx, tenant, reaccion); !errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
+		t.Fatalf("sujeto solo en emergencias: err = %v, quiere ErrBandejaNoEncontrada", err)
+	}
+
+	// Caso 3: membresía activa en DOS bandejas de chat -> ambigua (no elige una).
+	const bandejaChat2 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision)
+		 VALUES ('`+bandejaChat2+`', '`+tenant+`', 'chat', 'otro pool chat', 0)`)
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, activa)
+		 VALUES ('`+bandejaChat2+`', '`+ejecutivo+`', '`+tenant+`', 'ejecutivo', true)`)
+	if _, err := svc.ResolverMiBandeja(ctx, tenant, ejecutivo); !errors.Is(err, bandejas.ErrMembresiaAmbigua) {
+		t.Fatalf("sujeto en dos bandejas de chat: err = %v, quiere ErrMembresiaAmbigua", err)
 	}
 }

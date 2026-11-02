@@ -26,6 +26,9 @@ type Autorizador interface {
 type Trabajador interface {
 	Trabajo(ctx context.Context, tenantID, bandejaID string) ([]msgclient.Conversacion, int64, error)
 	CambiosDesde(ctx context.Context, tenantID, bandejaID string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
+	// ResolverMiBandeja da el id de la bandeja de chat del sujeto por su membresía
+	// efectiva del pool (cola única, DEC-103). Sin pool de chat -> ErrBandejaNoEncontrada.
+	ResolverMiBandeja(ctx context.Context, tenantID, usuarioID string) (string, error)
 }
 
 // Handlers agrupa las dependencias del handler de bandejas.
@@ -34,15 +37,14 @@ type Handlers struct {
 	Bandeja Trabajador
 }
 
-// Montar registra la ruta de trabajo de bandeja. El bff antepone auth.Middleware.
+// Montar registra las rutas de trabajo de bandeja. El bff antepone auth.Middleware.
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/bandejas/{id}/trabajo", h.trabajo)
+	mux.HandleFunc("GET /api/v1/bandeja/trabajo", h.miTrabajo)
 }
 
-// trabajo sirve el trabajo de una bandeja. Sin desde_revision es el bootstrap;
-// con desde_revision es el catch-up incremental. Autoriza por membresía de pool
-// (DEC-097, Addendum §7) y devuelve TrabajoBandeja con la revisión de la
-// colección. Fuera de ventana (no en V1) sería 409 stream_resync_required.
+// trabajo sirve el trabajo de una bandeja NOMBRADA por {id} (uso administrativo).
+// Autoriza por membresía de pool en esa bandeja (DEC-097, Addendum §7).
 func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 	claims := auth.ClaimsFromContext(r.Context())
 	if claims == nil {
@@ -55,7 +57,38 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 		escribirError(w, err)
 		return
 	}
+	h.servirTrabajo(w, r, claims.TenantID, bandejaID)
+}
 
+// miTrabajo sirve el trabajo de la bandeja del SUJETO, sin {id} (cola única e
+// implícita, DEC-103). La bandeja la resuelve la membresía efectiva del pool:
+// resolverla ES la autorización (si hay bandeja, el sujeto es miembro activo de
+// ella por construcción), así que no hace falta una guarda PuedeVerBandeja
+// aparte. Un cliente no tiene bandeja de chat -> 404 por la misma vía que un
+// interno sin pool. Un sujeto en más de una bandeja de chat (dato inconsistente
+// con la cola única) -> error interno, no se elige una en silencio.
+func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	bandejaID, err := h.Bandeja.ResolverMiBandeja(r.Context(), claims.TenantID, claims.Subject)
+	if err != nil {
+		if errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
+			escribirError(w, platformerrors.NewNoEncontrado("el sujeto no pertenece a ningún pool de chat"))
+			return
+		}
+		escribirError(w, traducir(err))
+		return
+	}
+	h.servirTrabajo(w, r, claims.TenantID, bandejaID)
+}
+
+// servirTrabajo es el cuerpo común de las dos rutas de trabajo: lee
+// desde_revision (bootstrap sin él, catch-up con él) y escribe TrabajoBandeja con
+// la revisión de la colección. El id de bandeja ya viene resuelto y autorizado.
+func (h Handlers) servirTrabajo(w http.ResponseWriter, r *http.Request, tenantID, bandejaID string) {
 	crudo := r.URL.Query().Get("desde_revision")
 	var (
 		items []msgclient.Conversacion
@@ -64,7 +97,7 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 		err   error
 	)
 	if crudo == "" {
-		items, rev, err = h.Bandeja.Trabajo(r.Context(), claims.TenantID, bandejaID)
+		items, rev, err = h.Bandeja.Trabajo(r.Context(), tenantID, bandejaID)
 	} else {
 		var desde int64
 		desde, err = strconv.ParseInt(crudo, 10, 64)
@@ -72,7 +105,7 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 			escribirError(w, platformerrors.NewValidacion("desde_revision inválida"))
 			return
 		}
-		items, rev, fuera, err = h.Bandeja.CambiosDesde(r.Context(), claims.TenantID, bandejaID, desde)
+		items, rev, fuera, err = h.Bandeja.CambiosDesde(r.Context(), tenantID, bandejaID, desde)
 	}
 	if err != nil {
 		if errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
