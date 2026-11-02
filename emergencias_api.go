@@ -8,6 +8,7 @@ import (
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
+	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
@@ -82,10 +83,11 @@ var (
 	_ autorizador      = (*autorizacion.Servicio)(nil)
 )
 
-// claimsDe lee los claims del ctx y rechaza su ausencia, igual que cada handler
-// HTTP al inicio. En proceso los claims ya vienen del middleware del bff.
+// claimsDe lee los claims del ctx y rechaza su ausencia o un sujeto que no es
+// UUID, igual que cada handler HTTP al inicio (boundary.Claims). En proceso los
+// claims ya vienen del middleware del bff.
 func claimsDe(ctx context.Context) (*auth.Claims, error) {
-	c := auth.ClaimsFromContext(ctx)
+	c := boundary.Claims(ctx)
 	if c == nil {
 		return nil, platformerrors.NewNoAutorizado("mensajeria: sin claims")
 	}
