@@ -16,6 +16,28 @@
 
 **Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria`, `go test ./...` con y sin `MENSAJERIA_TEST_DB` (Postgres 18 local, base desechable), `arch-test@v0.1.1` OK.
 
+## 2026-11-02 17:55 — No filtrar el error interno en la respuesta HTTP (seguridad)
+
+**Para quién:** cualquier cliente de las rutas HTTP de mensajeria (hoy el bff). Medido: un token con sujeto que no es UUID respondía `502` con el texto crudo de Postgres en el cuerpo (`"mensajeria: error interno: bandejas: iterar membresía: ERROR: invalid input syntax for type uuid: \"no-es-uuid\" (SQLSTATE 22P02)"`). Ahora responde `401 {"codigo":"no_autorizado","mensaje":"sin claims"}` sin llegar a SQL.
+
+**Causa raíz:** los tres escritores de error (`conversacion`, `bandejas`, `emergencias`) emitían `err.Error()`, y `PlatformError.Error()` de pf-pkg-platform-go concatena la causa envuelta (`"%s: %v"`). Todo `NewRotoErr` (de `traducir` y de `internal/autorizacion`) llevaba su causa al cliente.
+
+**Arreglo, en un solo lugar:** nuevo paquete `adapters/http/boundary`.
+- `WriteError` emite solo `PlatformError.Message` (el error más externo de la taxonomía); un error fuera de la taxonomía sale como `"error interno"`. Status y código no cambian. Los tres `escribirError` delegan en él.
+- `Claims` devuelve los claims solo si el sujeto es un UUID canónico; si no, `nil`, y cada handler responde el mismo `401 no_autorizado` que ya daba ante la ausencia de claims (un sujeto que no es UUID no identifica a ningún actor). Lo usan los handlers HTTP y `claimsDe` de la superficie en proceso. El sujeto es el único claim que llega a columnas UUID (`usuario_id`, `actor_real`); `tenant_id` es TEXT.
+
+**Fuera de alcance:** no se agrega log de la causa: los adaptadores HTTP no usan logger y esta historia no añade infraestructura de logging. En la ruta HTTP la causa de un `roto` ya no queda visible en ningún lado; en proceso sigue disponible por `errors.Unwrap`. Un `{id}` de ruta que no es UUID sigue respondiendo `502 roto` (ya sin texto de Postgres); debería ser `404`, va en su propio cambio.
+
+**Cambios:**
+- `adapters/http/boundary/boundary.go` (nuevo) y su prueba.
+- `adapters/http/conversacion/conversacion.go`, `adapters/http/bandejas/bandejas.go`, `adapters/http/emergencias/emergencias.go`: `boundary.Claims` y `escribirError` → `boundary.WriteError`.
+- `emergencias_api.go`: `claimsDe` usa `boundary.Claims`.
+- `adapters/http/bandejas/bandejas_test.go` (nuevo): reproduce el caso medido con un caso de uso que falla como Postgres; afirma 401, cuerpo literal y que no se llamó al caso de uso.
+- `emergencias_api_test.go`: el sujeto de prueba pasa a UUID; nueva prueba de sujeto no UUID en proceso.
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria`, `go test ./...` con y sin `MENSAJERIA_TEST_DB` (Postgres 18 local, base desechable), `arch-test@v0.1.1` OK. La prueba nueva de bandejas falla sobre `pf-msg-d` (502 con el texto de Postgres) y pasa con el arreglo.
+
+
 ## 2026:11:02 16:57 — Superficie en proceso de conversación y bandeja (`ConversacionesAPI`)
 
 **Para quién:** `pf-svc-core`, que compone bff y mensajeria en un solo binario. Al subir core a bff v0.1.12 su adaptador `BFFMensajeriaEnProceso` ya no cumple `agregacion.MensajeriaPort`, porque el puerto pide conversación y bandeja y mensajeria solo exponía `EmergenciasAPI` en proceso. Con `Module.Conversaciones()` el adaptador de core queda en reenviar y descartar el bearer.
