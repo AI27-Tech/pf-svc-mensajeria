@@ -40,6 +40,7 @@ import (
 	bandejashttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/bandejas"
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
 	emerhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/emergencias"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/catalogoscache"
@@ -91,6 +92,7 @@ type Module struct {
 	autz         *autorizacion.Servicio
 	bandejas     *bandejas.Servicio
 	emergencias  *emergencias.Servicio
+	auditoria    *auditoria.Servicio
 	relayOutbox  worker.Worker // nil sin Publisher (standalone sin bus)
 	// consumidorCatalogos es el worker durable de catalogo.actualizado que
 	// invalida la caché en proceso de clientes (E5-T5). nil sin Subscriber+Catalogos.
@@ -117,6 +119,7 @@ func New(p Pools, d Deps) (*Module, error) {
 	m.autz = autorizacion.NewServicio(p.Chat)
 	m.bandejas = bandejas.NewServicio(p.Chat)
 	m.emergencias = emergencias.NewServicio(p.Chat, pub)
+	m.auditoria = auditoria.NewServicio(p.Chat)
 
 	if d.Publisher != nil {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el
@@ -191,6 +194,8 @@ func New(p Pools, d Deps) (*Module, error) {
 // El bff antepone auth.Middleware, así que los claims llegan en el contexto. El
 // alias_mostrado del mensaje se resuelve en el handler desde el cliente de la
 // conversación (Opción 2, DEC-097 forma 1); el dominio no llama a catalogos.
+// Atendida, recibos y la auditoría de la conversación (E3-T6) van en el mismo
+// juego de handlers de conversación.
 //
 // Emergencia (M9) se monta desde tracer.17 (DEC-100): la familia
 // /api/v1/viajes/{id}/emergencias sobre internal/emergencias. El catch-up de
@@ -257,6 +262,8 @@ func (m *Module) handlersConversacion() convhttp.Handlers {
 		Reclamo:      m.reclamos,
 		Conversacion: m.conversacion,
 		Catalogos:    m.deps.Catalogos,
+		Atencion:     m.conversacion,
+		Auditoria:    m.auditoria,
 	}
 }
 
