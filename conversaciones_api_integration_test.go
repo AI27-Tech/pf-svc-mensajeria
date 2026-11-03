@@ -185,20 +185,31 @@ func TestConversacionesAPI(t *testing.T) {
 		t.Fatalf("antes_de+despues_de: categoría %v, quiere validacion", categoria(err))
 	}
 
-	// Transferir al otro miembro: el reclamo nuevo es del destino, en versión 1.
+	// Transferir al otro miembro: el reclamo nuevo es del destino, en la versión
+	// siguiente (2).
 	rt, err := api.TransferirConversacion(interno(ejec), convUUID, msgclient.TransferenciaEntrada{ResponsableDestinoId: uuid.MustParse(destino), VersionEsperada: 1})
 	if err != nil {
 		t.Fatalf("TransferirConversacion: %v", err)
 	}
-	if rt.ResponsableId.String() != destino || rt.Version != 1 {
-		t.Fatalf("transferencia: responsable %s version %d; quiere %s 1", rt.ResponsableId, rt.Version, destino)
+	if rt.ResponsableId.String() != destino || rt.Version != 2 {
+		t.Fatalf("transferencia: responsable %s version %d; quiere %s 2", rt.ResponsableId, rt.Version, destino)
+	}
+	// Solo el responsable libera (DEC-118): el origen, ya sin reclamo, recibe
+	// prohibido con la versión vigente, igual que por HTTP.
+	err = api.LiberarReclamo(interno(ejec), convUUID, rt.Id, msgclient.LiberarReclamoParams{VersionEsperada: 2})
+	if categoria(err) != platformerrors.CategoryProhibido {
+		t.Fatalf("liberar ajeno: categoría %v, quiere prohibido", categoria(err))
+	}
+	rutaLiberar := "/api/v1/conversaciones/" + conv + "/reclamos/" + rt.Id.String() + "?version_esperada=2"
+	if got := statusHTTP(interno(ejec), http.MethodDelete, rutaLiberar, nil); got != http.StatusForbidden {
+		t.Fatalf("paridad liberar ajeno: HTTP %d, quiere 403", got)
 	}
 
 	// Liberar: el destino suelta su reclamo; liberar de nuevo ya no encuentra reclamo.
-	if err := api.LiberarReclamo(interno(destino), convUUID, rt.Id, msgclient.LiberarReclamoParams{VersionEsperada: 1}); err != nil {
+	if err := api.LiberarReclamo(interno(destino), convUUID, rt.Id, msgclient.LiberarReclamoParams{VersionEsperada: 2}); err != nil {
 		t.Fatalf("LiberarReclamo: %v", err)
 	}
-	if err := api.LiberarReclamo(interno(destino), convUUID, rt.Id, msgclient.LiberarReclamoParams{VersionEsperada: 1}); categoria(err) != platformerrors.CategoryNoEncontrado {
+	if err := api.LiberarReclamo(interno(destino), convUUID, rt.Id, msgclient.LiberarReclamoParams{VersionEsperada: 2}); categoria(err) != platformerrors.CategoryNoEncontrado {
 		t.Fatalf("liberar sin reclamo: categoría %v, quiere no_encontrado", categoria(err))
 	}
 }

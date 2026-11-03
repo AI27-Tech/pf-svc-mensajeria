@@ -203,7 +203,8 @@ func TestTransferirCierraYAbreEnUnaTx(t *testing.T) {
 		t.Fatalf("tras conflicto el responsable debe ser el origen, es %s", activo.ResponsableId)
 	}
 
-	// Versión esperada (1): cierra el del origen, abre el del destino en versión 1.
+	// Versión esperada (1): cierra el del origen, abre el del destino en la
+	// versión siguiente de la conversación (2), no en 1 (P20).
 	if err := svc.Transferir(ctx, tenant, convID, origen, destino, "escalamiento", 1); err != nil {
 		t.Fatalf("transferir con versión correcta: %v", err)
 	}
@@ -214,8 +215,8 @@ func TestTransferirCierraYAbreEnUnaTx(t *testing.T) {
 	if activo.ResponsableId.String() != destino {
 		t.Fatalf("tras transferir el responsable debe ser el destino, es %s", activo.ResponsableId)
 	}
-	if activo.Version != 1 {
-		t.Fatalf("el reclamo del destino debe abrir en versión 1, abrió en %d", activo.Version)
+	if activo.Version != 2 {
+		t.Fatalf("el reclamo del destino debe abrir en versión 2, abrió en %d", activo.Version)
 	}
 
 	// Verificar que hay EXACTAMENTE un reclamo activo (no dos): el índice único
@@ -314,12 +315,13 @@ func TestEventosDeReclamoSeEscribenEnOutbox(t *testing.T) {
 		t.Fatalf("tras transferir quiere 1 conversacion.transferida, hay %d", n)
 	}
 
-	// Liberar el reclamo del destino (versión 1): 1 evento conversacion.liberada.
+	// Liberar el reclamo del destino (versión 2, la que abrió la transferencia):
+	// 1 evento conversacion.liberada.
 	activo, err := svc.ReclamoActivo(ctx, tenant, convID)
 	if err != nil {
 		t.Fatalf("leer reclamo activo del destino: %v", err)
 	}
-	if err := svc.Liberar(ctx, tenant, convID, activo.Id.String(), destino, 1); err != nil {
+	if err := svc.Liberar(ctx, tenant, convID, activo.Id.String(), destino, 2); err != nil {
 		t.Fatalf("liberar: %v", err)
 	}
 	if n := contarEvento("conversacion.liberada"); n != 1 {

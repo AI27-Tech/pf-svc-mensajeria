@@ -59,11 +59,13 @@ func (s *Servicio) MarcarAtendida(ctx context.Context, tenantID, conversacionID,
 	if err != nil {
 		return fmt.Errorf("conversacion: leer reclamo para atendida: %w", err)
 	}
-	if responsable != actorReal {
-		return ErrNoEsResponsable
-	}
+	// Versión antes que responsable, como Liberar y Transferir: una vista obsoleta
+	// recibe 409 y recarga; con la versión vigente, otro actor recibe 403.
 	if version != int64(esperada) {
 		return fmt.Errorf("conversacion: atendida con versión %d, vigente %d: %w", esperada, version, ErrSinReclamoActivo)
+	}
+	if responsable != actorReal {
+		return ErrNoEsResponsable
 	}
 
 	var atendidaEn time.Time

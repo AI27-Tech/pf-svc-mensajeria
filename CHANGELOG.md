@@ -1,5 +1,66 @@
 # CHANGELOG
 
+## 2026-11-03 10:46 — Versión de reclamo monotónica, solo el responsable libera o transfiere y 403 real
+
+**Para quién:** el `bff`, `pf-svc-core` en proceso y los dos portales. Cambia lo que observan: un Ejecutivo que no tiene el reclamo ya no puede liberar ni transferir; las denegaciones por facultad pasan de `401` a `403`; y la `version_reclamo` de una conversación en el pool deja de ser `0` tras el primer reclamo.
+
+**Resumen:** corrige los defectos medidos el 2026-11-02. `Transferir` reabría el reclamo en versión 1, así que tras A→B→A un envío de A con la versión previa entraba (`201`) y un reclamar con ella reasignaba en silencio (`201`, versión 2). `Liberar` y `Transferir` no verificaban que quien llama tuviera el reclamo (DEC-118). Las denegaciones por facultad salían como `401` aunque el contrato declara `403`.
+
+**Comportamiento:**
+- La versión del reclamo es monotónica POR CONVERSACIÓN (contrato `VersionReclamo`): reclamar desde el pool y transferir abren en la versión más alta de la conversación + 1. Liberar no cambia la versión. Una versión previa a una transferencia nunca vuelve a ser vigente: enviar, reclamar, liberar, transferir o marcar atendida con ella dan `409`.
+- Sin reclamo activo, `version_reclamo` (en `obtenerConversacion` y en la bandeja) es la versión vigente de la conversación, no `0`; `0` solo si nunca se reclamó. Reclamar desde el pool exige esa versión: tras una liberación, `version_esperada = 0` da `409`.
+- Liberar y transferir: sin reclamo activo `404`; versión no vigente `409`; quien llama no es el responsable activo `403 prohibido` (DEC-118, incluido el Supervisor). La versión se valida antes que el responsable, también en `marcarAtendida`: una vista obsoleta recibe `409` y recarga.
+- `403 prohibido` (pf-pkg-platform-go `v0.1.8`, DEC-115) para: marcar atendida sin ser el responsable, liberar o transferir sin ser el responsable, leer la auditoría sin ser `administrador`. Siguen en `401`: falta de claims y la guarda de acceso (`PuedeEscribir`, sin membresía o cliente ajeno).
+
+**Cambios:**
+- `go.mod`: `pf-pkg-platform-go` de `v0.1.6` a `v0.1.8`.
+- `internal/reclamos`: `versionConversacion` y `tomarActivo` (bloquea el reclamo activo y valida versión y responsable); `abrir` recibe la versión; `ErrNoEsResponsable`. Se borra `versionActiva`.
+- `internal/conversacion`: `ObtenerConversacion` devuelve la versión vigente sin reclamo activo; `MarcarAtendida` valida versión antes que responsable.
+- `internal/bandejas`: misma `version_reclamo` en la bandeja.
+- `adapters/http/conversacion`: `TraducirReclamo`, compartida por los handlers y `ConversacionesAPI` (reemplaza el mapeo repetido y `traducirConflictoReclamo`); `TraducirAtencion` y la auditoría usan `NewProhibido`.
+- Migración `0007_reclamo_version_por_conversacion.sql`: índice `(conversacion_id, version)` para leer la versión vigente. No es único: los datos previos pueden repetir versiones.
+- Pruebas: P20 A→B→A con versión obsoleta (`409` en envío y en reclamo); `403` al liberar y transferir sin ser el responsable; versión conservada tras liberar en obtener y en la bandeja. Se actualizan las que fijaban `401` o la versión 1 tras transferir (PR #36, PR #37, E3-T3).
+
+**Archivos modificados:**
+- `go.mod`, `go.sum`
+- `internal/reclamos/reclamos.go`, `internal/reclamos/reclamos_integration_test.go`
+- `internal/conversacion/conversacion.go`, `internal/conversacion/atencion.go`
+- `internal/bandejas/bandejas.go`
+- `adapters/http/conversacion/conversacion.go`, `adapters/http/conversacion/atencion.go`
+- `adapters/http/conversacion/reclamo_perdido_integration_test.go`, `adapters/http/conversacion/atencion_integration_test.go`
+- `conversaciones_api.go`, `conversaciones_api_integration_test.go`, `atencion_api_integration_test.go`
+- `migrations/mensajeria/0007_reclamo_version_por_conversacion.sql` (nuevo)
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria ./cmd/migrate`, `go test -race ./...` con `MENSAJERIA_TEST_DB` (Postgres local, base desechable: 63 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Antes del arreglo, las dos pruebas nuevas y la de P20 actualizada fallaban (versiones `[1 1 1]`, transferir abría en 1, liberar ajeno `204`).
+
+## 2026-11-03 10:39 — Conversación por viaje y mensaje del cliente que desmarca atendida (E9-T8, DEC-122 #1)
+
+**Para quién:** el `bff` y `pf-svc-core` en proceso, que solo conocen el `viaje_id` y necesitan el `id` de la conversación para listar y enviar; y la bandeja interna, que veía como atendida una conversación con un mensaje del cliente sin contestar.
+
+**Resumen:** mensajeria implementa `obtenerConversacionDeViaje` (`GET /api/v1/viajes/{id}/conversacion`, contrato `tracer.33`) por HTTP y en `ConversacionesAPI`, y un mensaje nuevo del cliente desmarca atendida en la misma tx del envío.
+
+**Comportamiento:**
+- `{id}` es el `viaje_id`. Devuelve la conversación no cerrada del viaje; si todas están cerradas, la más reciente por `creado_en` (la tabla no guarda la hora de cierre). Misma forma y misma guarda que `obtenerConversacion`. Sin conversación, sin acceso (otro cliente, interno sin membresía, otro tenant) o `{id}` que no es UUID: `404`, como pide el contrato. Sin claims: `401`.
+- Mensaje nuevo del cliente: `estado_atendido.atendida = false` en la tx del mensaje y su outbox (DEC-122 #1). El envío interno no la toca (DEC-117). El reintento idempotente no es mensaje nuevo y no desmarca. No se publica evento propio: el registro del contrato no tiene uno para desmarcar.
+
+**Cambios:**
+- `go.mod`: `api-client-go` de `tracer.31` a `tracer.33`. Sin renombres de enum.
+- `internal/conversacion`: `ConversacionDeViaje`; `Enviar` desmarca atendida si el autor es el cliente.
+- `adapters/http/conversacion`: ruta nueva y `Handlers.ObtenerDeViaje`, el camino que comparten HTTP y la superficie en proceso.
+- `ConversacionesAPI`: `ObtenerConversacionDeViaje(ctx, viajeID msgclient.Id) (*msgclient.Conversacion, error)`.
+
+**Archivos modificados:**
+- `go.mod`, `go.sum`
+- `internal/conversacion/conversacion.go`
+- `adapters/http/conversacion/conversacion.go`
+- `conversaciones_api.go`
+- `conversacion_de_viaje_integration_test.go` (nuevo)
+- `adapters/http/conversacion/atencion_integration_test.go`
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria ./cmd/migrate`, `go test -race ./...` con `MENSAJERIA_TEST_DB` (Postgres local, base desechable: 63 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK.
+
 ## 2026-11-02 18:03 — Atendida, recibos con P23 y auditoría inmutable (E3-T6)
 
 **Para quién:** el `bff` (y `pf-svc-core` en proceso), que ya montan `/atendida` y `/recibos/*` y hoy reciben 404 de mensajeria; y el Administrador, que podrá leer la auditoría de una conversación.
