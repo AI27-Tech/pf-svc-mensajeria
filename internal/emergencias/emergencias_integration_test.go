@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	tenant    = "t1"
 	viaje     = "11111111-1111-1111-1111-111111111111"
-	cliente   = "22222222-2222-2222-2222-222222222222"
+	cliente   = "22222222-2222-2222-2222-222222222222" // empresa del viaje
+	tenant    = cliente                                // tenant == cliente_id (DEC-112)
+	viajeB    = "b1111111-1111-1111-1111-111111111111"
+	clienteB  = "b2222222-2222-2222-2222-222222222222" // empresa de viajeB
 	bandeja   = "33333333-3333-3333-3333-333333333333"
 	actorA    = "44444444-4444-4444-4444-444444444444"
 	actorB    = "55555555-5555-5555-5555-555555555555"
@@ -37,6 +39,12 @@ func setup(t *testing.T, ctx context.Context) (*emergencias.Servicio, func()) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre)
 		 VALUES ('`+bandeja+`', '`+tenant+`', 'emergencias', 'Reacción')`)
+	// La empresa de cada viaje la conoce mensajeria por su conversación, proyectada
+	// de viaje.mensajeria_habilitada (DEC-133).
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.conversacion (tenant_id, viaje_id, cliente_id) VALUES
+		 ('`+cliente+`', '`+viaje+`', '`+cliente+`'),
+		 ('`+clienteB+`', '`+viajeB+`', '`+clienteB+`')`)
 	svc := emergencias.NewServicio(pool, outbox.NewPublisher())
 	return svc, func() {
 		closePool()
@@ -48,8 +56,7 @@ func setup(t *testing.T, ctx context.Context) (*emergencias.Servicio, func()) {
 func activar(t *testing.T, ctx context.Context, svc *emergencias.Servicio, activacionID string) emergencias.ResultadoActivacion {
 	t.Helper()
 	res, err := svc.Activar(ctx, emergencias.EntradaActivacion{
-		TenantID: tenant, ViajeID: viaje, ClienteID: cliente,
-		ActorReal: actorA, Origen: msgclient.OrigenActivacionOperacion, ActivacionID: activacionID,
+		ViajeID: viaje, ActorReal: actorA, Origen: msgclient.OrigenActivacionOperacion, ActivacionID: activacionID,
 	})
 	if err != nil {
 		t.Fatalf("activar: %v", err)
@@ -315,8 +322,8 @@ func TestDobleTransferenciaVersionMonotonica(t *testing.T) {
 // TestBandejaUnicaSinTenant afirma la bandeja única de emergencias (DEC-130) sin
 // acotar por tenant (DEC-129): casos de dos tenants entran a la MISMA bandeja (la
 // más antigua de tipo emergencias), la lectura excluye los cerrados y ordena por
-// activada_en con desempate por id (DEC-121 #3). ListarPorViaje devuelve todos,
-// también el cerrado.
+// activada_en con desempate por id (DEC-121 #3). ListarPorViaje devuelve todos los
+// del viaje, también el cerrado.
 func TestBandejaUnicaSinTenant(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -325,14 +332,14 @@ func TestBandejaUnicaSinTenant(t *testing.T) {
 	admin, closeAdmin := dbtest.AdminConn(t, ctx)
 	defer closeAdmin()
 
-	activarEn := func(tenant, activacion, id, activadaEn string) {
+	activarEn := func(viajeID, activacion, id, activadaEn string) {
 		t.Helper()
 		res, err := svc.Activar(ctx, emergencias.EntradaActivacion{
-			TenantID: tenant, ViajeID: viaje, ActorReal: actorA,
-			Origen: msgclient.OrigenActivacionCliente, ActivacionID: activacion,
+			ViajeID: viajeID, ActorReal: actorA,
+			Origen: msgclient.OrigenActivacionOperacion, ActivacionID: activacion,
 		})
 		if err != nil {
-			t.Fatalf("activar en %s: %v", tenant, err)
+			t.Fatalf("activar en %s: %v", viajeID, err)
 		}
 		// Ids y horas literales para afirmar el orden; el caso aún no tiene notas
 		// ni reclamos que lo referencien.
@@ -345,10 +352,10 @@ func TestBandejaUnicaSinTenant(t *testing.T) {
 		e3 = "e3000000-0000-0000-0000-000000000003"
 		e4 = "e4000000-0000-0000-0000-000000000004"
 	)
-	activarEn("t1", "a1000000-0000-0000-0000-000000000001", e1, "2026-01-02T00:00:00Z")
-	activarEn("t2", "a2000000-0000-0000-0000-000000000002", e3, "2026-01-01T00:00:00Z")
-	activarEn("t1", "a3000000-0000-0000-0000-000000000003", e2, "2026-01-01T00:00:00Z")
-	activarEn("t2", "a4000000-0000-0000-0000-000000000004", e4, "2025-12-31T00:00:00Z")
+	activarEn(viaje, "a1000000-0000-0000-0000-000000000001", e1, "2026-01-02T00:00:00Z")
+	activarEn(viajeB, "a2000000-0000-0000-0000-000000000002", e3, "2026-01-01T00:00:00Z")
+	activarEn(viaje, "a3000000-0000-0000-0000-000000000003", e2, "2026-01-01T00:00:00Z")
+	activarEn(viajeB, "a4000000-0000-0000-0000-000000000004", e4, "2025-12-31T00:00:00Z")
 	dbtest.Exec(t, ctx, admin, `UPDATE mensajeria.emergencia SET estado = 'cerrada' WHERE id = '`+e4+`'`)
 
 	var bandejas []string
@@ -379,17 +386,17 @@ func TestBandejaUnicaSinTenant(t *testing.T) {
 		t.Fatalf("bandeja = %v, quiere %v", ids, want)
 	}
 
-	todos, err := svc.ListarPorViaje(ctx, viaje)
+	todos, err := svc.ListarPorViaje(ctx, viajeB)
 	if err != nil {
 		t.Fatalf("ListarPorViaje: %v", err)
 	}
-	if len(todos) != 4 {
-		t.Fatalf("ListarPorViaje debe traer los 4 casos de ambos tenants, trajo %d", len(todos))
+	if len(todos) != 2 || todos[0].ID != e4 || todos[1].ID != e3 {
+		t.Fatalf("ListarPorViaje(viajeB) = %+v, quiere e4 (cerrado) y e3", todos)
 	}
 }
 
 // TestActivarCreaLaBandejaUnica afirma que sin bandeja de emergencias la primera
-// activación la crea en su misma tx y la segunda, de otro tenant, la reutiliza
+// activación la crea en su misma tx y la segunda, de otra empresa, la reutiliza
 // (DEC-130 #1): queda exactamente una.
 func TestActivarCreaLaBandejaUnica(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -400,12 +407,12 @@ func TestActivarCreaLaBandejaUnica(t *testing.T) {
 	defer closeAdmin()
 	dbtest.Exec(t, ctx, admin, `DELETE FROM mensajeria.bandeja`)
 
-	for i, tn := range []string{"t1", "t2"} {
+	for i, v := range []string{viaje, viajeB} {
 		if _, err := svc.Activar(ctx, emergencias.EntradaActivacion{
-			TenantID: tn, ViajeID: viaje, ActorReal: actorA,
+			ViajeID: v, ActorReal: actorA,
 			Origen: msgclient.OrigenActivacionOperacion, ActivacionID: []string{activacn1, activacn2}[i],
 		}); err != nil {
-			t.Fatalf("activar en %s: %v", tn, err)
+			t.Fatalf("activar en %s: %v", v, err)
 		}
 	}
 	var bandejas, enOtra int
@@ -421,8 +428,8 @@ func TestActivarCreaLaBandejaUnica(t *testing.T) {
 	).Scan(&enOtra); err != nil {
 		t.Fatalf("contar casos fuera de la bandeja: %v", err)
 	}
-	if bandejas != 1 || tenantBandeja != "t1" || enOtra != 0 {
-		t.Fatalf("bandejas de emergencias = %d (tenant %q), casos fuera de ella = %d; quiere 1 (t1), 0", bandejas, tenantBandeja, enOtra)
+	if bandejas != 1 || tenantBandeja != cliente || enOtra != 0 {
+		t.Fatalf("bandejas de emergencias = %d (tenant %q), casos fuera de ella = %d; quiere 1 (%s), 0", bandejas, tenantBandeja, enOtra, cliente)
 	}
 }
 
@@ -451,5 +458,77 @@ func TestResolverSoloElResponsable(t *testing.T) {
 	}
 	if err := svc.Resolver(ctx, tenant, id, actorA, 1); err != nil {
 		t.Fatalf("A resuelve: %v", err)
+	}
+}
+
+// TestActivarTomaLaEmpresaDelViaje cubre DEC-133: el caso queda bajo la empresa
+// del viaje (tenant y cliente_id de su conversación), lo active Monitoreo o el
+// cliente, y emergencia.activada lleva ese cliente_id. El cliente de otra
+// empresa, un cliente sin empresa y un viaje que mensajeria no conoce reciben
+// ErrViajeNoEncontrado sin crear nada.
+func TestActivarTomaLaEmpresaDelViaje(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	svc, teardown := setup(t, ctx)
+	defer teardown()
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	activarComo := func(viajeID, clienteActor string, origen msgclient.OrigenActivacion, activacion string) (string, error) {
+		res, err := svc.Activar(ctx, emergencias.EntradaActivacion{
+			ViajeID: viajeID, ClienteActor: clienteActor, ActorReal: actorA, Origen: origen, ActivacionID: activacion,
+		})
+		return res.EmergenciaID, err
+	}
+	empresa := func(id string) string {
+		t.Helper()
+		var tn, cl, ev string
+		if err := admin.QueryRow(ctx,
+			`SELECT e.tenant_id, e.cliente_id::text, o.payload->>'cliente_id'
+			   FROM mensajeria.emergencia e
+			   JOIN mensajeria.outbox o ON o.agregado_id = e.id::text AND o.tipo = 'emergencia.activada'
+			  WHERE e.id = $1`, id).Scan(&tn, &cl, &ev); err != nil {
+			t.Fatalf("leer caso %s: %v", id, err)
+		}
+		return tn + "/" + cl + "/" + ev
+	}
+	const quiere = cliente + "/" + cliente + "/" + cliente
+
+	porMonitoreo, err := activarComo(viaje, "", msgclient.OrigenActivacionOperacion, activacn1)
+	if err != nil {
+		t.Fatalf("Monitoreo activa: %v", err)
+	}
+	if got := empresa(porMonitoreo); got != quiere {
+		t.Fatalf("caso de Monitoreo: tenant/cliente/evento = %s, quiere %s", got, quiere)
+	}
+	porCliente, err := activarComo(viaje, cliente, msgclient.OrigenActivacionCliente, activacn2)
+	if err != nil {
+		t.Fatalf("el cliente del viaje activa: %v", err)
+	}
+	if got := empresa(porCliente); got != quiere {
+		t.Fatalf("caso del cliente: tenant/cliente/evento = %s, quiere %s", got, quiere)
+	}
+
+	for paso, intento := range map[string]func() (string, error){
+		"cliente de otra empresa": func() (string, error) {
+			return activarComo(viaje, clienteB, msgclient.OrigenActivacionCliente, "c1000000-0000-0000-0000-000000000001")
+		},
+		"cliente sin empresa": func() (string, error) {
+			return activarComo(viaje, "", msgclient.OrigenActivacionCliente, "c2000000-0000-0000-0000-000000000002")
+		},
+		"viaje desconocido": func() (string, error) {
+			return activarComo("dead0000-0000-0000-0000-00000000dead", "", msgclient.OrigenActivacionOperacion, "c3000000-0000-0000-0000-000000000003")
+		},
+	} {
+		if _, err := intento(); !errors.Is(err, emergencias.ErrViajeNoEncontrado) {
+			t.Fatalf("%s: err %v, quiere ErrViajeNoEncontrado", paso, err)
+		}
+	}
+	var casos int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM mensajeria.emergencia`).Scan(&casos); err != nil {
+		t.Fatalf("contar casos: %v", err)
+	}
+	if casos != 2 {
+		t.Fatalf("casos = %d, quiere 2: los rechazos no crean nada", casos)
 	}
 }

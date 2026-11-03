@@ -133,25 +133,28 @@ func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclien
 	return &msgclient.PaginaEmergencias{Items: items}, nil
 }
 
+// ActivarEmergencia crea el caso bajo la empresa del viaje, lo active el cliente
+// o Monitoreo (DEC-133). Viaje que mensajeria no conoce, o de otra empresa que la
+// del cliente que activa: 404 (DEC-132 #2).
 func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (*msgclient.CasoEmergencia, bool, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	origen := msgclient.OrigenActivacionOperacion
+	clienteActor := ""
 	if claims.Audiencia == auth.AudienciaCliente {
-		origen = msgclient.OrigenActivacionCliente
+		origen, clienteActor = msgclient.OrigenActivacionCliente, claims.TenantID
 	}
 	res, err := a.emergencias.Activar(ctx, emergencias.EntradaActivacion{
-		TenantID:     claims.TenantID,
 		ViajeID:      viajeID.String(),
-		ClienteID:    clienteDeClaims(claims),
+		ClienteActor: clienteActor,
 		ActorReal:    claims.Subject,
 		Origen:       origen,
 		ActivacionID: body.ActivacionId.String(),
 	})
 	if err != nil {
-		return nil, false, traducir(err)
+		return nil, false, traducirEmergencia(err)
 	}
 	id, err := uuid.Parse(res.EmergenciaID)
 	if err != nil {
@@ -502,19 +505,6 @@ func notaValida(texto, mensaje string) (string, error) {
 	return nota, nil
 }
 
-// clienteDeClaims devuelve el cliente_id a persistir en el caso: para una
-// activación de cliente, su empresa, que es el tenant del token (DEC-112,
-// DEC-124); el bff la usa para componer desde catalogos. Para interno va vacío
-// (NULL): mensajeria no conoce el cliente del viaje. Un tenant que no es UUID
-// también va vacío: la activación de una emergencia no falla por el formato de
-// un claim.
-func clienteDeClaims(c *auth.Claims) string {
-	if _, err := uuid.Parse(c.TenantID); c.Audiencia != auth.AudienciaCliente || err != nil {
-		return ""
-	}
-	return c.TenantID
-}
-
 // traducir conserva la categoría de un PlatformError y envuelve cualquier otro
 // como error interno.
 func traducir(err error) error {
@@ -532,8 +522,9 @@ func conMando(c *auth.Claims) bool {
 
 // traducirEmergencia mapea los errores del dominio de emergencia a la taxonomía:
 // conflicto de versión → 409 conflicto_version_reclamo; transición inválida →
-// 409; caso cerrado → 409 emergencia_cerrada; sin reclamo o caso inexistente →
-// 404; no es el responsable → 403 (DEC-126). nil pasa como nil.
+// 409; caso cerrado → 409 emergencia_cerrada; sin reclamo, caso o viaje
+// inexistente (o de otra empresa, DEC-133) → 404; no es el responsable → 403
+// (DEC-126). nil pasa como nil.
 func traducirEmergencia(err error) error {
 	var conflicto emergencias.ErrConflictoVersion
 	switch {
@@ -549,6 +540,8 @@ func traducirEmergencia(err error) error {
 		return platformerrors.NewNoEncontrado("reclamo no encontrado")
 	case errors.Is(err, emergencias.ErrNoEncontrada):
 		return platformerrors.NewNoEncontrado("emergencia no encontrada")
+	case errors.Is(err, emergencias.ErrViajeNoEncontrado):
+		return platformerrors.NewNoEncontrado("viaje no encontrado")
 	case errors.Is(err, emergencias.ErrNoEsResponsable):
 		return platformerrors.NewProhibido("el actor no es el responsable del caso")
 	}

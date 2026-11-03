@@ -1,6 +1,8 @@
 # CHANGELOG
 
-## 2026-11-03 17:11 — Internos sin tenant (DEC-129), bandeja única de emergencias (DEC-130), Supervisor y Coordinador (DEC-131), 403/404 (DEC-132) y operaciones por id (tracer.34)
+## 2026-11-03 17:11 — Internos sin tenant (DEC-129), bandeja única de emergencias (DEC-130), Supervisor y Coordinador (DEC-131), 403/404 (DEC-132), operaciones por id (tracer.34) y caso de emergencia bajo la empresa del viaje (DEC-133)
+
+_Ampliada a las 17:25 con DEC-133._
 
 **Para quién:** el `bff`, `pf-svc-core` en proceso, el panel interno, el portal del cliente y la siembra de la demo. Cambia lo que observan: un Ejecutivo, un miembro de Reacción o un Supervisor reales (tenant de AI27 en el token) ya encuentran las conversaciones y los casos de todos los clientes; la bandeja de Reacción y el caso por su id existen; un interno sin permiso recibe `403` en lugar de `401`.
 
@@ -16,19 +18,22 @@
 - DEC-132: interno sin permiso sobre un recurso que existe → `403` (antes `401`); Cliente sobre un recurso de otra empresa → `404` (antes `401` en la fila con `cliente_id` ajeno); inexistente → `404`; sin claims → `401`. Un id de ruta de emergencia que no es UUID → `404`.
 - tracer.34: `listarBandejaEmergencias`, `obtenerEmergencia`, `listarNotasEmergenciaPorId`, `reclamarEmergenciaPorId`, `liberarReclamoEmergenciaPorId`, `transferirEmergenciaPorId`, `resolverEmergenciaPorId` y `cerrarEmergenciaPorId`, por HTTP y en `EmergenciasAPI`, sobre los mismos casos de uso que las rutas por viaje. La bandeja excluye cerrados y ordena por `activada_en`, desempate por `id`; las notas de la más antigua a la más reciente. `obtenerEmergencia` y `cerrarEmergenciaPorId` devuelven `CasoEmergencia`; `resolverEmergenciaPorId` y la bandeja, `EmergenciaReaccion`.
 - `CasoEmergencia` para Interno trae `reclamo_activo` (id, responsable, versión); `reclamar` y `transferir` de emergencia (HTTP y en proceso) devuelven el reclamo completo en vez de solo la versión. El `conversacion_id` del `Reclamo` lleva el id del caso.
-- El `cliente_id` de un caso activado por un Cliente es su empresa (tenant del token, DEC-112) en lugar del `sub`; si el tenant no es UUID va NULL.
+- DEC-133: todo caso de emergencia queda bajo la empresa del viaje, `tenant_id` y `cliente_id` del viaje, lo active el Cliente o Monitoreo. Antes un caso de Monitoreo quedaba bajo el tenant de AI27 con `cliente_id` NULL y el cliente no lo veía en `listarEmergencias`. Ahora lo ve en la vista recortada (sin `origen`, `actor_real` ni `reclamo_activo`). `emergencia.activada` lleva ese `cliente_id`.
+- La empresa del viaje sale de su conversación, la única proyección del viaje en `mensajeria` (nace de `viaje.mensajeria_habilitada`, que `operacion` publica al crear el viaje). Viaje sin conversación: `activarEmergencia` responde `404` y no crea caso; no se guarda bajo el tenant de quien activa.
+- Un Cliente que activa sobre un viaje de otra empresa recibe `404` y no se crea caso. Antes el caso se creaba bajo su tenant sobre un viaje ajeno.
 
 **Cambios:**
 - `internal/autorizacion`: tabla de roles por acción (`Accion`: `Leer`, `Escribir`) y por permiso de emergencia (`Permiso`: `VerCaso`, `AtenderCaso`, `MoverCaso`, `CerrarCaso`). Nuevas `Conversacion`, `TenantDeConversacion`, `Bandeja`, `Emergencia`, `TenantDeEmergencia`, `LeeBandejaChat`, `VeBandejaEmergencias`; devuelven el tenant del recurso. Se borran `PuedeEscribir`, `PuedeVerBandeja`, `PuedeAtenderEmergencia` y `EsMiembroBandejaChat`.
 - `internal/bandejas`: `TrabajoChat` y `CambiosChatDesde` (unión); `EnrutarABandejaUnica` con revisión global y lock global; se borra `ResolverMiBandeja`.
 - `internal/emergencias`: `bandejaEmergencias` (resuelve o crea la única); `Bandeja`, `Obtener`, `ListarNotas`; `ListarPorViaje(ctx, viajeID)` sin tenant; `CasoProyectado` con `TenantID` y `Reclamo`; `Resolver` exige al responsable.
+- `internal/emergencias` (DEC-133): `EntradaActivacion` pierde `TenantID` y `ClienteID` y gana `ClienteActor`; `empresaDelViaje` lee tenant y `cliente_id` de la conversación más reciente del viaje en la tx de la activación; nuevo `ErrViajeNoEncontrado`. `emergencias_api.go` lo traduce a `404` y se borra `clienteDeClaims`.
 - `internal/conversacion`: `ConversacionDeViaje(ctx, viajeID)` sin tenant.
 - `emergencias_api.go`: única copia de las reglas de emergencia; ocho métodos nuevos por id; las por viaje delegan en ellos. `adapters/http/emergencias` solo decodifica, llama a `EmergenciasAPI` y codifica.
 - `adapters/http/conversacion`, `adapters/http/bandejas`, `conversaciones_api.go`: usan el tenant que devuelve la guarda.
 - `go.mod`: `api-client-go` `v0.1.0-tracer.33` → `v0.1.0-tracer.34` (sin renombres de enums).
-- Pruebas: los internos llegan con el tenant `ai27`; las denegaciones de rol pasan de `401` a `403`; Reacción sin filas de membresía. Nuevas: Ejecutivo con tenant de AI27 ve conversaciones de dos empresas con revisión 3 y catch-up desde 2; Cliente no ve la de otra empresa (`404`); Supervisor lee bandeja, conversación y mensajes y recibe `403` al enviar y reclamar; matriz de permisos de emergencia por rol (incluye `403` Cliente propio vs `404` otra empresa); bandeja única con casos de dos tenants, orden y cerrados; la activación crea la bandeja única; resolver solo el responsable; recorrido de las ocho operaciones por id; paridad por viaje / por id.
+- Pruebas: los internos llegan con el tenant `ai27`; las denegaciones de rol pasan de `401` a `403`; Reacción sin filas de membresía. Nuevas: Ejecutivo con tenant de AI27 ve conversaciones de dos empresas con revisión 3 y catch-up desde 2; Cliente no ve la de otra empresa (`404`); Supervisor lee bandeja, conversación y mensajes y recibe `403` al enviar y reclamar; matriz de permisos de emergencia por rol (incluye `403` Cliente propio vs `404` otra empresa); bandeja única con casos de dos tenants, orden y cerrados; la activación crea la bandeja única; resolver solo el responsable; recorrido de las ocho operaciones por id; paridad por viaje / por id. DEC-133: las pruebas siembran la conversación del viaje; `TestActivarTomaLaEmpresaDelViaje` (Monitoreo y cliente propio quedan bajo la empresa, en la fila y en el evento; cliente de otra empresa, cliente sin empresa y viaje desconocido → `ErrViajeNoEncontrado` sin caso) y `TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP` (Monitorista activa con tenant `ai27`; el cliente de la empresa lista los dos casos recortados; el de otra empresa lista vacío y su activación da `404`; viaje desconocido `404`; Reacción los ve completos).
 
-**Migración:** ninguna. Los casos activados antes de DEC-130 en bandejas de Reacción por tenant salen en la bandeja porque la lectura no filtra por `bandeja_id`.
+**Migración:** ninguna. Los casos activados antes de DEC-130 en bandejas de Reacción por tenant salen en la bandeja porque la lectura no filtra por `bandeja_id`. Los casos de Monitoreo creados antes de DEC-133 siguen bajo el tenant de AI27 con `cliente_id` NULL: no se reescriben (el tenant también vive en sus notas y reclamos).
 
 **Archivos modificados:**
 - `internal/autorizacion/autorizacion.go`, `internal/autorizacion/autorizacion_integration_test.go`
@@ -42,7 +47,7 @@
 - `atencion_api_integration_test.go`, `bandeja_unica_integration_test.go`, `conversacion_de_viaje_integration_test.go`, `conversaciones_api_integration_test.go`
 - `go.mod`, `go.sum`, `CHANGELOG.md`
 
-**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/...`, `go test -race -p 1 ./...` con `MENSAJERIA_TEST_DB` (clúster `initdb` aislado de Postgres.app en el puerto 55439: 79 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Mutaciones comprobadas: con la revisión por bandeja en vez de global, la unión trae revisión 2 y el orden cambia; sin la guarda de responsable en `Resolver`, B resuelve el caso de A.
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/...`, `go test -race -p 1 ./...` con `MENSAJERIA_TEST_DB` (clúster `initdb` aislado de Postgres.app en el puerto 55451: 81 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Mutaciones comprobadas: con la revisión por bandeja en vez de global, la unión trae revisión 2 y el orden cambia; sin la guarda de responsable en `Resolver`, B resuelve el caso de A.
 
 ## 2026-11-03 13:00 — Conversación por empresa cliente (DEC-124) y bandeja única con membresía por rol (DEC-127)
 

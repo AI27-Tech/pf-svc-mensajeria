@@ -87,16 +87,22 @@ var ErrCerrada = errors.New("emergencias: el caso está cerrado")
 // irreversibles). El llamador la mapea a 409.
 var ErrTransicionInvalida = errors.New("emergencias: transición de estado inválida")
 
+// ErrViajeNoEncontrado la devuelve Activar cuando mensajeria no conoce la empresa
+// del viaje (no hay conversación proyectada de viaje.mensajeria_habilitada) o el
+// viaje es de otra empresa que la del cliente que activa. El llamador la mapea a
+// 404, sin revelar cuál de las dos (DEC-132 #2).
+var ErrViajeNoEncontrado = errors.New("emergencias: viaje no encontrado")
+
 // EntradaActivacion es lo mínimo para activar un caso. ActivacionID es la clave
 // de idempotencia generada por el llamante (contrato ActivarEmergenciaEntrada).
-// Origen distingue cliente de operacion (ADR 21 §3). ClienteID puede ir vacío:
-// mensajeria no siempre conoce el cliente del viaje (lo proyecta de viaje.*); se
-// persiste NULL y la vista mínima del cliente se resuelve por el alcance del
-// token. La bandeja de Reacción NO se recibe: la resuelve el dominio (es su dato).
+// Origen distingue cliente de operacion (ADR 21 §3). El tenant y el cliente_id
+// del caso NO se reciben: son los del viaje (DEC-133) y los resuelve el dominio,
+// igual que la bandeja de Reacción (DEC-130). ClienteActor es la empresa del
+// cliente que activa (tenant de su token); solo cuenta con Origen cliente y debe
+// ser la empresa del viaje.
 type EntradaActivacion struct {
-	TenantID     string
 	ViajeID      string
-	ClienteID    string
+	ClienteActor string
 	ActorReal    string
 	Origen       msgclient.OrigenActivacion
 	ActivacionID string
@@ -112,7 +118,9 @@ type ResultadoActivacion struct {
 // Activar crea un caso de emergencia, o devuelve el existente si se reentrega la
 // misma ActivacionID (idempotente, ADR 21 §2). Escribe el caso y
 // emergencia.activada en una sola tx. Una pulsación nueva con otra ActivacionID
-// crea otro caso aunque ya exista uno abierto: no se deduplica por viaje.
+// crea otro caso aunque ya exista uno abierto: no se deduplica por viaje. El caso
+// queda bajo la empresa del viaje (DEC-133); si mensajeria no la conoce, o el
+// cliente que activa es de otra empresa, ErrViajeNoEncontrado y no se crea nada.
 func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (ResultadoActivacion, error) {
 	if in.ViajeID == "" || in.ActorReal == "" || in.ActivacionID == "" {
 		return ResultadoActivacion{}, fmt.Errorf("emergencias: activación inválida: faltan campos obligatorios")
@@ -124,8 +132,17 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// El caso vive bajo la empresa del viaje, lo active quien lo active (DEC-133).
+	tenantID, clienteID, err := empresaDelViaje(ctx, tx, in.ViajeID)
+	if err != nil {
+		return ResultadoActivacion{}, err
+	}
+	if in.Origen == msgclient.OrigenActivacionCliente && (in.ClienteActor != clienteID || in.ClienteActor != tenantID) {
+		return ResultadoActivacion{}, ErrViajeNoEncontrado
+	}
+
 	// Idempotencia: si la activación ya existe, devolver el caso original.
-	if id, ok, err := s.buscarPorActivacion(ctx, tx, in); err != nil {
+	if id, ok, err := s.buscarPorActivacion(ctx, tx, tenantID, in); err != nil {
 		return ResultadoActivacion{}, err
 	} else if ok {
 		return ResultadoActivacion{EmergenciaID: id, Idempotente: true}, nil
@@ -133,7 +150,7 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 
 	// La bandeja única de emergencias es dato de mensajeria: se resuelve (o se
 	// crea) aquí, en la tx de la activación, no la trae el llamante (DEC-130).
-	bandejaID, err := bandejaEmergencias(ctx, tx, in.TenantID)
+	bandejaID, err := bandejaEmergencias(ctx, tx, tenantID)
 	if err != nil {
 		return ResultadoActivacion{}, err
 	}
@@ -142,15 +159,15 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 	err = tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.emergencia
 		    (tenant_id, viaje_id, cliente_id, bandeja_id, origen, actor_real, activacion_id)
-		  VALUES ($1, $2, NULLIF($3, '')::uuid, $4, $5, $6, $7)
+		  VALUES ($1, $2, $3::uuid, $4, $5, $6, $7)
 		  RETURNING id`,
-		in.TenantID, in.ViajeID, in.ClienteID, bandejaID, string(in.Origen), in.ActorReal, in.ActivacionID,
+		tenantID, in.ViajeID, clienteID, bandejaID, string(in.Origen), in.ActorReal, in.ActivacionID,
 	).Scan(&emergenciaID)
 	if err != nil {
 		// Carrera por la misma activación: el índice único la rechaza; releer el
 		// original en vez de crear un segundo caso.
 		if esViolacionUnica(err) {
-			if id, ok, e := s.buscarPorActivacion(ctx, tx, in); e == nil && ok {
+			if id, ok, e := s.buscarPorActivacion(ctx, tx, tenantID, in); e == nil && ok {
 				return ResultadoActivacion{EmergenciaID: id, Idempotente: true}, nil
 			}
 		}
@@ -164,7 +181,7 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 		Payload: map[string]any{
 			"caso_emergencia_id": emergenciaID,
 			"viaje_id":           in.ViajeID,
-			"cliente_id":         in.ClienteID,
+			"cliente_id":         clienteID,
 			"origen":             string(in.Origen),
 		},
 	}
@@ -178,13 +195,39 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 	return ResultadoActivacion{EmergenciaID: emergenciaID}, nil
 }
 
+// empresaDelViaje devuelve el tenant y el cliente_id del viaje. La única
+// proyección del viaje en mensajeria es su conversación, que nace de
+// viaje.mensajeria_habilitada (operacion la publica al crear el viaje, en la tx
+// de viaje.creado) con tenant_id = cliente_id (DEC-049/112). Si hay varias (una
+// cerrada y otra activa), todas son del mismo viaje; se toma la más reciente.
+// Sin conversación, ErrViajeNoEncontrado: no se inventa la empresa.
+//
+// shortcut: filtra solo por viaje_id, sin índice propio (el único es (tenant_id,
+// viaje_id)); se indexa viaje_id si la activación se vuelve camino caliente.
+func empresaDelViaje(ctx context.Context, tx pgx.Tx, viajeID string) (string, string, error) {
+	var tenant, cliente string
+	err := tx.QueryRow(ctx,
+		`SELECT tenant_id, cliente_id::text FROM mensajeria.conversacion
+		  WHERE viaje_id = $1 AND cliente_id IS NOT NULL
+		  ORDER BY creado_en DESC, id DESC LIMIT 1`,
+		viajeID,
+	).Scan(&tenant, &cliente)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrViajeNoEncontrado
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("emergencias: leer la empresa del viaje: %w", err)
+	}
+	return tenant, cliente, nil
+}
+
 // buscarPorActivacion devuelve el caso ya existente para la clave de idempotencia.
-func (s *Servicio) buscarPorActivacion(ctx context.Context, tx pgx.Tx, in EntradaActivacion) (string, bool, error) {
+func (s *Servicio) buscarPorActivacion(ctx context.Context, tx pgx.Tx, tenantID string, in EntradaActivacion) (string, bool, error) {
 	var id string
 	err := tx.QueryRow(ctx,
 		`SELECT id FROM mensajeria.emergencia
 		  WHERE tenant_id = $1 AND viaje_id = $2 AND activacion_id = $3`,
-		in.TenantID, in.ViajeID, in.ActivacionID,
+		tenantID, in.ViajeID, in.ActivacionID,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
