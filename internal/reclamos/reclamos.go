@@ -7,8 +7,11 @@
 // para el perdedor.
 //
 // La transferencia (cerrar el reclamo anterior y abrir el siguiente en una sola
-// transacción, mensajeria.md (e)) y el override auditado de Supervisor/
-// Coordinador quedan declarados y sin implementar en el scaffold.
+// transacción, mensajeria.md (e)) está implementada; el override auditado de
+// Supervisor/Coordinador sigue cerrado en V1 (DEC-107, DEC-118).
+//
+// Auditoría inmutable (E3-T6): cada intento de reclamo (ganado y perdido), cada
+// liberación y cada transferencia escriben su fila en auditoria_mensajeria.
 //
 // Perder el reclamo NO es perder la membresía (Addendum §4 puntos 7 y 8): son
 // dos efectos distintos. reclamos solo quita autoridad de envío; la membresía
@@ -29,9 +32,11 @@ import (
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrConflictoVersion es el conflicto de concurrencia optimista: el perdedor de
@@ -80,11 +85,51 @@ func NewServicio(pool Begin, pub Publicador) *Servicio {
 // por (conversacion_id, version) solo afecta una fila para un valor de versión,
 // así que de dos reclamos concurrentes con la misma versión esperada exactamente
 // uno encuentra la fila y el otro no.
+//
+// Cada intento queda en auditoria_mensajeria (E3-T6): el ganado en la misma tx
+// del reclamo, el perdido en una tx propia tras el conflicto.
 func (s *Servicio) Reclamar(ctx context.Context, tenantID, conversacionID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error) {
 	if conversacionID == "" || actorReal == "" {
 		return 0, fmt.Errorf("reclamos: reclamo inválido: faltan conversacion_id o actor_real")
 	}
 
+	nueva, err := s.reclamar(ctx, tenantID, conversacionID, actorReal, esperada)
+	var conflicto ErrConflictoVersion
+	if errors.As(err, &conflicto) {
+		// El intento perdido se audita en su PROPIA tx, después del conflicto: la tx
+		// del intento ya se descartó (en la carrera del primer reclamo Postgres la
+		// abortó con 23505 y no admite más sentencias), y el perdedor no debe
+		// comprometer nada de su intento salvo el hecho de que lo intentó.
+		if e := s.auditarIntentoPerdido(ctx, tenantID, conversacionID, actorReal, conflicto); e != nil {
+			return 0, e
+		}
+	}
+	return nueva, err
+}
+
+// auditarIntentoPerdido registra el reclamo perdido en una tx propia.
+func (s *Servicio) auditarIntentoPerdido(ctx context.Context, tenantID, conversacionID, actorReal string, c ErrConflictoVersion) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("reclamos: abrir transacción de auditoría: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: tenantID, ConversacionID: conversacionID, ActorReal: actorReal,
+		Accion:  auditoria.AccionReclamoPerdido,
+		Detalle: map[string]any{"version_esperada": c.Esperada, "version_actual": c.Actual},
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("reclamos: commit de la auditoría del intento perdido: %w", err)
+	}
+	return nil
+}
+
+// reclamar es el intento en su tx: avanza o abre el reclamo, audita el intento
+// ganado y publica conversacion.reclamada, todo en la misma tx.
+func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("reclamos: abrir transacción: %w", err)
@@ -118,12 +163,26 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, conversacionID, actor
 			return 0, ErrConflictoVersion{Esperada: esperada, Actual: 0}
 		}
 		reclamoID, err = abrir(ctx, tx, tenantID, conversacionID, actorReal)
+		if esViolacionUnica(err) {
+			// Carrera del primer reclamo (P19): otro abrió el reclamo entre la lectura
+			// y el INSERT, y el índice único parcial rechazó éste. El ganador abrió en
+			// versión 1 (abrir siempre abre en 1).
+			return 0, ErrConflictoVersion{Esperada: esperada, Actual: 1}
+		}
 		if err != nil {
 			return 0, err
 		}
 		nueva = 1
 	} else if err != nil {
 		return 0, fmt.Errorf("reclamos: reclamar: %w", err)
+	}
+
+	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: tenantID, ConversacionID: conversacionID, ActorReal: actorReal,
+		Accion:  auditoria.AccionReclamoGanado,
+		Detalle: map[string]any{"reclamo_id": reclamoID, "version_esperada": esperada, "version_reclamo": nueva},
+	}); err != nil {
+		return 0, err
 	}
 
 	// Publica conversacion.reclamada en la MISMA tx (E3-T3). Refleja quién
@@ -152,8 +211,8 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, conversacionID, actor
 
 // abrir inserta el reclamo activo inicial y devuelve su id. El índice único
 // parcial un_reclamo_activo_por_conversacion garantiza a lo más uno activo: si
-// dos abren a la vez, uno recibe violación de unicidad (lo trata el llamador como
-// conflicto en una versión completa; en el scaffold se propaga).
+// dos abren a la vez, uno recibe violación de unicidad, que Reclamar traduce a
+// conflicto de versión.
 func abrir(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actorReal string) (string, error) {
 	var id string
 	err := tx.QueryRow(ctx,
@@ -205,6 +264,14 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclam
 			return ErrConflictoVersion{Esperada: esperada, Actual: actual}
 		}
 		return ErrSinReclamo
+	}
+
+	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: tenantID, ConversacionID: conversacionID, ActorReal: actorReal,
+		Accion:  auditoria.AccionReclamoLiberado,
+		Detalle: map[string]any{"reclamo_id": reclamoID, "version_reclamo": esperada},
+	}); err != nil {
+		return err
 	}
 
 	// Publica conversacion.liberada en la MISMA tx (E3-T3): la conversación
@@ -278,14 +345,17 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, ori
 		return err
 	}
 
-	// Auditar la transferencia (hecho inmutable, addendum §11). El motivo puede
-	// venir vacío; se registra como NULL.
-	_, err = tx.Exec(ctx,
-		`INSERT INTO mensajeria.auditoria_mensajeria (tenant_id, conversacion_id, actor_real, accion, detalle)
-		 VALUES ($1, $2, $3, 'reclamo.transferido', jsonb_build_object('destino', $4::text, 'motivo', NULLIF($5, '')))`,
-		tenantID, conversacionID, origen, destino, motivo)
-	if err != nil {
-		return fmt.Errorf("reclamos: auditar transferencia: %w", err)
+	// Auditar la transferencia (hecho inmutable, addendum §11). Sin motivo, la
+	// clave no se escribe y la lectura lo entrega como null.
+	detalle := map[string]any{"destino": destino, "reclamo_anterior_id": anteriorID, "reclamo_id": nuevoID}
+	if motivo != "" {
+		detalle["motivo"] = motivo
+	}
+	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: tenantID, ConversacionID: conversacionID, ActorReal: origen,
+		Accion: auditoria.AccionReclamoTransferido, Detalle: detalle,
+	}); err != nil {
+		return err
 	}
 
 	// Publica conversacion.transferida en la MISMA tx (E3-T3): lleva el reclamo
@@ -348,6 +418,12 @@ func (s *Servicio) ReclamoActivo(ctx context.Context, tenantID, conversacionID s
 		AbiertoEn:      abiertoEn,
 		CerradoEn:      cerradoEn,
 	}, nil
+}
+
+// esViolacionUnica detecta la violación de índice único de Postgres (23505).
+func esViolacionUnica(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // versionActiva devuelve la versión del reclamo activo de la conversación.

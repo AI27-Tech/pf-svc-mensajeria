@@ -30,8 +30,8 @@ import (
 // El id de conversación es el que la ruta HTTP recibe en {id}
 // (mensajeria.conversacion.id); esta superficie no lo reinterpreta.
 //
-// No expone MarcarAtendida ni los recibos (entregado/leído): mensajeria no
-// tiene esos casos de uso ni sus rutas HTTP todavía.
+// MarcarAtendida, los recibos y ListarAuditoriaConversacion (E3-T6) traducen sus
+// errores con convhttp.TraducirAtencion, la MISMA función que usan sus handlers.
 type ConversacionesAPI interface {
 	ObtenerConversacion(ctx context.Context, conversacionID msgclient.Id) (*msgclient.Conversacion, error)
 	ListarMensajes(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarMensajesParams) (*msgclient.PaginaMensajes, error)
@@ -40,6 +40,10 @@ type ConversacionesAPI interface {
 	ReclamarConversacion(ctx context.Context, conversacionID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error)
 	LiberarReclamo(ctx context.Context, conversacionID, reclamoID msgclient.Id, params msgclient.LiberarReclamoParams) error
 	TransferirConversacion(ctx context.Context, conversacionID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
+	MarcarAtendida(ctx context.Context, conversacionID msgclient.Id, body msgclient.VersionEsperadaEntrada) error
+	RegistrarReciboEntregado(ctx context.Context, conversacionID msgclient.Id, body msgclient.ReciboEntrada) error
+	RegistrarReciboLeido(ctx context.Context, conversacionID msgclient.Id, body msgclient.ReciboEntrada) error
+	ListarAuditoriaConversacion(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarAuditoriaConversacionParams) (*msgclient.PaginaAuditoria, error)
 }
 
 // Conversaciones construye la superficie pública de conversación y bandeja sobre
@@ -254,6 +258,66 @@ func (a *conversacionesAPI) TransferirConversacion(ctx context.Context, conversa
 		return nil, traducir(err)
 	}
 	return reclamo, nil
+}
+
+// MarcarAtendida: mismo orden que el handler (claims → acceso → caso de uso).
+func (a *conversacionesAPI) MarcarAtendida(ctx context.Context, conversacionID msgclient.Id, body msgclient.VersionEsperadaEntrada) error {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return err
+	}
+	id := conversacionID.String()
+	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+		return err
+	}
+	if err := a.conv.Atencion.MarcarAtendida(ctx, claims.TenantID, id, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
+		return convhttp.TraducirAtencion(err)
+	}
+	return nil
+}
+
+func (a *conversacionesAPI) RegistrarReciboEntregado(ctx context.Context, conversacionID msgclient.Id, body msgclient.ReciboEntrada) error {
+	return a.registrarRecibo(ctx, conversacionID, conversacion.ReciboEntregado, body)
+}
+
+func (a *conversacionesAPI) RegistrarReciboLeido(ctx context.Context, conversacionID msgclient.Id, body msgclient.ReciboEntrada) error {
+	return a.registrarRecibo(ctx, conversacionID, conversacion.ReciboLeido, body)
+}
+
+func (a *conversacionesAPI) registrarRecibo(ctx context.Context, conversacionID msgclient.Id, tipo conversacion.Recibo, body msgclient.ReciboEntrada) error {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return err
+	}
+	id := conversacionID.String()
+	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+		return err
+	}
+	if err := a.conv.Atencion.RegistrarRecibo(ctx, claims.TenantID, id, claims.Subject, tipo, msgtipos.SecuenciaMensaje(body.HastaSecuencia)); err != nil {
+		return convhttp.TraducirAtencion(err)
+	}
+	return nil
+}
+
+// ListarAuditoriaConversacion: solo administrador (DEC-036), verificado antes de
+// leer, igual que el handler.
+func (a *conversacionesAPI) ListarAuditoriaConversacion(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarAuditoriaConversacionParams) (*msgclient.PaginaAuditoria, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Rol != convhttp.RolAdministrador {
+		return nil, platformerrors.NewNoAutorizado("solo administrador lee la auditoría")
+	}
+	cursor := ""
+	if params.Cursor != nil {
+		cursor = *params.Cursor
+	}
+	pagina, err := a.conv.Auditoria.Listar(ctx, claims.TenantID, conversacionID.String(), cursor)
+	if err != nil {
+		return nil, convhttp.TraducirAtencion(err)
+	}
+	return pagina, nil
 }
 
 // traducirConflictoReclamo mapea el conflicto de versión del reclamo de
