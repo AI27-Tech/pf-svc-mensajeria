@@ -21,6 +21,7 @@ import (
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
+	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
@@ -92,7 +93,7 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 // (Addendum §7, poseer el UUID no autoriza). Devuelve el agregado completo; el
 // consumidor (bff) recorta por audiencia para su schema de cliente.
 func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -122,7 +123,7 @@ func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
 // ACCESO igual que obtener. El orden de salida es siempre ascendente por
 // secuencia (contrato).
 func (h Handlers) listarMensajes(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -185,7 +186,7 @@ func queryInt(r *http.Request, nombre string) (*int64, error) {
 // devuelve 201 con el Reclamo. El conflicto de versión del dominio se traduce a
 // 409 (addendum §4 punto 5).
 func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -230,7 +231,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 // obligatoria en el query (concurrencia optimista). Autoriza (DEC-097), traduce
 // el conflicto de versión a 409 y la ausencia de reclamo a 404, y responde 204.
 func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -272,7 +273,7 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 // el reclamo en una tx del dominio, y devuelve 201 con el nuevo Reclamo. Conflicto
 // de versión → 409; sin reclamo activo → 404.
 func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -324,7 +325,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 // con el Mensaje hidratado (alias y audiencia incluidos). Idempotente por
 // client_message_id: un reintento devuelve el mensaje original.
 func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -450,12 +451,5 @@ func escribirJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// escribirError traduce un error de la taxonomía de la plataforma a su status
-// HTTP (invariante I3) y lo emite con la forma Error del contrato.
-func escribirError(w http.ResponseWriter, err error) {
-	cat := platformerrors.AsCategory(err)
-	escribirJSON(w, cat.HTTPStatus(), msgclient.Error{
-		Codigo:  cat.String(),
-		Mensaje: err.Error(),
-	})
-}
+// escribirError emite el error sin su causa interna (boundary.WriteError).
+func escribirError(w http.ResponseWriter, err error) { boundary.WriteError(w, err) }

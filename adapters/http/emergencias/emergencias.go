@@ -19,6 +19,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 
+	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
@@ -62,7 +63,7 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 // (ADR 21 §6). Al Cliente le entrega la vista mínima: solo casos no cerrados y
 // sin los campos internos (origen, actor, reclamo). A Interno, el caso completo.
 func (h Handlers) listar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -120,7 +121,7 @@ func uuidOCero(s string) msgclient.Id {
 // impone la composición de bff, igual que conversación no revalida el viaje).
 // Idempotente por activacion_id: una reentrega devuelve 200 con el caso original.
 func (h Handlers) activar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -166,7 +167,7 @@ func (h Handlers) activar(w http.ResponseWriter, r *http.Request) {
 // agregarNota agrega una nota append-only al caso. Permitida mientras el caso no
 // esté cerrado (ADR 21 §4). Texto ≤1000, recortado; vacío tras recorte → 400.
 func (h Handlers) agregarNota(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -209,7 +210,7 @@ func (h Handlers) agregarNota(w http.ResponseWriter, r *http.Request) {
 // reclamar toma el reclamo del caso (abierta → en_atencion). Solo miembros del
 // pool de Reacción (DEC-028). Conflicto de versión → 409.
 func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -238,7 +239,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 // liberar cierra el reclamo activo y devuelve el caso al pool. version_esperada
 // obligatoria en el query. Conflicto → 409; sin reclamo → 404.
 func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -271,7 +272,7 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 
 // transferir mueve la responsabilidad del caso a otro miembro de Reacción.
 func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -305,7 +306,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 // Exige una nota de resolución 1..1000: se resuelve primero (valida estado y
 // versión) y, en éxito, se registra la nota con es_resolucion=true.
 func (h Handlers) resolver(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -362,7 +363,7 @@ func (h Handlers) resolver(w http.ResponseWriter, r *http.Request) {
 // cerrar cierra administrativamente el caso (resuelta → cerrada). Interno dentro
 // del alcance o admin (ADR 21 §5); el cliente no cierra.
 func (h Handlers) cerrar(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -425,10 +426,5 @@ func escribirJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func escribirError(w http.ResponseWriter, err error) {
-	cat := platformerrors.AsCategory(err)
-	escribirJSON(w, cat.HTTPStatus(), msgclient.Error{
-		Codigo:  cat.String(),
-		Mensaje: err.Error(),
-	})
-}
+// escribirError emite el error sin su causa interna (boundary.WriteError).
+func escribirError(w http.ResponseWriter, err error) { boundary.WriteError(w, err) }
