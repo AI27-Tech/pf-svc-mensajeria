@@ -24,6 +24,7 @@ import (
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Consultor es la lectura mínima que el bootstrap/catch-up necesita. El pool de
@@ -47,52 +48,86 @@ func NewServicio(db Consultor) *Servicio {
 // existe para el tenant. El llamador la mapea a no_encontrado.
 var ErrBandejaNoEncontrada = errors.New("bandejas: bandeja no encontrada")
 
-// ErrMembresiaAmbigua la devuelve ResolverMiBandeja cuando un sujeto tiene
-// membresía activa en MÁS de una bandeja de chat. Con cola única e implícita
-// (DEC-103) el invariante es exactamente una; más de una es un dato
-// inconsistente que un administrador debe corregir, no una ambigüedad que el
-// servidor pueda resolver eligiendo una en silencio.
-var ErrMembresiaAmbigua = errors.New("bandejas: el sujeto tiene membresía activa en más de una bandeja de chat")
-
-// ResolverMiBandeja devuelve el id de la bandeja de chat del sujeto, derivado de
-// su membresía efectiva del pool (cola única e implícita, DEC-103): el llamante
-// no nombra la bandeja. Filtra por tipo 'chat' para no devolver una bandeja de
-// Reacción. Sin membresía activa en ninguna bandeja de chat -> ErrBandejaNoEncontrada
-// (el llamador lo mapea a 404, como una bandeja inexistente). Más de una ->
-// ErrMembresiaAmbigua (dato inconsistente; no se elige una en silencio).
-func (s *Servicio) ResolverMiBandeja(ctx context.Context, tenantID, usuarioID string) (string, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT b.id
-		   FROM mensajeria.pool_membresia m
-		   JOIN mensajeria.bandeja b
-		     ON b.id = m.bandeja_id AND b.tenant_id = m.tenant_id
-		  WHERE m.usuario_id = $1 AND m.tenant_id = $2 AND m.activa
-		    AND b.tipo = 'chat'`,
-		usuarioID, tenantID)
-	if err != nil {
-		return "", fmt.Errorf("bandejas: resolver bandeja del sujeto: %w", err)
-	}
-	defer rows.Close()
-
+// ResolverMiBandeja devuelve el id de la bandeja única de conversaciones del
+// tenant (DEC-127, DEC-103 #1): el llamante no nombra la bandeja. Quién es
+// miembro lo decide el rol, no esta función (autorizacion.EsMiembroBandejaChat);
+// el llamador lo verifica antes. Filtra por tipo 'chat' para no devolver una
+// bandeja de Reacción. Sin bandeja de chat en el tenant -> ErrBandejaNoEncontrada
+// (el llamador lo mapea a 404).
+//
+// Si un tenant tiene más de una bandeja de chat (sembradas antes de DEC-127),
+// la única es la más antigua, el mismo criterio que bandejaReaccion de
+// emergencias y que EnrutarABandejaUnica.
+func (s *Servicio) ResolverMiBandeja(ctx context.Context, tenantID string) (string, error) {
 	var bandejaID string
-	n := 0
-	for rows.Next() {
-		n++
-		if n > 1 {
-			return "", ErrMembresiaAmbigua
-		}
-		if err := rows.Scan(&bandejaID); err != nil {
-			return "", fmt.Errorf("bandejas: escanear bandeja del sujeto: %w", err)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("bandejas: iterar membresía: %w", err)
-	}
-	if n == 0 {
+	err := s.db.QueryRow(ctx, sqlBandejaChat, tenantID).Scan(&bandejaID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrBandejaNoEncontrada
+	}
+	if err != nil {
+		return "", fmt.Errorf("bandejas: resolver bandeja de conversaciones: %w", err)
 	}
 	return bandejaID, nil
 }
+
+// sqlBandejaChat elige la bandeja única de conversaciones del tenant.
+const sqlBandejaChat = `SELECT id FROM mensajeria.bandeja
+	 WHERE tenant_id = $1 AND tipo = 'chat'
+	 ORDER BY creado_en, id LIMIT 1`
+
+// Ejecutor es lo que EnrutarABandejaUnica necesita de la transacción del
+// llamador. pgx.Tx lo satisface.
+type Ejecutor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// EnrutarABandejaUnica enruta la conversación a la bandeja única de
+// conversaciones de su tenant, dentro de la transacción del llamador (DEC-127
+// #1: en la misma transacción que la crea). Crea la bandeja si el tenant no
+// tiene. Avanza bandeja.revision y estampa esa revisión en la ruta nueva, para
+// que el catch-up la reporte como alta (0003_ruta_revision).
+//
+// Un lock transaccional por tenant serializa la creación de la bandeja: dos
+// conversaciones nuevas del mismo tenant no crean dos bandejas.
+func EnrutarABandejaUnica(ctx context.Context, tx Ejecutor, tenantID, conversacionID string) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('mensajeria.bandeja_chat'), hashtext($1))`,
+		tenantID,
+	); err != nil {
+		return fmt.Errorf("bandejas: bloquear bandeja del tenant: %w", err)
+	}
+
+	var bandejaID string
+	err := tx.QueryRow(ctx, sqlBandejaChat, tenantID).Scan(&bandejaID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx,
+			`INSERT INTO mensajeria.bandeja (tenant_id, tipo, nombre)
+			 VALUES ($1, 'chat', $2) RETURNING id`,
+			tenantID, NombreBandejaUnica,
+		).Scan(&bandejaID)
+	}
+	if err != nil {
+		return fmt.Errorf("bandejas: resolver o crear bandeja de conversaciones: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`WITH rev AS (
+		   UPDATE mensajeria.bandeja SET revision = revision + 1
+		    WHERE id = $1 AND tenant_id = $2
+		   RETURNING revision)
+		 INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, revision)
+		 SELECT $3, $2, $1, revision FROM rev`,
+		bandejaID, tenantID, conversacionID,
+	); err != nil {
+		return fmt.Errorf("bandejas: enrutar conversación: %w", err)
+	}
+	return nil
+}
+
+// NombreBandejaUnica es el nombre con que nace la bandeja única de un tenant.
+// La migración 0008 usa el mismo literal.
+const NombreBandejaUnica = "Conversaciones"
 
 // Trabajo es el BOOTSTRAP de una bandeja (ADR 28 §2): las conversaciones con
 // ruta ACTIVA en la bandeja y la revisión actual de la colección, que el cliente

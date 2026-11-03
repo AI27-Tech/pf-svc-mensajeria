@@ -8,6 +8,7 @@ import (
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	bandejashttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/bandejas"
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
@@ -162,17 +163,20 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 	return mensaje, nil
 }
 
-// ListarTrabajoBandeja es la ruta sin {id} (listarTrabajoMiBandeja, DEC-103):
-// resolver la bandeja por la membresía del sujeto ES la autorización. Cursor se
-// ignora, igual que en HTTP.
+// ListarTrabajoBandeja es la ruta sin {id} (listarTrabajoMiBandeja, DEC-127):
+// ser Ejecutivo y resolver la bandeja única del tenant ES la autorización, igual
+// que en HTTP. Cursor se ignora, igual que en HTTP.
 func (a *conversacionesAPI) ListarTrabajoBandeja(ctx context.Context, params msgclient.ListarTrabajoMiBandejaParams) (*msgclient.TrabajoBandeja, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
 	}
-	bandejaID, err := a.bandeja.Bandeja.ResolverMiBandeja(ctx, claims.TenantID, claims.Subject)
+	if !autorizacion.EsMiembroBandejaChat(claims.Rol) {
+		return nil, platformerrors.NewNoEncontrado(bandejashttp.SinBandejaChat)
+	}
+	bandejaID, err := a.bandeja.Bandeja.ResolverMiBandeja(ctx, claims.TenantID)
 	if errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-		return nil, platformerrors.NewNoEncontrado("el sujeto no pertenece a ningún pool de chat")
+		return nil, platformerrors.NewNoEncontrado(bandejashttp.SinBandejaChat)
 	}
 	if err != nil {
 		return nil, traducir(err)

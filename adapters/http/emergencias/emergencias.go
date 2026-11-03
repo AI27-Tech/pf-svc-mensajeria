@@ -34,8 +34,8 @@ type Emergencias interface {
 	Activar(ctx context.Context, in emergencias.EntradaActivacion) (emergencias.ResultadoActivacion, error)
 	AgregarNota(ctx context.Context, in emergencias.EntradaNota) (string, error)
 	Reclamar(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error)
-	Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo) error
-	Transferir(ctx context.Context, tenantID, emergenciaID, origen, destino string, esperada msgtipos.VersionReclamo) error
+	Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo, mando bool) error
+	Transferir(ctx context.Context, tenantID, emergenciaID, actor, destino string, esperada msgtipos.VersionReclamo, mando bool) error
 	Resolver(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) error
 	Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal string) error
 	ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]emergencias.CasoProyectado, error)
@@ -207,8 +207,9 @@ func (h Handlers) agregarNota(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-// reclamar toma el reclamo del caso (abierta → en_atencion). Solo miembros del
-// pool de Reacción (DEC-028). Conflicto de versión → 409.
+// reclamar toma del pool el reclamo del caso (abierta → en_atencion). Solo
+// miembros del pool de Reacción (DEC-028). Caso con reclamo activo (DEC-125) o
+// versión no vigente → 409.
 func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -237,7 +238,8 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 }
 
 // liberar cierra el reclamo activo y devuelve el caso al pool. version_esperada
-// obligatoria en el query. Conflicto → 409; sin reclamo → 404.
+// obligatoria en el query. Solo el responsable o un Supervisor/Coordinador
+// (DEC-126): otro actor → 403. Conflicto → 409; sin reclamo → 404.
 func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -253,13 +255,16 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
-		escribirError(w, err)
-		return
+	mando := conMando(claims)
+	if !mando {
+		if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
+			escribirError(w, err)
+			return
+		}
 	}
 
 	if err := h.Emergencias.Liberar(r.Context(), claims.TenantID, eid, rid, claims.Subject,
-		msgtipos.VersionReclamo(ver)); err != nil {
+		msgtipos.VersionReclamo(ver), mando); err != nil {
 		if errors.Is(err, emergencias.ErrSinReclamo) {
 			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
 			return
@@ -270,7 +275,8 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// transferir mueve la responsabilidad del caso a otro miembro de Reacción.
+// transferir mueve la responsabilidad del caso a otro miembro de Reacción. Mismo
+// permiso que liberar (DEC-126).
 func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -279,9 +285,12 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	}
 	eid := r.PathValue("eid")
 
-	if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
-		escribirError(w, err)
-		return
+	mando := conMando(claims)
+	if !mando {
+		if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
+			escribirError(w, err)
+			return
+		}
 	}
 
 	var entrada msgclient.TransferenciaEntrada
@@ -291,7 +300,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.Emergencias.Transferir(r.Context(), claims.TenantID, eid, claims.Subject,
-		entrada.ResponsableDestinoId.String(), msgtipos.VersionReclamo(entrada.VersionEsperada)); err != nil {
+		entrada.ResponsableDestinoId.String(), msgtipos.VersionReclamo(entrada.VersionEsperada), mando); err != nil {
 		if errors.Is(err, emergencias.ErrSinReclamo) {
 			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
 			return
@@ -410,12 +419,22 @@ func traducir(err error) error {
 	return platformerrors.NewRotoErr(err, "mensajeria: error interno")
 }
 
+// conMando: un Supervisor o Coordinador libera o transfiere el caso sin ser
+// miembro del pool de Reacción ni su responsable (DEC-126).
+func conMando(c *auth.Claims) bool {
+	return c.Audiencia == auth.AudienciaInterno && emergencias.TieneMando(c.Rol)
+}
+
 // traducirConflicto mapea el conflicto de versión del dominio a 409
-// conflicto_version_reclamo; cualquier otro error pasa por traducir.
+// conflicto_version_reclamo y al no responsable a 403 prohibido (DEC-126);
+// cualquier otro error pasa por traducir.
 func traducirConflicto(err error) error {
 	var conflicto emergencias.ErrConflictoVersion
 	if errors.As(err, &conflicto) {
 		return platformerrors.NewConflicto("conflicto_version_reclamo")
+	}
+	if errors.Is(err, emergencias.ErrNoEsResponsable) {
+		return platformerrors.NewProhibido("solo el responsable, un supervisor o un coordinador libera o transfiere el caso")
 	}
 	return traducir(err)
 }
