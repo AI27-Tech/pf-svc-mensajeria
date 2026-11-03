@@ -152,14 +152,19 @@ func (s *Servicio) revisionColeccion(ctx context.Context, tenantID, bandejaID st
 
 // consultar lee las conversaciones de la bandeja con el filtro dado sobre la
 // ruta (r). Une ruta_conversacion → conversacion y un LEFT JOIN al reclamo
-// activo para version_reclamo (required en el contrato). El filtro y sus args
-// extra los pone el llamador (bootstrap: activa; catch-up: revision > desde).
+// activo para version_reclamo (required en el contrato); sin reclamo activo, la
+// versión más alta de la conversación (0 si nunca se reclamó), con la que se
+// reclama desde el pool. El filtro y sus args extra los pone el llamador
+// (bootstrap: activa; catch-up: revision > desde).
 func (s *Servicio) consultar(ctx context.Context, tenantID, bandejaID, filtro string, extraArgs ...any) ([]msgclient.Conversacion, error) {
 	args := append([]any{bandejaID, tenantID}, extraArgs...)
 	rows, err := s.db.Query(ctx,
 		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
 		        c.escritura_hasta, c.creado_en, r.bandeja_id,
-		        COALESCE(rec.version, 0) AS version_reclamo
+		        COALESCE(rec.version,
+		                 (SELECT max(h.version) FROM mensajeria.reclamo h
+		                   WHERE h.conversacion_id = c.id AND h.tenant_id = c.tenant_id),
+		                 0) AS version_reclamo
 		   FROM mensajeria.ruta_conversacion r
 		   JOIN mensajeria.conversacion c
 		     ON c.id = r.conversacion_id AND c.tenant_id = r.tenant_id

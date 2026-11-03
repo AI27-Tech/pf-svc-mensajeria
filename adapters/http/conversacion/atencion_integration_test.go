@@ -135,8 +135,9 @@ func TestMarcarAtendidaHTTP(t *testing.T) {
 		version          int64
 		quiere           int
 	}{
-		{"miembro no responsable", atOtro, "ejecutivo", 1, http.StatusUnauthorized},
-		{"cliente dueño", atCliente, "cliente", 1, http.StatusUnauthorized},
+		{"miembro no responsable", atOtro, "ejecutivo", 1, http.StatusForbidden},
+		{"miembro no responsable con versión obsoleta", atOtro, "ejecutivo", 0, http.StatusConflict},
+		{"cliente dueño", atCliente, "cliente", 1, http.StatusForbidden},
 		{"sin membresía", atExtrano, "ejecutivo", 1, http.StatusUnauthorized},
 		{"responsable con versión obsoleta", atEjec, "ejecutivo", 0, http.StatusConflict},
 		{"responsable con versión vigente", atEjec, "ejecutivo", 1, http.StatusNoContent},
@@ -285,7 +286,8 @@ func TestAuditoriaInmutableHTTP(t *testing.T) {
 		ganador, perdedor = perdedor, ganador
 	}
 
-	// Liberación, nuevo reclamo del perdedor, transferencia al ganador, atendida.
+	// Liberación (la conversación queda en v1), nuevo reclamo del perdedor desde
+	// el pool (v2), transferencia al ganador (v3), atendida.
 	var reclamoID string
 	if err := e.admin.QueryRow(e.ctx, `SELECT id FROM mensajeria.reclamo WHERE cerrado_en IS NULL`).Scan(&reclamoID); err != nil {
 		t.Fatalf("leer reclamo activo: %v", err)
@@ -296,9 +298,9 @@ func TestAuditoriaInmutableHTTP(t *testing.T) {
 		quiere            int
 	}{
 		{ganador, http.MethodDelete, rutaConv + "/reclamos/" + reclamoID + "?version_esperada=1", nil, http.StatusNoContent},
-		{perdedor, http.MethodPost, rutaConv + "/reclamos", msgclient.VersionEsperadaEntrada{}, http.StatusCreated},
-		{perdedor, http.MethodPost, rutaConv + "/transferencias", msgclient.TransferenciaEntrada{ResponsableDestinoId: uuid.MustParse(ganador), VersionEsperada: 1, Motivo: textoPtr("escalamiento")}, http.StatusCreated},
-		{ganador, http.MethodPost, rutaConv + "/atendida", msgclient.VersionEsperadaEntrada{VersionEsperada: 1}, http.StatusNoContent},
+		{perdedor, http.MethodPost, rutaConv + "/reclamos", msgclient.VersionEsperadaEntrada{VersionEsperada: 1}, http.StatusCreated},
+		{perdedor, http.MethodPost, rutaConv + "/transferencias", msgclient.TransferenciaEntrada{ResponsableDestinoId: uuid.MustParse(ganador), VersionEsperada: 2, Motivo: textoPtr("escalamiento")}, http.StatusCreated},
+		{ganador, http.MethodPost, rutaConv + "/atendida", msgclient.VersionEsperadaEntrada{VersionEsperada: 3}, http.StatusNoContent},
 	}
 	for _, p := range pasos {
 		if rec := e.pedir(p.sub, "ejecutivo", p.metodo, p.ruta, p.cuerpo); rec.Code != p.quiere {
@@ -344,9 +346,9 @@ func TestAuditoriaInmutableHTTP(t *testing.T) {
 		t.Fatalf("una sola página: cursor_siguiente = %q, quiere null", *pag.CursorSiguiente)
 	}
 
-	// Solo administrador; conversación ajena o inexistente: 404.
-	if c := e.pedir(atEjec, "ejecutivo", http.MethodGet, rutaAud, nil).Code; c != http.StatusUnauthorized {
-		t.Fatalf("auditoría como ejecutivo: status %d, quiere 401", c)
+	// Solo administrador (otro rol: 403); conversación ajena o inexistente: 404.
+	if c := e.pedir(atEjec, "ejecutivo", http.MethodGet, rutaAud, nil).Code; c != http.StatusForbidden {
+		t.Fatalf("auditoría como ejecutivo: status %d, quiere 403", c)
 	}
 	if c := e.pedir(atAdmin, "administrador", http.MethodGet, "/api/v1/auditoria/conversaciones/"+uuid.NewString(), nil).Code; c != http.StatusNotFound {
 		t.Fatalf("auditoría de conversación inexistente: status %d, quiere 404", c)
@@ -375,3 +377,56 @@ func TestAuditoriaInmutableHTTP(t *testing.T) {
 }
 
 func textoPtr(s string) *string { return &s }
+
+// TestMensajeClienteDesmarcaAtendidaHTTP: un mensaje nuevo del cliente desmarca
+// atendida (DEC-122 #1); una respuesta interna no la toca (DEC-117), y el
+// reintento idempotente del cliente no es mensaje nuevo.
+func TestMensajeClienteDesmarcaAtendidaHTTP(t *testing.T) {
+	e := montarAtencion(t)
+
+	if rec := e.pedir(atEjec, "ejecutivo", http.MethodPost, rutaConv+"/reclamos", msgclient.VersionEsperadaEntrada{}); rec.Code != http.StatusCreated {
+		t.Fatalf("reclamar: status %d; cuerpo %s", rec.Code, rec.Body.String())
+	}
+	marcar := func() {
+		t.Helper()
+		if rec := e.pedir(atEjec, "ejecutivo", http.MethodPost, rutaConv+"/atendida", msgclient.VersionEsperadaEntrada{VersionEsperada: 1}); rec.Code != http.StatusNoContent {
+			t.Fatalf("marcar atendida: status %d; cuerpo %s", rec.Code, rec.Body.String())
+		}
+	}
+	enviar := func(sub, rol string, cmid uuid.UUID) {
+		t.Helper()
+		in := msgclient.EnviarMensajeEntrada{ClientMessageId: cmid, Cuerpo: "m"}
+		if rol != "cliente" {
+			v1 := msgclient.VersionReclamo(1)
+			in.VersionReclamoEsperada = &v1
+		}
+		if rec := e.pedir(sub, rol, http.MethodPost, rutaConv+"/mensajes", in); rec.Code != http.StatusCreated {
+			t.Fatalf("enviar como %s: status %d; cuerpo %s", rol, rec.Code, rec.Body.String())
+		}
+	}
+	atendida := func() bool { return obtenerConv(t, e).AtendidaEn != nil }
+
+	marcar()
+	enviar(atEjec, "ejecutivo", uuid.New())
+	if !atendida() {
+		t.Fatalf("una respuesta interna desmarcó atendida; quiere atendida")
+	}
+
+	cmid := uuid.New()
+	enviar(atCliente, "cliente", cmid)
+	if atendida() {
+		t.Fatalf("tras mensaje del cliente: atendida; quiere desmarcada")
+	}
+	if n := e.entero(t, `SELECT count(*) FROM mensajeria.estado_atendido WHERE conversacion_id = '`+atConv+`' AND atendida`); n != 0 {
+		t.Fatalf("filas atendidas tras mensaje del cliente: %d, quiere 0", n)
+	}
+
+	marcar()
+	enviar(atCliente, "cliente", cmid) // reintento: devuelve el original, no es mensaje nuevo
+	if !atendida() {
+		t.Fatalf("el reintento idempotente del cliente desmarcó atendida; quiere atendida")
+	}
+	if n := e.entero(t, `SELECT count(*) FROM mensajeria.mensaje WHERE conversacion_id = '`+atConv+`'`); n != 2 {
+		t.Fatalf("mensajes: %d, quiere 2", n)
+	}
+}

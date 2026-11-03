@@ -55,6 +55,7 @@ type Enviador interface {
 	MensajePorID(ctx context.Context, tenantID, mensajeID string) (*msgclient.Mensaje, error)
 	ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error)
 	ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error)
+	ConversacionDeViaje(ctx context.Context, tenantID, viajeID string) (string, error)
 	ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error)
 }
 
@@ -80,6 +81,7 @@ type Handlers struct {
 // auth.Middleware, de modo que aquí los claims ya están en el contexto.
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/conversaciones/{id}", h.obtener)
+	mux.HandleFunc("GET /api/v1/viajes/{id}/conversacion", h.obtenerDeViaje)
 	mux.HandleFunc("GET /api/v1/conversaciones/{id}/mensajes", h.listarMensajes)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/reclamos", h.reclamar)
 	mux.HandleFunc("DELETE /api/v1/conversaciones/{id}/reclamos/{rid}", h.liberar)
@@ -119,6 +121,56 @@ func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	escribirJSON(w, http.StatusOK, conv)
+}
+
+// obtenerDeViaje atiende GET /api/v1/viajes/{id}/conversacion
+// (obtenerConversacionDeViaje): {id} es el viaje_id.
+func (h Handlers) obtenerDeViaje(w http.ResponseWriter, r *http.Request) {
+	claims := boundary.Claims(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	conv, err := h.ObtenerDeViaje(r.Context(), claims, r.PathValue("id"))
+	if err != nil {
+		escribirError(w, err)
+		return
+	}
+	escribirJSON(w, http.StatusOK, conv)
+}
+
+// ObtenerDeViaje resuelve la conversación del viaje, autoriza el acceso con la
+// misma guarda que obtenerConversacion y la hidrata. Sin acceso responde 404,
+// igual que un viaje sin conversación (contrato: poseer el viaje_id no
+// autoriza). Devuelve errores ya traducidos a la taxonomía. Exportada para que
+// la superficie en proceso (mensajeria.ConversacionesAPI) siga el MISMO camino.
+func (h Handlers) ObtenerDeViaje(ctx context.Context, claims *auth.Claims, viajeID string) (*msgclient.Conversacion, error) {
+	noEncontrada := platformerrors.NewNoEncontrado("conversacion no encontrada")
+	viaje, err := uuid.Parse(viajeID)
+	if err != nil {
+		return nil, noEncontrada // un id que no es UUID no nombra ningún viaje
+	}
+	convID, err := h.Conversacion.ConversacionDeViaje(ctx, claims.TenantID, viaje.String())
+	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
+		return nil, noEncontrada
+	}
+	if err != nil {
+		return nil, traducir(err)
+	}
+	if err := h.Autz.PuedeEscribir(ctx, claims.TenantID, convID, claims); err != nil {
+		if platformerrors.AsCategory(err) == platformerrors.CategoryNoAutorizado {
+			return nil, noEncontrada
+		}
+		return nil, err
+	}
+	conv, err := h.Conversacion.ObtenerConversacion(ctx, claims.TenantID, convID)
+	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
+		return nil, noEncontrada
+	}
+	if err != nil {
+		return nil, traducir(err)
+	}
+	return conv, nil
 }
 
 // listarMensajes atiende GET /api/v1/conversaciones/{id}/mensajes: historia por
@@ -210,12 +262,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 
 	_, err := h.Reclamos.Reclamar(r.Context(), claims.TenantID, convID, claims.Subject, msgtipos.VersionReclamo(entrada.VersionEsperada))
 	if err != nil {
-		var conflicto reclamos.ErrConflictoVersion
-		if errors.As(err, &conflicto) {
-			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
-			return
-		}
-		escribirError(w, traducir(err))
+		escribirError(w, TraducirReclamo(err))
 		return
 	}
 
@@ -233,7 +280,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 // liberar cierra el reclamo activo de una conversación y lo devuelve al pool
 // (addendum §4 punto 6). DELETE sobre el reclamo por su rid, con version_esperada
 // obligatoria en el query (concurrencia optimista). Autoriza (DEC-097), traduce
-// el conflicto de versión a 409 y la ausencia de reclamo a 404, y responde 204.
+// con TraducirReclamo (409, 404, o 403 si no es el responsable) y responde 204.
 func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -256,16 +303,7 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 
 	err = h.Reclamos.Liberar(r.Context(), claims.TenantID, convID, rid, claims.Subject, msgtipos.VersionReclamo(ver))
 	if err != nil {
-		var conflicto reclamos.ErrConflictoVersion
-		if errors.As(err, &conflicto) {
-			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
-			return
-		}
-		if errors.Is(err, reclamos.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
-			return
-		}
-		escribirError(w, traducir(err))
+		escribirError(w, TraducirReclamo(err))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -274,8 +312,8 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 // transferir mueve la responsabilidad de la conversación a otro miembro del pool
 // (addendum §4 punto 6). POST con TransferenciaEntrada (destino, versión
 // esperada, motivo opcional). Autoriza (DEC-097) al que transfiere, cierra y abre
-// el reclamo en una tx del dominio, y devuelve 201 con el nuevo Reclamo. Conflicto
-// de versión → 409; sin reclamo activo → 404.
+// el reclamo en una tx del dominio, y devuelve 201 con el nuevo Reclamo. Errores
+// por TraducirReclamo: 409 versión, 404 sin reclamo, 403 si no es el responsable.
 func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -302,16 +340,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	err := h.Reclamos.Transferir(r.Context(), claims.TenantID, convID, claims.Subject,
 		entrada.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(entrada.VersionEsperada))
 	if err != nil {
-		var conflicto reclamos.ErrConflictoVersion
-		if errors.As(err, &conflicto) {
-			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
-			return
-		}
-		if errors.Is(err, reclamos.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
-			return
-		}
-		escribirError(w, traducir(err))
+		escribirError(w, TraducirReclamo(err))
 		return
 	}
 
@@ -437,6 +466,23 @@ func (h Handlers) ResolverAlias(ctx context.Context, tenantID, conversacionID st
 		return "", nil // degradado: sin alias, no se rompe el envío
 	}
 	return pagina.Items[0].Nombre, nil
+}
+
+// TraducirReclamo mapea los errores de internal/reclamos a la taxonomía:
+// versión no vigente → conflicto (409), sin reclamo activo → no_encontrado
+// (404), no es el responsable activo → prohibido (403, DEC-118). Exportada para
+// que la superficie en proceso (mensajeria.ConversacionesAPI) traduzca IGUAL.
+func TraducirReclamo(err error) error {
+	var conflicto reclamos.ErrConflictoVersion
+	switch {
+	case errors.As(err, &conflicto):
+		return platformerrors.NewConflicto("conflicto de versión del reclamo")
+	case errors.Is(err, reclamos.ErrSinReclamo):
+		return platformerrors.NewNoEncontrado("reclamo no encontrado")
+	case errors.Is(err, reclamos.ErrNoEsResponsable):
+		return platformerrors.NewProhibido("solo el responsable activo libera o transfiere")
+	}
+	return traducir(err)
 }
 
 // traducir conserva la categoría de un PlatformError y envuelve cualquier otro
