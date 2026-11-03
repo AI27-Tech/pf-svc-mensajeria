@@ -10,7 +10,6 @@ import (
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
-	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
 
@@ -203,7 +202,7 @@ func (a *conversacionesAPI) ReclamarConversacion(ctx context.Context, conversaci
 		return nil, err
 	}
 	if _, err := a.conv.Reclamos.Reclamar(ctx, claims.TenantID, id, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
-		return nil, traducirConflictoReclamo(err)
+		return nil, convhttp.TraducirReclamo(err)
 	}
 	// Misma hidratación en lectura aparte que el handler (ver su shortcut).
 	reclamo, err := a.conv.Reclamo.ReclamoActivo(ctx, claims.TenantID, id)
@@ -222,12 +221,8 @@ func (a *conversacionesAPI) LiberarReclamo(ctx context.Context, conversacionID, 
 	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
 		return err
 	}
-	err = a.conv.Reclamos.Liberar(ctx, claims.TenantID, id, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(params.VersionEsperada))
-	if errors.Is(err, reclamos.ErrSinReclamo) {
-		return platformerrors.NewNoEncontrado("reclamo no encontrado")
-	}
-	if err != nil {
-		return traducirConflictoReclamo(err)
+	if err := a.conv.Reclamos.Liberar(ctx, claims.TenantID, id, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(params.VersionEsperada)); err != nil {
+		return convhttp.TraducirReclamo(err)
 	}
 	return nil
 }
@@ -247,11 +242,8 @@ func (a *conversacionesAPI) TransferirConversacion(ctx context.Context, conversa
 	}
 	err = a.conv.Reclamos.Transferir(ctx, claims.TenantID, id, claims.Subject,
 		body.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(body.VersionEsperada))
-	if errors.Is(err, reclamos.ErrSinReclamo) {
-		return nil, platformerrors.NewNoEncontrado("reclamo no encontrado")
-	}
 	if err != nil {
-		return nil, traducirConflictoReclamo(err)
+		return nil, convhttp.TraducirReclamo(err)
 	}
 	reclamo, err := a.conv.Reclamo.ReclamoActivo(ctx, claims.TenantID, id)
 	if err != nil {
@@ -307,7 +299,7 @@ func (a *conversacionesAPI) ListarAuditoriaConversacion(ctx context.Context, con
 		return nil, err
 	}
 	if claims.Rol != convhttp.RolAdministrador {
-		return nil, platformerrors.NewNoAutorizado("solo administrador lee la auditoría")
+		return nil, platformerrors.NewProhibido("solo administrador lee la auditoría")
 	}
 	cursor := ""
 	if params.Cursor != nil {
@@ -318,14 +310,4 @@ func (a *conversacionesAPI) ListarAuditoriaConversacion(ctx context.Context, con
 		return nil, convhttp.TraducirAtencion(err)
 	}
 	return pagina, nil
-}
-
-// traducirConflictoReclamo mapea el conflicto de versión del reclamo de
-// conversación a conflicto (409 en HTTP); cualquier otro error pasa por traducir.
-func traducirConflictoReclamo(err error) error {
-	var conflicto reclamos.ErrConflictoVersion
-	if errors.As(err, &conflicto) {
-		return platformerrors.NewConflicto("conflicto de versión del reclamo")
-	}
-	return traducir(err)
 }

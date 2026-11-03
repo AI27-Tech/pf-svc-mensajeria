@@ -210,12 +210,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 
 	_, err := h.Reclamos.Reclamar(r.Context(), claims.TenantID, convID, claims.Subject, msgtipos.VersionReclamo(entrada.VersionEsperada))
 	if err != nil {
-		var conflicto reclamos.ErrConflictoVersion
-		if errors.As(err, &conflicto) {
-			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
-			return
-		}
-		escribirError(w, traducir(err))
+		escribirError(w, TraducirReclamo(err))
 		return
 	}
 
@@ -233,7 +228,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 // liberar cierra el reclamo activo de una conversación y lo devuelve al pool
 // (addendum §4 punto 6). DELETE sobre el reclamo por su rid, con version_esperada
 // obligatoria en el query (concurrencia optimista). Autoriza (DEC-097), traduce
-// el conflicto de versión a 409 y la ausencia de reclamo a 404, y responde 204.
+// con TraducirReclamo (409, 404, o 403 si no es el responsable) y responde 204.
 func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -256,16 +251,7 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 
 	err = h.Reclamos.Liberar(r.Context(), claims.TenantID, convID, rid, claims.Subject, msgtipos.VersionReclamo(ver))
 	if err != nil {
-		var conflicto reclamos.ErrConflictoVersion
-		if errors.As(err, &conflicto) {
-			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
-			return
-		}
-		if errors.Is(err, reclamos.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
-			return
-		}
-		escribirError(w, traducir(err))
+		escribirError(w, TraducirReclamo(err))
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -274,8 +260,8 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 // transferir mueve la responsabilidad de la conversación a otro miembro del pool
 // (addendum §4 punto 6). POST con TransferenciaEntrada (destino, versión
 // esperada, motivo opcional). Autoriza (DEC-097) al que transfiere, cierra y abre
-// el reclamo en una tx del dominio, y devuelve 201 con el nuevo Reclamo. Conflicto
-// de versión → 409; sin reclamo activo → 404.
+// el reclamo en una tx del dominio, y devuelve 201 con el nuevo Reclamo. Errores
+// por TraducirReclamo: 409 versión, 404 sin reclamo, 403 si no es el responsable.
 func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -302,16 +288,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	err := h.Reclamos.Transferir(r.Context(), claims.TenantID, convID, claims.Subject,
 		entrada.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(entrada.VersionEsperada))
 	if err != nil {
-		var conflicto reclamos.ErrConflictoVersion
-		if errors.As(err, &conflicto) {
-			escribirError(w, platformerrors.NewConflicto("conflicto de versión del reclamo"))
-			return
-		}
-		if errors.Is(err, reclamos.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
-			return
-		}
-		escribirError(w, traducir(err))
+		escribirError(w, TraducirReclamo(err))
 		return
 	}
 
@@ -437,6 +414,23 @@ func (h Handlers) ResolverAlias(ctx context.Context, tenantID, conversacionID st
 		return "", nil // degradado: sin alias, no se rompe el envío
 	}
 	return pagina.Items[0].Nombre, nil
+}
+
+// TraducirReclamo mapea los errores de internal/reclamos a la taxonomía:
+// versión no vigente → conflicto (409), sin reclamo activo → no_encontrado
+// (404), no es el responsable activo → prohibido (403, DEC-118). Exportada para
+// que la superficie en proceso (mensajeria.ConversacionesAPI) traduzca IGUAL.
+func TraducirReclamo(err error) error {
+	var conflicto reclamos.ErrConflictoVersion
+	switch {
+	case errors.As(err, &conflicto):
+		return platformerrors.NewConflicto("conflicto de versión del reclamo")
+	case errors.Is(err, reclamos.ErrSinReclamo):
+		return platformerrors.NewNoEncontrado("reclamo no encontrado")
+	case errors.Is(err, reclamos.ErrNoEsResponsable):
+		return platformerrors.NewProhibido("solo el responsable activo libera o transfiere")
+	}
+	return traducir(err)
 }
 
 // traducir conserva la categoría de un PlatformError y envuelve cualquier otro

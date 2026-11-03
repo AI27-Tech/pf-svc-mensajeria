@@ -541,7 +541,9 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 		conv.BandejaId = &b
 	}
 
-	// Reclamo activo (solo-interno): version_reclamo + el agregado. 0 si no hay.
+	// Reclamo activo (solo-interno): version_reclamo + el agregado. Sin reclamo
+	// activo, version_reclamo es la versión vigente de la conversación (la más alta
+	// de sus reclamos; 0 si nunca se reclamó): con ella se reclama desde el pool.
 	var (
 		rid, rconv, rresp string
 		rversion          int64
@@ -555,7 +557,13 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 	).Scan(&rid, &rconv, &rresp, &rversion, &rabierto)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		conv.VersionReclamo = 0 // nunca reclamado (contrato)
+		if err := tx.QueryRow(ctx,
+			`SELECT COALESCE(max(version), 0) FROM mensajeria.reclamo
+			  WHERE conversacion_id = $1 AND tenant_id = $2`,
+			conversacionID, tenantID,
+		).Scan(&conv.VersionReclamo); err != nil {
+			return nil, fmt.Errorf("conversacion: leer versión de reclamo: %w", err)
+		}
 	case err != nil:
 		return nil, fmt.Errorf("conversacion: leer reclamo activo: %w", err)
 	default:

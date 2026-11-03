@@ -93,11 +93,11 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	convUUID := uuid.MustParse(conv)
 	rutaAtendida := "/api/v1/conversaciones/" + conv + "/atendida"
 
-	// Atendida: no responsable → no_autorizado; versión obsoleta → conflicto;
+	// Atendida: no responsable → prohibido; versión obsoleta → conflicto;
 	// ambas con el mismo status que HTTP. El responsable en v1 → ok.
 	err = api.MarcarAtendida(como(otro, "ejecutivo"), convUUID, msgclient.VersionEsperadaEntrada{VersionEsperada: 1})
-	if categoria(err) != platformerrors.CategoryNoAutorizado {
-		t.Fatalf("atendida por no responsable: categoría %v, quiere no_autorizado (err %v)", categoria(err), err)
+	if categoria(err) != platformerrors.CategoryProhibido {
+		t.Fatalf("atendida por no responsable: categoría %v, quiere prohibido (err %v)", categoria(err), err)
 	}
 	if got := statusHTTP(como(otro, "ejecutivo"), http.MethodPost, rutaAtendida, msgclient.VersionEsperadaEntrada{VersionEsperada: 1}); got != categoria(err).HTTPStatus() {
 		t.Fatalf("paridad no responsable: HTTP %d, en proceso %d", got, categoria(err).HTTPStatus())
@@ -142,8 +142,11 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	}
 
 	// Auditoría: solo administrador; trae la atendida con su actor.
-	if _, err := api.ListarAuditoriaConversacion(como(ejec, "ejecutivo"), convUUID, msgclient.ListarAuditoriaConversacionParams{}); categoria(err) != platformerrors.CategoryNoAutorizado {
-		t.Fatalf("auditoría como ejecutivo: categoría %v, quiere no_autorizado", categoria(err))
+	if _, err := api.ListarAuditoriaConversacion(como(ejec, "ejecutivo"), convUUID, msgclient.ListarAuditoriaConversacionParams{}); categoria(err) != platformerrors.CategoryProhibido {
+		t.Fatalf("auditoría como ejecutivo: categoría %v, quiere prohibido", categoria(err))
+	}
+	if got := statusHTTP(como(ejec, "ejecutivo"), http.MethodGet, "/api/v1/auditoria/conversaciones/"+conv, nil); got != http.StatusForbidden {
+		t.Fatalf("paridad auditoría como ejecutivo: HTTP %d, quiere 403", got)
 	}
 	pag, err := api.ListarAuditoriaConversacion(como(adminID, "administrador"), convUUID, msgclient.ListarAuditoriaConversacionParams{})
 	if err != nil {
