@@ -33,13 +33,11 @@ const RolAdministrador = "administrador"
 // a la taxonomía de la plataforma. Exportada para que la superficie en proceso
 // (mensajeria.ConversacionesAPI) traduzca IGUAL que estos handlers.
 //
-// El contrato declara 403 para "no es el responsable"; la taxonomía de la
-// plataforma no tiene categoría prohibido, así que sale como no_autorizado
-// (401), igual que las demás denegaciones de este servicio.
+// "No es el responsable" es prohibido (403, contrato marcarAtendida; DEC-115).
 func TraducirAtencion(err error) error {
 	switch {
 	case errors.Is(err, conversacion.ErrNoEsResponsable):
-		return platformerrors.NewNoAutorizado("solo el responsable activo marca atendida")
+		return platformerrors.NewProhibido("solo el responsable activo marca atendida")
 	case errors.Is(err, conversacion.ErrSinReclamoActivo):
 		return platformerrors.NewConflicto("conflicto_version_reclamo")
 	case errors.Is(err, conversacion.ErrConversacionNoEncontrada), errors.Is(err, auditoria.ErrConversacionNoEncontrada):
@@ -119,7 +117,7 @@ func (h Handlers) listarAuditoria(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims.Rol != RolAdministrador {
-		escribirError(w, platformerrors.NewNoAutorizado("solo administrador lee la auditoría"))
+		escribirError(w, platformerrors.NewProhibido("solo administrador lee la auditoría"))
 		return
 	}
 
