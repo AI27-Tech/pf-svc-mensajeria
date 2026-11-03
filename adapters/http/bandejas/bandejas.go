@@ -14,6 +14,7 @@ import (
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
+	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 )
 
@@ -46,7 +47,7 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 // trabajo sirve el trabajo de una bandeja NOMBRADA por {id} (uso administrativo).
 // Autoriza por membresía de pool en esa bandeja (DEC-097, Addendum §7).
 func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -68,7 +69,7 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 // interno sin pool. Un sujeto en más de una bandeja de chat (dato inconsistente
 // con la cola única) -> error interno, no se elige una en silencio.
 func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
-	claims := auth.ClaimsFromContext(r.Context())
+	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
@@ -142,10 +143,5 @@ func escribirJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func escribirError(w http.ResponseWriter, err error) {
-	cat := platformerrors.AsCategory(err)
-	escribirJSON(w, cat.HTTPStatus(), msgclient.Error{
-		Codigo:  cat.String(),
-		Mensaje: err.Error(),
-	})
-}
+// escribirError emite el error sin su causa interna (boundary.WriteError).
+func escribirError(w http.ResponseWriter, err error) { boundary.WriteError(w, err) }

@@ -7,6 +7,7 @@ import (
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
+	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/google/uuid"
@@ -43,7 +44,7 @@ func (f *casoFake) Cerrar(context.Context, string, string, string) error { panic
 
 func ctxConAudiencia(aud auth.Audiencia) context.Context {
 	return auth.ContextWithClaims(context.Background(), &auth.Claims{
-		Subject:   "u-1",
+		Subject:   "11111111-1111-1111-1111-111111111111",
 		TenantID:  "t-1",
 		Audiencia: aud,
 	})
@@ -113,5 +114,19 @@ func TestListarEmergencias_SinClaims(t *testing.T) {
 	_, err := api.ListarEmergencias(context.Background(), uuid.New())
 	if err == nil {
 		t.Fatalf("se esperaba error de no autorizado sin claims")
+	}
+}
+
+// TestListarEmergencias_SujetoNoUUID: un sujeto que no es UUID no identifica a un
+// actor; se rechaza como no autorizado antes del caso de uso (que aquí devolvería
+// éxito), igual que la ausencia de claims.
+func TestListarEmergencias_SujetoNoUUID(t *testing.T) {
+	api := &emergenciasAPI{emergencias: &casoFake{}}
+	ctx := auth.ContextWithClaims(context.Background(), &auth.Claims{
+		Subject: "u-1", TenantID: "t-1", Audiencia: auth.AudienciaInterno,
+	})
+	_, err := api.ListarEmergencias(ctx, uuid.New())
+	if got := platformerrors.AsCategory(err); got != platformerrors.CategoryNoAutorizado {
+		t.Fatalf("categoría: got %v (%v), want no_autorizado", got, err)
 	}
 }
