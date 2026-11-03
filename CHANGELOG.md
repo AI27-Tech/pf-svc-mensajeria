@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## 2026-11-03 12:55 — Emergencia: reclamar solo desde el pool (DEC-125) y quién libera o transfiere (DEC-126)
+
+**Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno (bandeja de Reacción). Cambia lo que observan: reclamar un caso que ya tiene responsable responde `409` aunque mande la versión vigente; liberar o transferir el caso de otro responde `403 prohibido`, salvo para Supervisor y Coordinador.
+
+**Resumen:** dos hallazgos del PR #44. Un miembro de Reacción con la versión vigente se quedaba con un caso ajeno (el reclamo pasaba a él), y cualquier miembro de Reacción liberaba o transfería cualquier caso. Sustituye la línea "Emergencia, sin cambio" de la entrada anterior.
+
+**Comportamiento:**
+- `reclamarEmergencia` (HTTP y `EmergenciasAPI`) solo procede si el caso no tiene reclamo activo (DEC-125). Con reclamo activo responde `409 conflicto`, también para el propio responsable. El caso sigue con su responsable.
+- Cada intento de reclamo de emergencia queda en `auditoria_mensajeria`: `emergencia.reclamo.intento_ganado` en la tx del reclamo y `emergencia.reclamo.intento_perdido` en una tx propia, con `conversacion_id` NULL y el caso en `detalle.caso_emergencia_id`. Antes el reclamo de emergencia no se auditaba. La carrera desde el pool no cambia: uno `201`, otro `409`, los dos auditados.
+- `liberarReclamoEmergencia` y `transferirEmergencia` (HTTP y `EmergenciasAPI`): los hace el responsable activo, o cualquier usuario con rol `supervisor` o `coordinador` sin verificar el mando (DEC-126, atajo de DEC-099 hasta DT-06). Otro miembro de Reacción recibe `403 prohibido`. Orden de validación: sin reclamo `404`, versión no vigente `409`, no responsable `403`.
+- Supervisor y Coordinador no necesitan membresía en el pool de Reacción para liberar o transferir: esas dos operaciones saltan `PuedeAtenderEmergencia` para ellos. Para todo lo demás (reclamar, resolver, y liberar/transferir de cualquier otro rol) la guarda de membresía no cambia: sin fila activa en `pool_membresia` de la bandeja del caso, `401`.
+
+**Cambios:**
+- `internal/emergencias`: `Reclamar` abre solo desde el pool (se borra el `UPDATE` que reasignaba) y audita cada intento; `tomarActivo` (bloquea el reclamo activo y valida versión y responsable); `Liberar` y `Transferir` reciben `mando`; `ErrNoEsResponsable`; `TieneMando`.
+- `internal/auditoria`: `AccionEmergenciaReclamoGanado`/`Perdido`; `Registrar` guarda `conversacion_id` NULL cuando viene vacío.
+- `adapters/http/emergencias` y `emergencias_api.go`: `conMando`; liberar y transferir saltan la guarda de membresía con mando; `ErrNoEsResponsable` → `403 prohibido`.
+- Pruebas: B (Reacción) reclama el caso de A con la versión vigente (`409` por HTTP y en proceso, el caso sigue con A en versión 1, tres filas de auditoría literales); B libera y transfiere el caso de A (`403 prohibido` por HTTP y en proceso); Monitorista sin membresía libera (`401`); Supervisor y Coordinador, sin membresía, liberan y transfieren el caso ajeno (HTTP y en proceso); el responsable transfiere y libera el suyo; el caso termina `abierta` en versión 6. La prueba de concurrencia afirma la auditoría de los dos intentos.
+
+**Archivos modificados:**
+- `internal/emergencias/emergencias.go`, `internal/emergencias/emergencias_integration_test.go`
+- `internal/auditoria/auditoria.go`
+- `adapters/http/emergencias/emergencias.go`
+- `adapters/http/emergencias/emergencias_integration_test.go` (nuevo)
+- `emergencias_api.go`, `emergencias_api_test.go`
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./... ./cmd/...`, `go test -race -p 1 ./...` con `MENSAJERIA_TEST_DB` (Postgres desechable: 69 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Mutaciones: sin la guarda de responsable, B libera con `204`; sin el salto de membresía, el Supervisor recibe `401`; sin el chequeo de reclamo activo, la auditoría del intento perdido cambia de versión actual.
+
 ## 2026-11-03 11:56 — Reclamar solo desde el pool (DEC-123) y versión monotónica del reclamo de emergencia
 
 **Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno (bandeja de conversaciones y de Reacción). Cambia lo que observan: `POST /reclamos` sobre una conversación que ya tiene responsable responde `409` aunque mande la versión vigente; y el reclamo de un caso de emergencia ya no reabre en versión 1 al transferir.
