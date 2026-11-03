@@ -287,14 +287,20 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, emergenciaID, actorRe
 		if hay {
 			return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual}
 		}
-		// No hay reclamo activo: abrir el primero exige esperada == 0.
-		if esperada != 0 {
-			return 0, ErrConflictoVersion{Esperada: esperada, Actual: 0}
+		// Sin reclamo activo, del pool se reclama con la versión vigente del caso (0
+		// si nunca se reclamó) y el reclamo nuevo la avanza: monotónica por caso, no
+		// por fila, como en la conversación (P20).
+		vigente, e := versionMaxima(ctx, tx, tenantID, emergenciaID)
+		if e != nil {
+			return 0, e
 		}
-		if err := abrirReclamo(ctx, tx, tenantID, emergenciaID, actorReal); err != nil {
+		if esperada != vigente {
+			return 0, ErrConflictoVersion{Esperada: esperada, Actual: vigente}
+		}
+		nueva = int64(vigente) + 1
+		if _, err := abrirReclamo(ctx, tx, tenantID, emergenciaID, actorReal, nueva); err != nil {
 			return 0, err
 		}
-		nueva = 1
 	} else if err != nil {
 		return 0, fmt.Errorf("emergencias: reclamar: %w", err)
 	}
@@ -359,8 +365,13 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoI
 		return ErrSinReclamo
 	}
 
-	// Liberar devuelve el caso a la cola: vuelve a abierta.
-	if err := fijarEstado(ctx, tx, tenantID, emergenciaID, esperada,
+	// Liberar devuelve el caso a la cola: vuelve a abierta. La fila del caso queda
+	// en la versión vigente (la más alta), que es la que exige el siguiente reclamo.
+	vigente, err := versionMaxima(ctx, tx, tenantID, emergenciaID)
+	if err != nil {
+		return err
+	}
+	if err := fijarEstado(ctx, tx, tenantID, emergenciaID, vigente,
 		string(msgclient.EstadoEmergenciaAbierta)); err != nil {
 		return err
 	}
@@ -387,8 +398,9 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoI
 
 // Transferir mueve la responsabilidad del caso a otro miembro de Reacción: cierra
 // el reclamo activo del origen y abre uno nuevo para el destino en una tx,
-// conservando el estado del caso (ADR 21 §5). Conflicto → ErrConflictoVersion;
-// sin reclamo activo → ErrSinReclamo.
+// conservando el estado del caso (ADR 21 §5). El reclamo nuevo abre en la versión
+// siguiente del caso, así que la previa queda obsoleta (P20). Conflicto →
+// ErrConflictoVersion; sin reclamo activo → ErrSinReclamo.
 func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, origen, destino string, esperada msgtipos.VersionReclamo) error {
 	if emergenciaID == "" || destino == "" {
 		return fmt.Errorf("emergencias: transferencia inválida: faltan emergencia_id o destino")
@@ -400,16 +412,15 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, orige
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	ct, err := tx.Exec(ctx,
+	var anteriorID string
+	err = tx.QueryRow(ctx,
 		`UPDATE mensajeria.reclamo_emergencia
 		    SET cerrado_en = now()
 		  WHERE emergencia_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
-		    AND version = $3`,
-		emergenciaID, tenantID, int64(esperada))
-	if err != nil {
-		return fmt.Errorf("emergencias: cerrar reclamo en transferencia: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
+		    AND version = $3
+		  RETURNING id`,
+		emergenciaID, tenantID, int64(esperada)).Scan(&anteriorID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		actual, hay, e := versionActiva(ctx, tx, tenantID, emergenciaID)
 		if e != nil {
 			return e
@@ -419,13 +430,26 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, orige
 		}
 		return ErrSinReclamo
 	}
+	if err != nil {
+		return fmt.Errorf("emergencias: cerrar reclamo en transferencia: %w", err)
+	}
 
-	var nuevaID string
-	if err := tx.QueryRow(ctx,
-		`INSERT INTO mensajeria.reclamo_emergencia (emergencia_id, tenant_id, actor_real, version)
-		 VALUES ($1, $2, $3, 1) RETURNING id`,
-		emergenciaID, tenantID, destino).Scan(&nuevaID); err != nil {
-		return fmt.Errorf("emergencias: abrir reclamo destino: %w", err)
+	// El reclamo del destino abre en la versión siguiente del caso, no en 1: tras
+	// A→B→A una versión previa de A no vuelve a ser vigente (P20). La fila del caso
+	// refleja la versión nueva; el estado se conserva (ADR 21 §5).
+	vigente, err := versionMaxima(ctx, tx, tenantID, emergenciaID)
+	if err != nil {
+		return err
+	}
+	nueva := int64(vigente) + 1
+	nuevaID, err := abrirReclamo(ctx, tx, tenantID, emergenciaID, destino, nueva)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE mensajeria.emergencia SET version_reclamo = $3 WHERE id = $1 AND tenant_id = $2`,
+		emergenciaID, tenantID, nueva); err != nil {
+		return fmt.Errorf("emergencias: reflejar versión en transferencia: %w", err)
 	}
 
 	ev := outbox.Event{
@@ -433,9 +457,11 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, orige
 		AgregadoID:   emergenciaID,
 		Sensibilidad: outbox.SensibilidadRestringida,
 		Payload: map[string]any{
-			"caso_emergencia_id": emergenciaID,
-			"reclamo_id":         nuevaID,
-			"responsable_id":     destino,
+			"caso_emergencia_id":  emergenciaID,
+			"reclamo_anterior_id": anteriorID,
+			"reclamo_id":          nuevaID,
+			"responsable_id":      destino,
+			"version_reclamo":     nueva,
 		},
 	}
 	if err := s.pub.Publish(ctx, tx, ev); err != nil {
@@ -634,17 +660,37 @@ func bandejaReaccion(ctx context.Context, tx pgx.Tx, tenantID string) (string, e
 	return id, nil
 }
 
-// abrirReclamo inserta el reclamo activo inicial del caso en versión 1. El índice
-// único parcial garantiza a lo más uno activo por emergencia.
-func abrirReclamo(ctx context.Context, tx pgx.Tx, tenantID, emergenciaID, actorReal string) error {
-	_, err := tx.Exec(ctx,
+// abrirReclamo inserta el reclamo activo del caso en la versión dada y devuelve
+// su id. El índice único parcial garantiza a lo más uno activo por emergencia:
+// si dos abren a la vez, el perdedor recibe ErrConflictoVersion.
+func abrirReclamo(ctx context.Context, tx pgx.Tx, tenantID, emergenciaID, actorReal string, version int64) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.reclamo_emergencia (emergencia_id, tenant_id, actor_real, version)
-		 VALUES ($1, $2, $3, 1)`,
-		emergenciaID, tenantID, actorReal)
-	if err != nil {
-		return fmt.Errorf("emergencias: abrir reclamo: %w", err)
+		 VALUES ($1, $2, $3, $4) RETURNING id`,
+		emergenciaID, tenantID, actorReal, version).Scan(&id)
+	if esViolacionUnica(err) {
+		return "", ErrConflictoVersion{Esperada: msgtipos.VersionReclamo(version - 1), Actual: msgtipos.VersionReclamo(version)}
 	}
-	return nil
+	if err != nil {
+		return "", fmt.Errorf("emergencias: abrir reclamo: %w", err)
+	}
+	return id, nil
+}
+
+// versionMaxima devuelve la versión vigente del reclamo del caso: la más alta de
+// sus reclamos, activos o cerrados (0 si nunca se reclamó). El reclamo nuevo,
+// desde el pool o por transferencia, abre en esta + 1 (P20).
+func versionMaxima(ctx context.Context, tx pgx.Tx, tenantID, emergenciaID string) (msgtipos.VersionReclamo, error) {
+	var v int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(max(version), 0) FROM mensajeria.reclamo_emergencia
+		  WHERE emergencia_id = $1 AND tenant_id = $2`,
+		emergenciaID, tenantID,
+	).Scan(&v); err != nil {
+		return 0, fmt.Errorf("emergencias: leer versión del caso: %w", err)
+	}
+	return msgtipos.VersionReclamo(v), nil
 }
 
 // fijarEstado estampa el estado del caso y refleja la versión de reclamo en la

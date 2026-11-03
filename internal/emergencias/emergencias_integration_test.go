@@ -197,6 +197,104 @@ func esConflicto(err error) bool {
 	return errors.As(err, &c)
 }
 
+// TestDobleTransferenciaVersionMonotonica cubre P20 en el caso de emergencia: la
+// versión del reclamo avanza en cada transferencia A→B→A (1, 2, 3) en lugar de
+// reabrir en 1, así que una versión previa da conflicto en transferir, liberar,
+// resolver y reclamar aunque A vuelva a ser responsable. Liberar deja el caso en
+// la versión vigente y el siguiente reclamo desde el pool la avanza.
+func TestDobleTransferenciaVersionMonotonica(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	svc, teardown := setup(t, ctx)
+	defer teardown()
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	id := activar(t, ctx, svc, activacn1).EmergenciaID
+	versionCaso := func() int64 {
+		t.Helper()
+		casos, err := svc.ListarPorViaje(ctx, tenant, viaje, false)
+		if err != nil || len(casos) != 1 {
+			t.Fatalf("listar: %d casos, err %v", len(casos), err)
+		}
+		return int64(casos[0].VersionReclamo)
+	}
+	reclamoActivo := func() (string, string) {
+		t.Helper()
+		var rid, actor string
+		if err := admin.QueryRow(ctx,
+			`SELECT id::text, actor_real::text FROM mensajeria.reclamo_emergencia WHERE cerrado_en IS NULL`).Scan(&rid, &actor); err != nil {
+			t.Fatalf("leer reclamo activo: %v", err)
+		}
+		return rid, actor
+	}
+
+	if _, err := svc.Reclamar(ctx, tenant, id, actorA, 0); err != nil {
+		t.Fatalf("A reclama: %v", err)
+	}
+	v1 := versionCaso()
+	if err := svc.Transferir(ctx, tenant, id, actorA, actorB, 1); err != nil {
+		t.Fatalf("A→B: %v", err)
+	}
+	v2 := versionCaso()
+	if err := svc.Transferir(ctx, tenant, id, actorB, actorA, 2); err != nil {
+		t.Fatalf("B→A: %v", err)
+	}
+	v3 := versionCaso()
+	if got := [3]int64{v1, v2, v3}; got != [3]int64{1, 2, 3} {
+		t.Fatalf("versiones A→B→A: %v, quiere [1 2 3]", got)
+	}
+
+	rid, _ := reclamoActivo()
+	for paso, err := range map[string]error{
+		"transferir con la versión previa": svc.Transferir(ctx, tenant, id, actorA, actorB, 1),
+		"liberar con la versión previa":    svc.Liberar(ctx, tenant, id, rid, actorA, 1),
+		"resolver con la versión previa":   svc.Resolver(ctx, tenant, id, actorA, 1),
+		"reclamar con la versión de B":     func() error { _, e := svc.Reclamar(ctx, tenant, id, actorB, 2); return e }(),
+	} {
+		if !esConflicto(err) {
+			t.Fatalf("%s: quiere conflicto, fue %v", paso, err)
+		}
+	}
+	if _, actor := reclamoActivo(); actor != actorA || versionCaso() != 3 {
+		t.Fatalf("tras los conflictos: responsable %s versión %d, quiere %s 3", actor, versionCaso(), actorA)
+	}
+
+	// El evento lleva la versión nueva de cada transferencia (contrato
+	// EmergenciaTransferida.version_reclamo).
+	var versiones []int64
+	rows, err := admin.Query(ctx,
+		`SELECT (payload->>'version_reclamo')::bigint FROM mensajeria.outbox
+		  WHERE tipo = 'emergencia.transferida' AND agregado_id = $1 ORDER BY id`, id)
+	if err != nil {
+		t.Fatalf("leer outbox: %v", err)
+	}
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("escanear outbox: %v", err)
+		}
+		versiones = append(versiones, v)
+	}
+	if len(versiones) != 2 || versiones[0] != 2 || versiones[1] != 3 {
+		t.Fatalf("version_reclamo de emergencia.transferida: %v, quiere [2 3]", versiones)
+	}
+
+	// Liberar deja el caso en 3; del pool, la versión 0 es obsoleta y la 3 abre en 4.
+	if err := svc.Liberar(ctx, tenant, id, rid, actorA, 3); err != nil {
+		t.Fatalf("liberar: %v", err)
+	}
+	if v := versionCaso(); v != 3 {
+		t.Fatalf("tras liberar: versión %d, quiere 3", v)
+	}
+	if _, err := svc.Reclamar(ctx, tenant, id, actorB, 0); !esConflicto(err) {
+		t.Fatalf("reclamar del pool con 0: quiere conflicto, fue %v", err)
+	}
+	if v, err := svc.Reclamar(ctx, tenant, id, actorB, 3); err != nil || v != 4 {
+		t.Fatalf("reclamar del pool con 3: versión %d err %v, quiere 4", v, err)
+	}
+}
+
 // TestListarVistaMinimaExcluyeCerradas afirma que, con soloActivos=true (vista
 // mínima del cliente), un caso cerrado no aparece, mientras que con
 // soloActivos=false (interno) sí.
