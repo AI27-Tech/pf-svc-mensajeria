@@ -36,7 +36,7 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		conv    = "11111111-1111-1111-1111-111111111111"
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		bandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -53,10 +53,6 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+conv+`', '`+tenant+`', '`+bandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+ejec+`', '`+tenant+`', 'ejecutivo', 1, true),
-		        ('`+bandeja+`', '`+otro+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.reclamo (conversacion_id, tenant_id, actor_real, version)
 		 VALUES ('`+conv+`', '`+tenant+`', '`+ejec+`', 1)`)
@@ -137,8 +133,10 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	if got := leidoAI27(); got != 2 {
 		t.Fatalf("leído AI27 tras recibo del responsable: %d, quiere 2", got)
 	}
-	if err := api.RegistrarReciboLeido(como(uuid.NewString(), "ejecutivo"), convUUID, msgclient.ReciboEntrada{HastaSecuencia: 1}); categoria(err) != platformerrors.CategoryNoAutorizado {
-		t.Fatalf("recibo sin membresía: categoría %v, quiere no_autorizado", categoria(err))
+	// Un rol que no es miembro de la bandeja (DEC-127) recibe la misma denegación
+	// que antes recibía quien no tenía membresía.
+	if err := api.RegistrarReciboLeido(como(uuid.NewString(), "monitorista"), convUUID, msgclient.ReciboEntrada{HastaSecuencia: 1}); categoria(err) != platformerrors.CategoryNoAutorizado {
+		t.Fatalf("recibo de monitorista: categoría %v, quiere no_autorizado", categoria(err))
 	}
 
 	// Auditoría: solo administrador; trae la atendida con su actor.

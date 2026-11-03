@@ -8,6 +8,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/dbtest"
+	"github.com/google/uuid"
 )
 
 // TestCrearPorEventoEsIdempotente verifica E3-T1: crear la conversación de un
@@ -71,6 +72,72 @@ func TestCrearPorEventoEsIdempotente(t *testing.T) {
 	}
 	if tenant != cliente || cli != cliente {
 		t.Fatalf("tenant_id/cliente_id = %q/%q, quiere ambos = %q", tenant, cli, cliente)
+	}
+
+	// DEC-127: nació enrutada a la bandeja única del tenant (creada con ella), una
+	// sola ruta activa en revisión 1 aunque el evento se reentregó.
+	var rutas, revRuta, revBandeja int64
+	var tipo string
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) OVER (), r.revision, b.revision, b.tipo
+		   FROM mensajeria.ruta_conversacion r
+		   JOIN mensajeria.conversacion c ON c.id = r.conversacion_id
+		   JOIN mensajeria.bandeja b ON b.id = r.bandeja_id AND b.tenant_id = r.tenant_id
+		  WHERE c.viaje_id = $1 AND r.activa LIMIT 1`, viaje,
+	).Scan(&rutas, &revRuta, &revBandeja, &tipo); err != nil {
+		t.Fatalf("leer ruta: %v", err)
+	}
+	if rutas != 1 || revRuta != 1 || revBandeja != 1 || tipo != "chat" {
+		t.Fatalf("ruta: %d activas, revisión %d, bandeja %s en revisión %d; quiere 1, 1, chat, 1", rutas, revRuta, tipo, revBandeja)
+	}
+}
+
+// TestCrearPorEventoConcurrenteUnaBandeja: ocho viajes de un tenant nuevo
+// habilitados a la vez crean UNA sola bandeja de chat (el lock por tenant de
+// bandejas.EnrutarABandejaUnica) y ocho rutas con revisiones 1..8 sin repetir.
+//
+// Prueba de comportamiento contra Postgres real. Se salta sin MENSAJERIA_TEST_DB.
+func TestCrearPorEventoConcurrenteUnaBandeja(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dbtest.Serializar(t, ctx)
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+	dbtest.Reiniciar(t, ctx, admin)
+	defer dbtest.Reiniciar(t, ctx, admin)
+	dbtest.AplicarMigraciones(t, ctx, admin)
+
+	pool, closePool := dbtest.PoolComoRol(t, ctx)
+	defer closePool()
+	svc := conversacion.NewServicio(pool, outbox.NewPublisher())
+
+	const cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const n = 8
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := svc.CrearPorEvento(ctx, conversacion.EntradaCreacion{ViajeID: uuid.NewString(), ClienteID: cliente})
+			errs <- err
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("crear concurrente: %v", err)
+		}
+	}
+
+	var bandejas, rutas, distintas, maxRev, revBandeja int64
+	if err := pool.QueryRow(ctx,
+		`SELECT (SELECT count(*) FROM mensajeria.bandeja WHERE tenant_id = $1 AND tipo = 'chat'),
+		        count(*), count(DISTINCT r.revision), max(r.revision),
+		        (SELECT max(revision) FROM mensajeria.bandeja WHERE tenant_id = $1)
+		   FROM mensajeria.ruta_conversacion r WHERE r.tenant_id = $1 AND r.activa`, cliente,
+	).Scan(&bandejas, &rutas, &distintas, &maxRev, &revBandeja); err != nil {
+		t.Fatalf("leer bandejas y rutas: %v", err)
+	}
+	if got := [5]int64{bandejas, rutas, distintas, maxRev, revBandeja}; got != [5]int64{1, n, n, n, n} {
+		t.Fatalf("[bandejas, rutas, revisiones distintas, revisión máx, revisión bandeja] = %v, quiere [1 8 8 8 8]", got)
 	}
 }
 

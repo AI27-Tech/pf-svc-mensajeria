@@ -22,6 +22,7 @@ import (
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	msgmensajeria "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -686,6 +687,8 @@ type EntradaCreacion struct {
 // no una segunda conversación. No usa inbox_evento: el invariante de unicidad del
 // negocio ES el árbitro (mismo criterio que el envío y el consumidor de
 // emergencia; DEC-067). Devuelve creada=true si insertó, false si ya existía.
+// La conversación creada queda enrutada a la bandeja única de su tenant en la
+// misma transacción (DEC-127).
 func (s *Servicio) CrearPorEvento(ctx context.Context, in EntradaCreacion) (bool, error) {
 	if in.ViajeID == "" || in.ClienteID == "" {
 		return false, fmt.Errorf("conversacion: creación inválida: faltan viaje_id o cliente_id")
@@ -698,21 +701,30 @@ func (s *Servicio) CrearPorEvento(ctx context.Context, in EntradaCreacion) (bool
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// tenant_id = cliente_id (DEC-049: cliente = tenant), igual que reportes.
-	ct, err := tx.Exec(ctx,
+	var id string
+	err = tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.conversacion (tenant_id, viaje_id, cliente_id, estado, siguiente_secuencia)
 		 VALUES ($1, $2, $3::uuid, 'abierta', 0)
-		 ON CONFLICT DO NOTHING`,
+		 ON CONFLICT DO NOTHING
+		 RETURNING id`,
 		in.ClienteID, in.ViajeID, in.ClienteID,
-	)
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// ON CONFLICT no insertó: ya existía una conversación activa para el
+		// viaje (reentrega idempotente, no-op). Su ruta ya se creó con ella.
+		return false, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("conversacion: insertar conversación: %w", err)
+	}
+	// La conversación nace en la bandeja única, en la misma tx (DEC-127 #1).
+	if err := bandejas.EnrutarABandejaUnica(ctx, tx, in.ClienteID, id); err != nil {
+		return false, fmt.Errorf("conversacion: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("conversacion: commit de creación: %w", err)
 	}
-	// RowsAffected 0 ⇒ ya existía una conversación activa para el viaje (ON
-	// CONFLICT no insertó): reentrega idempotente, no-op.
-	return ct.RowsAffected() == 1, nil
+	return true, nil
 }
 
 // Ventanas de escritura tras el cierre del viaje (DEC-030/DEC-041): con

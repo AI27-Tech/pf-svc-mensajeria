@@ -94,8 +94,8 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 }
 
 // obtener atiende GET /api/v1/conversaciones/{id}: hidrata el agregado
-// Conversacion para el bootstrap. Autoriza el ACCESO (DEC-097: cliente dueño o
-// membresía de pool); un sin-acceso recibe el mismo 404 que si no existiera
+// Conversacion para el bootstrap. Autoriza el ACCESO (empresa cliente dueña,
+// DEC-124; o rol `ejecutivo` sobre la bandeja de chat, DEC-127); un sin-acceso recibe el mismo 404 que si no existiera
 // (Addendum §7, poseer el UUID no autoriza). Devuelve el agregado completo; el
 // consumidor (bff) recorta por audiencia para su schema de cliente.
 func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +238,7 @@ func queryInt(r *http.Request, nombre string) (*int64, error) {
 }
 
 // reclamar toma del pool el reclamo de una conversación. Exige claims, autoriza
-// contra la membresía del pool (DEC-097), reclama con la versión esperada y
+// con internal/autorizacion (rol `ejecutivo`, DEC-127), reclama con la versión esperada y
 // devuelve 201 con el Reclamo. El conflicto de versión del dominio, también el de
 // una conversación que ya tiene responsable (DEC-123), se traduce a 409
 // (addendum §4 punto 5).

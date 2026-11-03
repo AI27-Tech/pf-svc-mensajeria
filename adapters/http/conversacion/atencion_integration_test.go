@@ -23,10 +23,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Actores fijos de las pruebas de E3-T6. ejec y otro son miembros del pool;
-// extrano no; admin tiene rol administrador.
+// Actores fijos de las pruebas de E3-T6. ejec y otro son Ejecutivos, miembros
+// de la bandeja por su rol (DEC-127); extrano es monitorista, no miembro; admin
+// tiene rol administrador.
 const (
-	atTenant  = "t1"
+	atTenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 	atConv    = "11111111-1111-1111-1111-111111111111"
 	atCliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	atBandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -36,8 +37,8 @@ const (
 	atAdmin   = "f0f0f0f0-f0f0-f0f0-f0f0-f0f0f0f0f0f0"
 )
 
-// escenarioAtencion levanta Postgres con una conversación abierta enrutada a una
-// bandeja con dos miembros (ejec, otro) y devuelve el mux del módulo, la conexión
+// escenarioAtencion levanta Postgres con una conversación abierta enrutada a la
+// bandeja de chat, sin filas de membresía, y devuelve el mux del módulo, la conexión
 // admin y el pool del rol de app.
 type escenarioAtencion struct {
 	ctx   context.Context
@@ -68,10 +69,6 @@ func montarAtencion(t *testing.T) escenarioAtencion {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+atConv+`', '`+atTenant+`', '`+atBandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+atBandeja+`', '`+atEjec+`', '`+atTenant+`', 'ejecutivo', 1, true),
-		        ('`+atBandeja+`', '`+atOtro+`', '`+atTenant+`', 'ejecutivo', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	t.Cleanup(closePool)
@@ -138,7 +135,7 @@ func TestMarcarAtendidaHTTP(t *testing.T) {
 		{"miembro no responsable", atOtro, "ejecutivo", 1, http.StatusForbidden},
 		{"miembro no responsable con versión obsoleta", atOtro, "ejecutivo", 0, http.StatusConflict},
 		{"cliente dueño", atCliente, "cliente", 1, http.StatusForbidden},
-		{"sin membresía", atExtrano, "ejecutivo", 1, http.StatusUnauthorized},
+		{"monitorista, no miembro", atExtrano, "monitorista", 1, http.StatusUnauthorized},
 		{"responsable con versión obsoleta", atEjec, "ejecutivo", 0, http.StatusConflict},
 		{"responsable con versión vigente", atEjec, "ejecutivo", 1, http.StatusNoContent},
 	}
@@ -241,8 +238,8 @@ func TestRecibosP23HTTP(t *testing.T) {
 	}
 
 	// Sin acceso: no autorizado y sin efecto.
-	if c := recibo(atExtrano, "ejecutivo", "leido", 3); c != http.StatusUnauthorized {
-		t.Fatalf("recibo sin membresía: status %d, quiere 401", c)
+	if c := recibo(atExtrano, "monitorista", "leido", 3); c != http.StatusUnauthorized {
+		t.Fatalf("recibo de monitorista: status %d, quiere 401", c)
 	}
 	if got := cursor(atExtrano, "leido_hasta"); got != -1 {
 		t.Fatalf("recibo rechazado creó cursor: %d", got)
