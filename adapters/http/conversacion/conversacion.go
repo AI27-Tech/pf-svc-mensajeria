@@ -237,10 +237,11 @@ func queryInt(r *http.Request, nombre string) (*int64, error) {
 	return &v, nil
 }
 
-// reclamar toma el reclamo activo de una conversación. Exige claims, autoriza
+// reclamar toma del pool el reclamo de una conversación. Exige claims, autoriza
 // contra la membresía del pool (DEC-097), reclama con la versión esperada y
-// devuelve 201 con el Reclamo. El conflicto de versión del dominio se traduce a
-// 409 (addendum §4 punto 5).
+// devuelve 201 con el Reclamo. El conflicto de versión del dominio, también el de
+// una conversación que ya tiene responsable (DEC-123), se traduce a 409
+// (addendum §4 punto 5).
 func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
