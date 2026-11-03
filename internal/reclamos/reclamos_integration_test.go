@@ -13,15 +13,16 @@ import (
 )
 
 // TestReclamoConcurrenteProduceGanadorYConflicto es la segunda prueba que exige
-// el prompt 07: dos reclamos concurrentes sobre la misma conversación, con la
-// misma versión esperada, producen EXACTAMENTE un ganador (versión avanzada) y
-// EXACTAMENTE un conflicto de versión para el perdedor (ErrConflictoVersion).
+// el prompt 07: dos reclamos concurrentes desde el pool sobre la misma
+// conversación, con la misma versión esperada, producen EXACTAMENTE un ganador
+// (versión avanzada) y EXACTAMENTE un conflicto de versión para el perdedor
+// (ErrConflictoVersion), y los dos intentos quedan auditados.
 //
 // Prueba de comportamiento contra Postgres real: afirma el conteo literal de
-// ganadores (1) y conflictos (1) y la versión resultante del ganador (2). El
-// árbitro real es el UPDATE condicional por (conversacion_id, version) sobre el
-// reclamo activo, serializado por el bloqueo de fila de Postgres. Se salta si
-// MENSAJERIA_TEST_DB no está definido.
+// ganadores (1) y conflictos (1), la versión resultante del ganador (2) y una
+// fila de auditoría por intento. El árbitro real es el índice único parcial
+// un_reclamo_activo_por_conversacion. Se salta si MENSAJERIA_TEST_DB no está
+// definido.
 func TestReclamoConcurrenteProduceGanadorYConflicto(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -39,13 +40,14 @@ func TestReclamoConcurrenteProduceGanadorYConflicto(t *testing.T) {
 	a := "22222222-2222-2222-2222-222222222222"
 	b := "33333333-3333-3333-3333-333333333333"
 
-	// Semilla: conversación abierta con un reclamo ACTIVO en versión 1.
+	// Semilla: conversación en el pool cuya versión vigente es 1 (un reclamo ya
+	// liberado), para que la carrera avance la versión en vez de abrir la primera.
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.conversacion (id, tenant_id, viaje_id, estado, siguiente_secuencia)
 		 VALUES ('`+convID+`', '`+tenant+`', gen_random_uuid(), 'abierta', 0)`)
 	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.reclamo (conversacion_id, tenant_id, actor_real, version)
-		 VALUES ('`+convID+`', '`+tenant+`', '`+a+`', 1)`)
+		`INSERT INTO mensajeria.reclamo (conversacion_id, tenant_id, actor_real, version, cerrado_en)
+		 VALUES ('`+convID+`', '`+tenant+`', '`+a+`', 1, now())`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
@@ -88,6 +90,19 @@ func TestReclamoConcurrenteProduceGanadorYConflicto(t *testing.T) {
 	}
 	if ganadores != 1 || conflictos != 1 {
 		t.Fatalf("se esperaba 1 ganador y 1 conflicto; hubo %d ganadores y %d conflictos", ganadores, conflictos)
+	}
+
+	// Los dos intentos quedan auditados: uno ganado y uno perdido (E3-T6).
+	for accion, quiere := range map[string]int{"reclamo.intento_ganado": 1, "reclamo.intento_perdido": 1} {
+		var n int
+		if err := admin.QueryRow(ctx,
+			`SELECT count(*) FROM mensajeria.auditoria_mensajeria WHERE conversacion_id = $1 AND accion = $2`,
+			convID, accion).Scan(&n); err != nil {
+			t.Fatalf("contar auditoría %s: %v", accion, err)
+		}
+		if n != quiere {
+			t.Fatalf("auditoría %s: %d filas, quiere %d", accion, n, quiere)
+		}
 	}
 }
 

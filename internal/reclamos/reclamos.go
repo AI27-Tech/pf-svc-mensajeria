@@ -1,10 +1,9 @@
 // Package reclamos es dueño del reclamo que autoriza a responder una
 // conversación: a lo más uno activo por conversación (índice único parcial
 // un_reclamo_activo_por_conversacion), con concurrencia optimista por versión
-// (Addendum §4 punto 5, mensajeria.md (e)). El scaffold implementa el camino que
-// el prompt 07 exige con lógica real: reclamar con la versión esperada, de modo
-// que dos reclamos concurrentes produzcan un ganador y un conflicto de versión
-// para el perdedor.
+// (Addendum §4 punto 5, mensajeria.md (e)). Reclamar solo procede desde el pool
+// (DEC-123), con la versión esperada, de modo que dos reclamos concurrentes
+// produzcan un ganador y un conflicto de versión para el perdedor.
 //
 // La transferencia (cerrar el reclamo anterior y abrir el siguiente en una sola
 // transacción, mensajeria.md (e)) está implementada; el override auditado de
@@ -82,13 +81,12 @@ func NewServicio(pool Begin, pub Publicador) *Servicio {
 	return &Servicio{pool: pool, pub: pub}
 }
 
-// Reclamar toma el reclamo activo de una conversación exigiendo la versión
-// esperada (concurrencia optimista). Devuelve la nueva versión si gana; si otro
-// reclamo avanzó la versión primero, devuelve ErrConflictoVersion y NO modifica
-// nada. La condición de carrera real la arbitra Postgres: el UPDATE condicional
-// por (conversacion_id, version) solo afecta una fila para un valor de versión,
-// así que de dos reclamos concurrentes con la misma versión esperada exactamente
-// uno encuentra la fila y el otro no.
+// Reclamar toma del pool el reclamo de una conversación exigiendo la versión
+// esperada (concurrencia optimista). Devuelve la nueva versión si gana. Si la
+// conversación ya tiene reclamo activo (aunque la versión sea la vigente,
+// DEC-123) o la versión no es la vigente, devuelve ErrConflictoVersion y NO
+// modifica nada. La carrera real la arbitra Postgres: de dos reclamos
+// concurrentes desde el pool, el índice único parcial deja abrir a uno solo.
 //
 // Cada intento queda en auditoria_mensajeria (E3-T6): el ganado en la misma tx
 // del reclamo, el perdido en una tx propia tras el conflicto.
@@ -140,45 +138,29 @@ func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actor
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Avanza la versión del reclamo activo solo si la versión esperada coincide.
-	var nueva int64
-	var reclamoID string
-	err = tx.QueryRow(ctx,
-		`UPDATE mensajeria.reclamo
-		    SET version = version + 1, actor_real = $3
-		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
-		    AND version = $4
-		  RETURNING id, version`,
-		conversacionID, tenantID, actorReal, int64(esperada),
-	).Scan(&reclamoID, &nueva)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		// No hay reclamo activo con esa versión: o hay uno activo en otra versión
-		// (conflicto), o la conversación está en el pool. Del pool se reclama con
-		// la versión vigente de la conversación (0 si nunca se reclamó) y el
-		// reclamo nuevo la avanza: la versión es monotónica por conversación, no
-		// por fila, así que una versión previa a una liberación o transferencia
-		// nunca vuelve a ser vigente (P20).
-		actual, hay, e := versionConversacion(ctx, tx, tenantID, conversacionID)
-		if e != nil {
-			return 0, e
-		}
-		if hay || esperada != actual {
-			return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual}
-		}
-		nueva = int64(actual) + 1
-		reclamoID, err = abrir(ctx, tx, tenantID, conversacionID, actorReal, nueva)
-		if esViolacionUnica(err) {
-			// Carrera del reclamo desde el pool (P19): otro abrió el reclamo entre la
-			// lectura y el INSERT, y el índice único parcial rechazó éste. El ganador
-			// abrió en la misma versión nueva.
-			return 0, ErrConflictoVersion{Esperada: esperada, Actual: msgtipos.VersionReclamo(nueva)}
-		}
-		if err != nil {
-			return 0, err
-		}
-	} else if err != nil {
-		return 0, fmt.Errorf("reclamos: reclamar: %w", err)
+	// Solo se reclama del pool (DEC-123): con reclamo activo es conflicto aunque
+	// la versión sea la vigente; cambiar de responsable es liberar o transferir
+	// (DEC-118, DEC-119). Del pool se reclama con la versión vigente de la
+	// conversación (0 si nunca se reclamó) y el reclamo nuevo la avanza: la
+	// versión es monotónica por conversación, no por fila, así que una versión
+	// previa a una liberación o transferencia nunca vuelve a ser vigente (P20).
+	actual, hay, err := versionConversacion(ctx, tx, tenantID, conversacionID)
+	if err != nil {
+		return 0, err
+	}
+	if hay || esperada != actual {
+		return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual}
+	}
+	nueva := int64(actual) + 1
+	reclamoID, err := abrir(ctx, tx, tenantID, conversacionID, actorReal, nueva)
+	if esViolacionUnica(err) {
+		// Carrera del reclamo desde el pool (P19): otro abrió el reclamo entre la
+		// lectura y el INSERT, y el índice único parcial rechazó éste. El ganador
+		// abrió en la misma versión nueva.
+		return 0, ErrConflictoVersion{Esperada: esperada, Actual: msgtipos.VersionReclamo(nueva)}
+	}
+	if err != nil {
+		return 0, err
 	}
 
 	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
@@ -189,10 +171,8 @@ func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actor
 		return 0, err
 	}
 
-	// Publica conversacion.reclamada en la MISMA tx (E3-T3). Refleja quién
-	// responde ahora y en qué versión: lo emiten los dos caminos (abrir el primer
-	// reclamo y reasignar/avanzar uno activo), porque ambos cambian el responsable
-	// que realtime debe mostrar.
+	// Publica conversacion.reclamada en la MISMA tx (E3-T3): quién responde ahora
+	// y en qué versión, que realtime debe mostrar.
 	if err := s.pub.Publish(ctx, tx, outbox.Event{
 		Tipo:         "conversacion.reclamada",
 		AgregadoID:   conversacionID,
