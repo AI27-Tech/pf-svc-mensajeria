@@ -31,10 +31,10 @@ func (f *casoFake) AgregarNota(context.Context, emergencias.EntradaNota) (string
 func (f *casoFake) Reclamar(context.Context, string, string, string, msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error) {
 	panic("no se invoca")
 }
-func (f *casoFake) Liberar(context.Context, string, string, string, string, msgtipos.VersionReclamo) error {
+func (f *casoFake) Liberar(context.Context, string, string, string, string, msgtipos.VersionReclamo, bool) error {
 	panic("no se invoca")
 }
-func (f *casoFake) Transferir(context.Context, string, string, string, string, msgtipos.VersionReclamo) error {
+func (f *casoFake) Transferir(context.Context, string, string, string, string, msgtipos.VersionReclamo, bool) error {
 	panic("no se invoca")
 }
 func (f *casoFake) Resolver(context.Context, string, string, string, msgtipos.VersionReclamo) error {

@@ -22,6 +22,7 @@ import (
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
 
@@ -63,6 +64,15 @@ func (e ErrConflictoVersion) Error() string {
 // ErrSinReclamo la devuelven las operaciones que exigen un reclamo activo cuando
 // no lo hay. El llamador decide si es 404 o un estado válido.
 var ErrSinReclamo = errors.New("emergencias: sin reclamo activo")
+
+// ErrNoEsResponsable la devuelven Liberar y Transferir cuando el actor no tiene el
+// reclamo activo ni mando (DEC-126). El llamador la mapea a 403 prohibido.
+var ErrNoEsResponsable = errors.New("emergencias: el actor no es el responsable activo")
+
+// TieneMando dice si el rol libera o transfiere casos ajenos: en V1, todo
+// Supervisor o Coordinador, sin verificar el mando sobre el responsable.
+// shortcut: no hay relación de mando en mensajeria (DEC-126), se verifica cuando exista (DT-06).
+func TieneMando(rol string) bool { return rol == "supervisor" || rol == "coordinador" }
 
 // ErrNoEncontrada la devuelven las operaciones sobre un caso inexistente para el
 // tenant. El llamador la mapea a 404.
@@ -254,55 +264,89 @@ func (s *Servicio) AgregarNota(ctx context.Context, in EntradaNota) (string, err
 	return notaID, nil
 }
 
-// Reclamar toma el reclamo del caso (abierta → en_atencion) exigiendo la versión
-// esperada. Avanza emergencia.version_reclamo y abre/continúa reclamo_emergencia
-// en una tx, y emite emergencia.reclamada. Conflicto de versión → ErrConflictoVersion.
+// Reclamar toma del pool el reclamo del caso (abierta → en_atencion) exigiendo la
+// versión esperada, y emite emergencia.reclamada. Si el caso ya tiene reclamo
+// activo (aunque la versión sea la vigente, DEC-125) o la versión no es la
+// vigente, devuelve ErrConflictoVersion sin modificar nada: cambiar de
+// responsable es liberar o transferir. Cada intento queda en
+// auditoria_mensajeria, como en la conversación (DEC-123): el ganado en la tx del
+// reclamo, el perdido en una tx propia tras el conflicto.
 func (s *Servicio) Reclamar(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error) {
 	if emergenciaID == "" || actorReal == "" {
 		return 0, fmt.Errorf("emergencias: reclamo inválido: faltan emergencia_id o actor_real")
 	}
 
+	nueva, err := s.reclamar(ctx, tenantID, emergenciaID, actorReal, esperada)
+	var conflicto ErrConflictoVersion
+	if errors.As(err, &conflicto) {
+		// La tx del intento ya se descartó (en la carrera Postgres la abortó con
+		// 23505): el perdedor solo compromete el hecho de que lo intentó.
+		if e := s.auditarIntentoPerdido(ctx, tenantID, emergenciaID, actorReal, conflicto); e != nil {
+			return 0, e
+		}
+	}
+	return nueva, err
+}
+
+// auditarIntentoPerdido registra el reclamo perdido en una tx propia.
+func (s *Servicio) auditarIntentoPerdido(ctx context.Context, tenantID, emergenciaID, actorReal string, c ErrConflictoVersion) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("emergencias: abrir transacción de auditoría: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: tenantID, ActorReal: actorReal,
+		Accion: auditoria.AccionEmergenciaReclamoPerdido,
+		Detalle: map[string]any{
+			"caso_emergencia_id": emergenciaID, "version_esperada": c.Esperada, "version_actual": c.Actual,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("emergencias: commit de la auditoría del intento perdido: %w", err)
+	}
+	return nil
+}
+
+// reclamar es el intento en su tx: abre el reclamo desde el pool, audita el
+// intento ganado, pone el caso en atención y publica emergencia.reclamada.
+func (s *Servicio) reclamar(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("emergencias: abrir transacción: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Avanzar la versión del reclamo activo solo si la esperada coincide.
-	var nueva int64
-	err = tx.QueryRow(ctx,
-		`UPDATE mensajeria.reclamo_emergencia
-		    SET version = version + 1, actor_real = $3
-		  WHERE emergencia_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
-		    AND version = $4
-		  RETURNING version`,
-		emergenciaID, tenantID, actorReal, int64(esperada),
-	).Scan(&nueva)
+	// Solo del pool (DEC-125), con la versión vigente del caso (0 si nunca se
+	// reclamó); el reclamo nuevo la avanza: monotónica por caso, no por fila (P20).
+	vigente, err := versionMaxima(ctx, tx, tenantID, emergenciaID)
+	if err != nil {
+		return 0, err
+	}
+	_, hay, err := versionActiva(ctx, tx, tenantID, emergenciaID)
+	if err != nil {
+		return 0, err
+	}
+	if hay || esperada != vigente {
+		return 0, ErrConflictoVersion{Esperada: esperada, Actual: vigente}
+	}
+	nueva := int64(vigente) + 1
+	reclamoID, err := abrirReclamo(ctx, tx, tenantID, emergenciaID, actorReal, nueva)
+	if err != nil {
+		return 0, err
+	}
 
-	if errors.Is(err, pgx.ErrNoRows) {
-		actual, hay, e := versionActiva(ctx, tx, tenantID, emergenciaID)
-		if e != nil {
-			return 0, e
-		}
-		if hay {
-			return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual}
-		}
-		// Sin reclamo activo, del pool se reclama con la versión vigente del caso (0
-		// si nunca se reclamó) y el reclamo nuevo la avanza: monotónica por caso, no
-		// por fila, como en la conversación (P20).
-		vigente, e := versionMaxima(ctx, tx, tenantID, emergenciaID)
-		if e != nil {
-			return 0, e
-		}
-		if esperada != vigente {
-			return 0, ErrConflictoVersion{Esperada: esperada, Actual: vigente}
-		}
-		nueva = int64(vigente) + 1
-		if _, err := abrirReclamo(ctx, tx, tenantID, emergenciaID, actorReal, nueva); err != nil {
-			return 0, err
-		}
-	} else if err != nil {
-		return 0, fmt.Errorf("emergencias: reclamar: %w", err)
+	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: tenantID, ActorReal: actorReal,
+		Accion: auditoria.AccionEmergenciaReclamoGanado,
+		Detalle: map[string]any{
+			"caso_emergencia_id": emergenciaID, "reclamo_id": reclamoID,
+			"version_esperada": esperada, "version_reclamo": nueva,
+		},
+	}); err != nil {
+		return 0, err
 	}
 
 	// El reclamo pone el caso en atención (ADR 21 §5).
@@ -332,9 +376,10 @@ func (s *Servicio) Reclamar(ctx context.Context, tenantID, emergenciaID, actorRe
 }
 
 // Liberar cierra el reclamo activo y devuelve el caso al pool (vuelve a abierta),
-// exigiendo rid y versión esperada. Conflicto → ErrConflictoVersion; sin reclamo
-// activo con ese rid y versión → ErrSinReclamo.
-func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo) error {
+// exigiendo rid y versión esperada. Sin reclamo activo → ErrSinReclamo; versión
+// no vigente o rid que no es el activo → ErrConflictoVersion; actor que no es el
+// responsable y no tiene mando → ErrNoEsResponsable (DEC-126).
+func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo, mando bool) error {
 	if emergenciaID == "" || reclamoID == "" {
 		return fmt.Errorf("emergencias: liberación inválida: faltan emergencia_id o reclamo_id")
 	}
@@ -345,24 +390,16 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoI
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	ct, err := tx.Exec(ctx,
-		`UPDATE mensajeria.reclamo_emergencia
-		    SET cerrado_en = now()
-		  WHERE id = $1 AND emergencia_id = $2 AND tenant_id = $3
-		    AND cerrado_en IS NULL AND version = $4`,
-		reclamoID, emergenciaID, tenantID, int64(esperada))
+	activo, err := tomarActivo(ctx, tx, tenantID, emergenciaID, actorReal, esperada, mando)
 	if err != nil {
-		return fmt.Errorf("emergencias: liberar: %w", err)
+		return err
 	}
-	if ct.RowsAffected() == 0 {
-		actual, hay, e := versionActiva(ctx, tx, tenantID, emergenciaID)
-		if e != nil {
-			return e
-		}
-		if hay {
-			return ErrConflictoVersion{Esperada: esperada, Actual: actual}
-		}
-		return ErrSinReclamo
+	if activo != reclamoID {
+		return ErrConflictoVersion{Esperada: esperada, Actual: esperada}
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE mensajeria.reclamo_emergencia SET cerrado_en = now() WHERE id = $1`, activo); err != nil {
+		return fmt.Errorf("emergencias: liberar: %w", err)
 	}
 
 	// Liberar devuelve el caso a la cola: vuelve a abierta. La fila del caso queda
@@ -397,11 +434,12 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoI
 }
 
 // Transferir mueve la responsabilidad del caso a otro miembro de Reacción: cierra
-// el reclamo activo del origen y abre uno nuevo para el destino en una tx,
-// conservando el estado del caso (ADR 21 §5). El reclamo nuevo abre en la versión
-// siguiente del caso, así que la previa queda obsoleta (P20). Conflicto →
-// ErrConflictoVersion; sin reclamo activo → ErrSinReclamo.
-func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, origen, destino string, esperada msgtipos.VersionReclamo) error {
+// el reclamo activo y abre uno nuevo para el destino en una tx, conservando el
+// estado del caso (ADR 21 §5). El reclamo nuevo abre en la versión siguiente del
+// caso, así que la previa queda obsoleta (P20). Mismas guardas que Liberar: sin
+// reclamo activo → ErrSinReclamo; versión no vigente → ErrConflictoVersion; actor
+// que no es el responsable y no tiene mando → ErrNoEsResponsable (DEC-126).
+func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, actor, destino string, esperada msgtipos.VersionReclamo, mando bool) error {
 	if emergenciaID == "" || destino == "" {
 		return fmt.Errorf("emergencias: transferencia inválida: faltan emergencia_id o destino")
 	}
@@ -412,25 +450,12 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, orige
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var anteriorID string
-	err = tx.QueryRow(ctx,
-		`UPDATE mensajeria.reclamo_emergencia
-		    SET cerrado_en = now()
-		  WHERE emergencia_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
-		    AND version = $3
-		  RETURNING id`,
-		emergenciaID, tenantID, int64(esperada)).Scan(&anteriorID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		actual, hay, e := versionActiva(ctx, tx, tenantID, emergenciaID)
-		if e != nil {
-			return e
-		}
-		if hay {
-			return ErrConflictoVersion{Esperada: esperada, Actual: actual}
-		}
-		return ErrSinReclamo
-	}
+	anteriorID, err := tomarActivo(ctx, tx, tenantID, emergenciaID, actor, esperada, mando)
 	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE mensajeria.reclamo_emergencia SET cerrado_en = now() WHERE id = $1`, anteriorID); err != nil {
 		return fmt.Errorf("emergencias: cerrar reclamo en transferencia: %w", err)
 	}
 
@@ -723,6 +748,35 @@ func leerEstadoYViaje(ctx context.Context, tx pgx.Tx, tenantID, emergenciaID str
 		return "", "", fmt.Errorf("emergencias: leer estado del caso: %w", err)
 	}
 	return estado, viajeID, nil
+}
+
+// tomarActivo bloquea el reclamo activo del caso (FOR UPDATE: una liberación o
+// transferencia concurrente espera a esta tx) y lo valida en este orden: que
+// exista (ErrSinReclamo), que la versión esperada sea la vigente
+// (ErrConflictoVersion) y que el actor sea su responsable o tenga mando
+// (ErrNoEsResponsable, DEC-126). Devuelve su id.
+func tomarActivo(ctx context.Context, tx pgx.Tx, tenantID, emergenciaID, actor string, esperada msgtipos.VersionReclamo, mando bool) (string, error) {
+	var id, responsable string
+	var version int64
+	err := tx.QueryRow(ctx,
+		`SELECT id::text, actor_real::text, version FROM mensajeria.reclamo_emergencia
+		  WHERE emergencia_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL
+		  FOR UPDATE`,
+		emergenciaID, tenantID,
+	).Scan(&id, &responsable, &version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrSinReclamo
+	}
+	if err != nil {
+		return "", fmt.Errorf("emergencias: leer reclamo activo: %w", err)
+	}
+	if version != int64(esperada) {
+		return "", ErrConflictoVersion{Esperada: esperada, Actual: msgtipos.VersionReclamo(version)}
+	}
+	if responsable != actor && !mando {
+		return "", ErrNoEsResponsable
+	}
+	return id, nil
 }
 
 // versionActiva devuelve la versión del reclamo activo del caso.

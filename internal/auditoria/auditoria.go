@@ -33,6 +33,11 @@ const (
 	AccionReclamoLiberado      = "reclamo.liberado"
 	AccionReclamoTransferido   = "reclamo.transferido"
 	AccionConversacionAtendida = "conversacion.atendida"
+
+	// El reclamo de emergencia no tiene conversación: va con conversacion_id NULL
+	// y el caso en detalle.caso_emergencia_id (DEC-125).
+	AccionEmergenciaReclamoGanado  = "emergencia.reclamo.intento_ganado"
+	AccionEmergenciaReclamoPerdido = "emergencia.reclamo.intento_perdido"
 )
 
 // Ejecutor es lo mínimo para insertar: lo cumplen pgx.Tx y el pool.
@@ -42,6 +47,7 @@ type Ejecutor interface {
 
 // Registro es un hecho auditable. Detalle va a la columna jsonb; su clave
 // "motivo", si existe, es la que listarAuditoriaConversacion expone como motivo.
+// ConversacionID vacío se guarda NULL (hechos que no son de una conversación).
 type Registro struct {
 	TenantID       string
 	ConversacionID string
@@ -54,7 +60,7 @@ type Registro struct {
 func Registrar(ctx context.Context, db Ejecutor, r Registro) error {
 	_, err := db.Exec(ctx,
 		`INSERT INTO mensajeria.auditoria_mensajeria (tenant_id, conversacion_id, actor_real, accion, detalle)
-		 VALUES ($1, $2, $3, $4, $5)`,
+		 VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5)`,
 		r.TenantID, r.ConversacionID, r.ActorReal, r.Accion, r.Detalle)
 	if err != nil {
 		return fmt.Errorf("auditoria: registrar %s: %w", r.Accion, err)
