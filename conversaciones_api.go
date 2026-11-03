@@ -33,6 +33,7 @@ import (
 // errores con convhttp.TraducirAtencion, la MISMA función que usan sus handlers.
 type ConversacionesAPI interface {
 	ObtenerConversacion(ctx context.Context, conversacionID msgclient.Id) (*msgclient.Conversacion, error)
+	ObtenerConversacionDeViaje(ctx context.Context, viajeID msgclient.Id) (*msgclient.Conversacion, error)
 	ListarMensajes(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarMensajesParams) (*msgclient.PaginaMensajes, error)
 	EnviarMensaje(ctx context.Context, conversacionID msgclient.Id, body msgclient.EnviarMensajeEntrada) (*msgclient.Mensaje, error)
 	ListarTrabajoBandeja(ctx context.Context, params msgclient.ListarTrabajoMiBandejaParams) (*msgclient.TrabajoBandeja, error)
@@ -81,6 +82,16 @@ func (a *conversacionesAPI) ObtenerConversacion(ctx context.Context, conversacio
 		return nil, traducir(err)
 	}
 	return conv, nil
+}
+
+// ObtenerConversacionDeViaje recorre el MISMO camino que el handler
+// (convhttp.Handlers.ObtenerDeViaje): resolver por viaje → acceso → lectura.
+func (a *conversacionesAPI) ObtenerConversacionDeViaje(ctx context.Context, viajeID msgclient.Id) (*msgclient.Conversacion, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return a.conv.ObtenerDeViaje(ctx, claims, viajeID.String())
 }
 
 func (a *conversacionesAPI) ListarMensajes(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarMensajesParams) (*msgclient.PaginaMensajes, error) {

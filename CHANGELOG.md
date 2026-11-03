@@ -34,6 +34,33 @@
 
 **Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria ./cmd/migrate`, `go test -race ./...` con `MENSAJERIA_TEST_DB` (Postgres local, base desechable: 63 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Antes del arreglo, las dos pruebas nuevas y la de P20 actualizada fallaban (versiones `[1 1 1]`, transferir abría en 1, liberar ajeno `204`).
 
+## 2026-11-03 10:39 — Conversación por viaje y mensaje del cliente que desmarca atendida (E9-T8, DEC-122 #1)
+
+**Para quién:** el `bff` y `pf-svc-core` en proceso, que solo conocen el `viaje_id` y necesitan el `id` de la conversación para listar y enviar; y la bandeja interna, que veía como atendida una conversación con un mensaje del cliente sin contestar.
+
+**Resumen:** mensajeria implementa `obtenerConversacionDeViaje` (`GET /api/v1/viajes/{id}/conversacion`, contrato `tracer.33`) por HTTP y en `ConversacionesAPI`, y un mensaje nuevo del cliente desmarca atendida en la misma tx del envío.
+
+**Comportamiento:**
+- `{id}` es el `viaje_id`. Devuelve la conversación no cerrada del viaje; si todas están cerradas, la más reciente por `creado_en` (la tabla no guarda la hora de cierre). Misma forma y misma guarda que `obtenerConversacion`. Sin conversación, sin acceso (otro cliente, interno sin membresía, otro tenant) o `{id}` que no es UUID: `404`, como pide el contrato. Sin claims: `401`.
+- Mensaje nuevo del cliente: `estado_atendido.atendida = false` en la tx del mensaje y su outbox (DEC-122 #1). El envío interno no la toca (DEC-117). El reintento idempotente no es mensaje nuevo y no desmarca. No se publica evento propio: el registro del contrato no tiene uno para desmarcar.
+
+**Cambios:**
+- `go.mod`: `api-client-go` de `tracer.31` a `tracer.33`. Sin renombres de enum.
+- `internal/conversacion`: `ConversacionDeViaje`; `Enviar` desmarca atendida si el autor es el cliente.
+- `adapters/http/conversacion`: ruta nueva y `Handlers.ObtenerDeViaje`, el camino que comparten HTTP y la superficie en proceso.
+- `ConversacionesAPI`: `ObtenerConversacionDeViaje(ctx, viajeID msgclient.Id) (*msgclient.Conversacion, error)`.
+
+**Archivos modificados:**
+- `go.mod`, `go.sum`
+- `internal/conversacion/conversacion.go`
+- `adapters/http/conversacion/conversacion.go`
+- `conversaciones_api.go`
+- `conversacion_de_viaje_integration_test.go` (nuevo)
+- `adapters/http/conversacion/atencion_integration_test.go`
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria ./cmd/migrate`, `go test -race ./...` con `MENSAJERIA_TEST_DB` (Postgres local, base desechable: 63 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK.
+
 ## 2026-11-02 18:03 — Atendida, recibos con P23 y auditoría inmutable (E3-T6)
 
 **Para quién:** el `bff` (y `pf-svc-core` en proceso), que ya montan `/atendida` y `/recibos/*` y hoy reciben 404 de mensajeria; y el Administrador, que podrá leer la auditoría de una conversación.

@@ -55,6 +55,7 @@ type Enviador interface {
 	MensajePorID(ctx context.Context, tenantID, mensajeID string) (*msgclient.Mensaje, error)
 	ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error)
 	ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error)
+	ConversacionDeViaje(ctx context.Context, tenantID, viajeID string) (string, error)
 	ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error)
 }
 
@@ -80,6 +81,7 @@ type Handlers struct {
 // auth.Middleware, de modo que aquí los claims ya están en el contexto.
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/conversaciones/{id}", h.obtener)
+	mux.HandleFunc("GET /api/v1/viajes/{id}/conversacion", h.obtenerDeViaje)
 	mux.HandleFunc("GET /api/v1/conversaciones/{id}/mensajes", h.listarMensajes)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/reclamos", h.reclamar)
 	mux.HandleFunc("DELETE /api/v1/conversaciones/{id}/reclamos/{rid}", h.liberar)
@@ -119,6 +121,56 @@ func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	escribirJSON(w, http.StatusOK, conv)
+}
+
+// obtenerDeViaje atiende GET /api/v1/viajes/{id}/conversacion
+// (obtenerConversacionDeViaje): {id} es el viaje_id.
+func (h Handlers) obtenerDeViaje(w http.ResponseWriter, r *http.Request) {
+	claims := boundary.Claims(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	conv, err := h.ObtenerDeViaje(r.Context(), claims, r.PathValue("id"))
+	if err != nil {
+		escribirError(w, err)
+		return
+	}
+	escribirJSON(w, http.StatusOK, conv)
+}
+
+// ObtenerDeViaje resuelve la conversación del viaje, autoriza el acceso con la
+// misma guarda que obtenerConversacion y la hidrata. Sin acceso responde 404,
+// igual que un viaje sin conversación (contrato: poseer el viaje_id no
+// autoriza). Devuelve errores ya traducidos a la taxonomía. Exportada para que
+// la superficie en proceso (mensajeria.ConversacionesAPI) siga el MISMO camino.
+func (h Handlers) ObtenerDeViaje(ctx context.Context, claims *auth.Claims, viajeID string) (*msgclient.Conversacion, error) {
+	noEncontrada := platformerrors.NewNoEncontrado("conversacion no encontrada")
+	viaje, err := uuid.Parse(viajeID)
+	if err != nil {
+		return nil, noEncontrada // un id que no es UUID no nombra ningún viaje
+	}
+	convID, err := h.Conversacion.ConversacionDeViaje(ctx, claims.TenantID, viaje.String())
+	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
+		return nil, noEncontrada
+	}
+	if err != nil {
+		return nil, traducir(err)
+	}
+	if err := h.Autz.PuedeEscribir(ctx, claims.TenantID, convID, claims); err != nil {
+		if platformerrors.AsCategory(err) == platformerrors.CategoryNoAutorizado {
+			return nil, noEncontrada
+		}
+		return nil, err
+	}
+	conv, err := h.Conversacion.ObtenerConversacion(ctx, claims.TenantID, convID)
+	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
+		return nil, noEncontrada
+	}
+	if err != nil {
+		return nil, traducir(err)
+	}
+	return conv, nil
 }
 
 // listarMensajes atiende GET /api/v1/conversaciones/{id}/mensajes: historia por

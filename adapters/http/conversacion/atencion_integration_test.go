@@ -377,3 +377,56 @@ func TestAuditoriaInmutableHTTP(t *testing.T) {
 }
 
 func textoPtr(s string) *string { return &s }
+
+// TestMensajeClienteDesmarcaAtendidaHTTP: un mensaje nuevo del cliente desmarca
+// atendida (DEC-122 #1); una respuesta interna no la toca (DEC-117), y el
+// reintento idempotente del cliente no es mensaje nuevo.
+func TestMensajeClienteDesmarcaAtendidaHTTP(t *testing.T) {
+	e := montarAtencion(t)
+
+	if rec := e.pedir(atEjec, "ejecutivo", http.MethodPost, rutaConv+"/reclamos", msgclient.VersionEsperadaEntrada{}); rec.Code != http.StatusCreated {
+		t.Fatalf("reclamar: status %d; cuerpo %s", rec.Code, rec.Body.String())
+	}
+	marcar := func() {
+		t.Helper()
+		if rec := e.pedir(atEjec, "ejecutivo", http.MethodPost, rutaConv+"/atendida", msgclient.VersionEsperadaEntrada{VersionEsperada: 1}); rec.Code != http.StatusNoContent {
+			t.Fatalf("marcar atendida: status %d; cuerpo %s", rec.Code, rec.Body.String())
+		}
+	}
+	enviar := func(sub, rol string, cmid uuid.UUID) {
+		t.Helper()
+		in := msgclient.EnviarMensajeEntrada{ClientMessageId: cmid, Cuerpo: "m"}
+		if rol != "cliente" {
+			v1 := msgclient.VersionReclamo(1)
+			in.VersionReclamoEsperada = &v1
+		}
+		if rec := e.pedir(sub, rol, http.MethodPost, rutaConv+"/mensajes", in); rec.Code != http.StatusCreated {
+			t.Fatalf("enviar como %s: status %d; cuerpo %s", rol, rec.Code, rec.Body.String())
+		}
+	}
+	atendida := func() bool { return obtenerConv(t, e).AtendidaEn != nil }
+
+	marcar()
+	enviar(atEjec, "ejecutivo", uuid.New())
+	if !atendida() {
+		t.Fatalf("una respuesta interna desmarcó atendida; quiere atendida")
+	}
+
+	cmid := uuid.New()
+	enviar(atCliente, "cliente", cmid)
+	if atendida() {
+		t.Fatalf("tras mensaje del cliente: atendida; quiere desmarcada")
+	}
+	if n := e.entero(t, `SELECT count(*) FROM mensajeria.estado_atendido WHERE conversacion_id = '`+atConv+`' AND atendida`); n != 0 {
+		t.Fatalf("filas atendidas tras mensaje del cliente: %d, quiere 0", n)
+	}
+
+	marcar()
+	enviar(atCliente, "cliente", cmid) // reintento: devuelve el original, no es mensaje nuevo
+	if !atendida() {
+		t.Fatalf("el reintento idempotente del cliente desmarcó atendida; quiere atendida")
+	}
+	if n := e.entero(t, `SELECT count(*) FROM mensajeria.mensaje WHERE conversacion_id = '`+atConv+`'`); n != 2 {
+		t.Fatalf("mensajes: %d, quiere 2", n)
+	}
+}
