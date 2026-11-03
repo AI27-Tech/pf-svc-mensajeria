@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## 2026-11-02 18:03 — Atendida, recibos con P23 y auditoría inmutable (E3-T6)
+
+**Para quién:** el `bff` (y `pf-svc-core` en proceso), que ya montan `/atendida` y `/recibos/*` y hoy reciben 404 de mensajeria; y el Administrador, que podrá leer la auditoría de una conversación.
+
+**Resumen:** mensajeria implementa `marcarAtendida`, `registrarReciboEntregado`, `registrarReciboLeido` y `listarAuditoriaConversacion` (contrato `tracer.31`, sin subir pin), por HTTP y en `ConversacionesAPI` sobre las mismas instancias de casos de uso.
+
+**Comportamiento:**
+- `marcarAtendida` es acción explícita del responsable activo con versión esperada (DEC-117); enviar no la marca. No responsable → `no_autorizado` (401; el contrato dice 403 pero la taxonomía de la plataforma no tiene prohibido). Sin reclamo activo o versión obsoleta → 409. Marca, auditoría y `conversacion.atendida` en una tx.
+- Recibos: avanzan el cursor personal (`cursor_participante`), nunca retroceden y se recortan a la última secuencia; leer implica entregado. El "leído por AI27" visible al cliente (`conversacion.leido_ai27_hasta`) solo lo mueve el recibo de lectura del responsable activo (P23). Leer la historia no escribe cursores. Publica `recibo.entregado`/`recibo.leido` solo si el cursor personal avanzó.
+- Auditoría inmutable: intento de reclamo ganado (en la tx del reclamo), intento perdido (en tx propia tras el conflicto), liberación, transferencia y atendida. El rol de app no tiene `UPDATE`/`DELETE` sobre la tabla y no hay ruta que edite o borre. Lectura solo para `administrador` (DEC-036), paginada de 50 en 50.
+- Corrección: en la carrera del PRIMER reclamo (dos `version_esperada = 0` sobre una conversación sin reclamo), el perdedor recibía 502 por la violación de índice único sin mapear. Ahora recibe 409 (P19).
+
+**Cambios:**
+- Migración `0006_auditoria_recibos.sql`: `auditoria_mensajeria.registro_id` (UUID del contrato), índices `(conversacion_id, ocurrido_en)` y `(actor_real, ocurrido_en)`, columna `conversacion.leido_ai27_hasta`. Aditiva e idempotente; sin grants nuevos.
+- `internal/auditoria`: deja de ser stub (`Registrar` en la tx del llamador, `Listar`).
+- `internal/reclamos`: audita cada intento, la liberación y la transferencia; mapea 23505 a conflicto.
+- `internal/conversacion`: `MarcarAtendida`, `RegistrarRecibo`, `ErrNoEsResponsable`.
+- `adapters/http/conversacion`: cuatro rutas nuevas y `TraducirAtencion`, que comparten HTTP y la superficie en proceso.
+- `ConversacionesAPI`: `MarcarAtendida`, `RegistrarReciboEntregado`, `RegistrarReciboLeido`, `ListarAuditoriaConversacion`.
+
+**Archivos modificados:**
+- `migrations/mensajeria/0006_auditoria_recibos.sql` (nuevo)
+- `internal/auditoria/auditoria.go` (nuevo; reemplaza `doc.go`)
+- `internal/conversacion/atencion.go` (nuevo)
+- `internal/reclamos/reclamos.go`
+- `adapters/http/conversacion/atencion.go` (nuevo), `adapters/http/conversacion/conversacion.go`
+- `conversaciones_api.go`, `mensajeria.go`
+- `adapters/http/conversacion/atencion_integration_test.go` (nuevo), `atencion_api_integration_test.go` (nuevo)
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria`, `go test ./...` con `MENSAJERIA_TEST_DB` (Postgres 18 local, 55 pruebas PASS, 0 SKIP) y sin él, `-race` en los paquetes tocados, `arch-test@v0.1.1` OK. Migraciones aplicadas dos veces seguidas sin error.
+
 ## 2026:11:02 16:57 — Superficie en proceso de conversación y bandeja (`ConversacionesAPI`)
 
 **Para quién:** `pf-svc-core`, que compone bff y mensajeria en un solo binario. Al subir core a bff v0.1.12 su adaptador `BFFMensajeriaEnProceso` ya no cumple `agregacion.MensajeriaPort`, porque el puerto pide conversación y bandeja y mensajeria solo exponía `EmergenciasAPI` en proceso. Con `Module.Conversaciones()` el adaptador de core queda en reenviar y descartar el bearer.

@@ -1,10 +1,8 @@
 // Package conversacion contiene los handlers HTTP ENTRANTES de la conversación
-// de negocio (arista bff → mensajeria, siempre HTTP; addendum §5). Hoy monta
-// ReclamarConversacion sobre internal/reclamos detrás de la guarda de
-// internal/autorizacion (DEC-097). EnviarMensaje NO se monta aún: su respuesta
-// de contrato exige alias_mostrado (identidad comercial por cliente, DEC-097
-// forma 1), que se persiste en el camino de escritura del dominio; ese cambio va
-// en su propio slice.
+// de negocio (arista bff → mensajeria, siempre HTTP; addendum §5): lectura,
+// envío, reclamo/liberación/transferencia, atendida, recibos y la auditoría de
+// la conversación (E3-T6), detrás de la guarda de internal/autorizacion
+// (DEC-097).
 //
 // Los tipos de request/response son los generados de pf-pkg-contracts (tracer.7),
 // nunca escritos a mano (golang-best-practices §3, regla 6).
@@ -73,6 +71,8 @@ type Handlers struct {
 	Reclamo      LectorReclamo
 	Conversacion Enviador
 	Catalogos    CatalogosLector
+	Atencion     Atendedor
+	Auditoria    LectorAuditoria
 }
 
 // Montar registra las rutas de conversación en el mux. El bff antepone
@@ -84,6 +84,10 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/conversaciones/{id}/reclamos/{rid}", h.liberar)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/transferencias", h.transferir)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/mensajes", h.enviar)
+	mux.HandleFunc("POST /api/v1/conversaciones/{id}/atendida", h.marcarAtendida)
+	mux.HandleFunc("POST /api/v1/conversaciones/{id}/recibos/entregado", h.registrarRecibo(conversacion.ReciboEntregado))
+	mux.HandleFunc("POST /api/v1/conversaciones/{id}/recibos/leido", h.registrarRecibo(conversacion.ReciboLeido))
+	mux.HandleFunc("GET /api/v1/auditoria/conversaciones/{id}", h.listarAuditoria)
 }
 
 // obtener atiende GET /api/v1/conversaciones/{id}: hidrata el agregado
