@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## 2026-11-03 11:56 — Reclamar solo desde el pool (DEC-123) y versión monotónica del reclamo de emergencia
+
+**Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno (bandeja de conversaciones y de Reacción). Cambia lo que observan: `POST /reclamos` sobre una conversación que ya tiene responsable responde `409` aunque mande la versión vigente; y el reclamo de un caso de emergencia ya no reabre en versión 1 al transferir.
+
+**Resumen:** dos defectos reportados en el PR #41. Otro miembro del pool con la versión vigente se quedaba con una conversación ajena (medido: `201`, el reclamo pasaba a B). `emergencias.Transferir` reabría el reclamo del caso en versión 1, el mismo defecto que el PR #41 corrigió para conversaciones (medido: tras A→B, la transferencia B→A con versión 2 daba conflicto con versión actual 1).
+
+**Comportamiento:**
+- `reclamarConversacion` (HTTP y `ConversacionesAPI`) solo procede si la conversación está en el pool (DEC-123). Con reclamo activo responde `409 conflicto`, también para el propio responsable que re-reclama. El intento queda auditado como `reclamo.intento_perdido`. Para cambiar de responsable, el responsable libera o transfiere (DEC-118, DEC-119).
+- La carrera de dos reclamos desde el pool no cambia: uno `201`, otro `409`, los dos auditados.
+- Emergencia: la versión del reclamo es monotónica POR CASO. Reclamar desde el pool y transferir abren en la versión más alta del caso + 1; tras A→B→A las versiones son 1, 2, 3 y una versión previa da conflicto en transferir, liberar, resolver y reclamar. La `version_reclamo` del caso (`listarEmergencias`) refleja la versión nueva tras transferir y la vigente tras liberar. Del pool, una versión distinta de la vigente da conflicto (antes solo se aceptaba `0`).
+- `emergencia.transferida` lleva `version_reclamo` y `reclamo_anterior_id`, que el contrato ya declaraba y el payload omitía.
+- Emergencia, sin cambio: liberar y transferir siguen sin exigir que quien llama sea el responsable (ADR 21 §5, DEC-099: Supervisor y Coordinador pueden liberar o transferir el reclamo de sus miembros de Reacción). Reclamar un caso con responsable y la versión vigente sigue reasignándolo (fuera del alcance de DEC-123).
+
+**Cambios:**
+- `internal/reclamos`: `reclamar` ya no avanza un reclamo activo; solo abre desde el pool. Se borra el `UPDATE` que reasignaba.
+- `internal/emergencias`: `versionMaxima`; `abrirReclamo` recibe la versión, devuelve el id y traduce la violación de unicidad a `ErrConflictoVersion`; `Transferir` abre en la versión siguiente y la refleja en la fila del caso; `Liberar` deja el caso en la versión vigente.
+- `adapters/http/conversacion`: comentario de `reclamar`.
+- Pruebas: B reclama la conversación de A con la versión vigente (`409` por HTTP y en proceso, el reclamo sigue con A, intentos auditados) y B reclama del pool tras liberar (`201`, versión 2); emergencia A→B→A con versiones `[1 2 3]`, conflictos con la versión previa y reclamo del pool en versión 4. La prueba de concurrencia de `internal/reclamos` sembraba un reclamo activo y esperaba que uno de los dos lo tomara: ahora la carrera es desde el pool y afirma la auditoría de los dos intentos.
+
+**Archivos modificados:**
+- `internal/reclamos/reclamos.go`, `internal/reclamos/reclamos_integration_test.go`
+- `internal/emergencias/emergencias.go`, `internal/emergencias/emergencias_integration_test.go`
+- `adapters/http/conversacion/conversacion.go`
+- `adapters/http/conversacion/reclamar_pool_integration_test.go` (nuevo)
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/...`, `go test -race -p 1 ./...` con `MENSAJERIA_TEST_DB` (Postgres local, base desechable: 67 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Antes del arreglo, la prueba de DEC-123 fallaba (B recibía `201`) y la de emergencia también (`B→A: esperada 2, actual 1`).
+
 ## 2026-11-03 10:46 — Versión de reclamo monotónica, solo el responsable libera o transfiere y 403 real
 
 **Para quién:** el `bff`, `pf-svc-core` en proceso y los dos portales. Cambia lo que observan: un Ejecutivo que no tiene el reclamo ya no puede liberar ni transferir; las denegaciones por facultad pasan de `401` a `403`; y la `version_reclamo` de una conversación en el pool deja de ser `0` tras el primer reclamo.
