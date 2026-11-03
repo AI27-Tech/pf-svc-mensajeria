@@ -1,7 +1,8 @@
 // Package bandejas contiene el handler HTTP entrante del trabajo de una bandeja
 // (arista bff → mensajeria). Monta listarTrabajoBandeja (contrato tracer.14, M3):
 // el bootstrap y el catch-up incremental de la colección de bandeja (ADR 28 §3).
-// Detrás de la guarda de internal/autorizacion (membresía de pool).
+// Detrás de la guarda de internal/autorizacion (rol para la bandeja de chat,
+// membresía de pool para Reacción; DEC-127).
 package bandejas
 
 import (
@@ -15,6 +16,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 )
 
@@ -27,10 +29,15 @@ type Autorizador interface {
 type Trabajador interface {
 	Trabajo(ctx context.Context, tenantID, bandejaID string) ([]msgclient.Conversacion, int64, error)
 	CambiosDesde(ctx context.Context, tenantID, bandejaID string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
-	// ResolverMiBandeja da el id de la bandeja de chat del sujeto por su membresía
-	// efectiva del pool (cola única, DEC-103). Sin pool de chat -> ErrBandejaNoEncontrada.
-	ResolverMiBandeja(ctx context.Context, tenantID, usuarioID string) (string, error)
+	// ResolverMiBandeja da el id de la bandeja única de conversaciones del tenant
+	// (DEC-127). Sin bandeja de chat -> ErrBandejaNoEncontrada.
+	ResolverMiBandeja(ctx context.Context, tenantID string) (string, error)
 }
+
+// SinBandejaChat es el mensaje del 404 de la bandeja del sujeto: rol que no es
+// miembro o tenant sin bandeja de conversaciones. Lo comparte la superficie en
+// proceso.
+const SinBandejaChat = "el sujeto no pertenece a ningún pool de chat"
 
 // Handlers agrupa las dependencias del handler de bandejas.
 type Handlers struct {
@@ -45,7 +52,8 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 }
 
 // trabajo sirve el trabajo de una bandeja NOMBRADA por {id} (uso administrativo).
-// Autoriza por membresía de pool en esa bandeja (DEC-097, Addendum §7).
+// Autoriza con PuedeVerBandeja: rol `ejecutivo` en la de chat (DEC-127),
+// membresía de pool en la de Reacción (Addendum §7).
 func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -61,23 +69,25 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 	h.servirTrabajo(w, r, claims.TenantID, bandejaID)
 }
 
-// miTrabajo sirve el trabajo de la bandeja del SUJETO, sin {id} (cola única e
-// implícita, DEC-103). La bandeja la resuelve la membresía efectiva del pool:
-// resolverla ES la autorización (si hay bandeja, el sujeto es miembro activo de
-// ella por construcción), así que no hace falta una guarda PuedeVerBandeja
-// aparte. Un cliente no tiene bandeja de chat -> 404 por la misma vía que un
-// interno sin pool. Un sujeto en más de una bandeja de chat (dato inconsistente
-// con la cola única) -> error interno, no se elige una en silencio.
+// miTrabajo sirve el trabajo de la bandeja del SUJETO, sin {id} (bandeja única,
+// DEC-127). Todo Ejecutivo es miembro por su rol; cualquier otro rol (y el
+// cliente) recibe 404, la misma respuesta que antes recibía quien no tenía
+// membresía. Ser Ejecutivo y resolver la bandeja del tenant ES la autorización,
+// así que no hace falta una guarda PuedeVerBandeja aparte.
 func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
 		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
 		return
 	}
-	bandejaID, err := h.Bandeja.ResolverMiBandeja(r.Context(), claims.TenantID, claims.Subject)
+	if !autorizacion.EsMiembroBandejaChat(claims.Rol) {
+		escribirError(w, platformerrors.NewNoEncontrado(SinBandejaChat))
+		return
+	}
+	bandejaID, err := h.Bandeja.ResolverMiBandeja(r.Context(), claims.TenantID)
 	if err != nil {
 		if errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-			escribirError(w, platformerrors.NewNoEncontrado("el sujeto no pertenece a ningún pool de chat"))
+			escribirError(w, platformerrors.NewNoEncontrado(SinBandejaChat))
 			return
 		}
 		escribirError(w, traducir(err))

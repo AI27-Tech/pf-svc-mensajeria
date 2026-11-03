@@ -1,5 +1,41 @@
 # CHANGELOG
 
+## 2026-11-03 13:00 — Conversación por empresa cliente (DEC-124) y bandeja única con membresía por rol (DEC-127)
+
+**Para quién:** el `bff`, `pf-svc-core` en proceso, los dos portales y la siembra de la demo. Cambia lo que observan: cualquier usuario del portal de la empresa cliente abre y escribe la conversación de su viaje; la conversación nueva aparece sola en la bandeja de todo Ejecutivo; la demo ya no siembra bandejas, rutas ni `pool_membresia` para conversaciones.
+
+**Resumen:** dos defectos medidos en el smoke de core del 2026-11-03. El cliente solo abría su conversación si el `sub` del token era igual a `conversacion.cliente_id`; con Keycloak el `sub` es la persona y el tenant es la empresa, así que nunca coincidían (404). Y la conversación creada por `viaje.mensajeria_habilitada` no quedaba en ninguna bandeja, y el Ejecutivo solo era miembro con una fila sembrada en `pool_membresia`.
+
+**Comportamiento:**
+- Audiencia Cliente: autoriza si el tenant del token es el `cliente_id` de la conversación (DEC-124, DEC-112). El `sub` ya no decide. Aplica a todas las rutas de cliente, HTTP y `ConversacionesAPI`, incluida `obtenerConversacionDeViaje`. Toda consulta sigue acotada por tenant: un cliente de otro tenant recibe `404`.
+- La conversación nace enrutada a la bandeja única de conversaciones de su tenant, en la misma transacción que la crea. Si el tenant no tiene bandeja de chat, se crea (`Conversaciones`). La ruta entra con revisión nueva, así que el catch-up la reporta como alta. Un lock transaccional por tenant evita dos bandejas cuando llegan varias conversaciones a la vez.
+- Membresía por rol (DEC-127): todo usuario con rol `ejecutivo` es miembro de la bandeja de chat sin filas en `pool_membresia`. Aplica a leer, enviar, reclamar, liberar, transferir, atendida y recibos (`internoPuede`), a `listarTrabajoMiBandeja` (HTTP y en proceso) y a `listarTrabajoBandeja` sobre una bandeja de chat.
+- Otro rol interno (monitorista, supervisor, coordinador…) recibe la misma denegación que antes sin membresía: `401` sobre la conversación, `404` en la bandeja del sujeto. Una fila sembrada en `pool_membresia` ya no da acceso a conversaciones.
+- Si un tenant tiene más de una bandeja de chat (siembra anterior), la única es la más antigua. Desaparece `ErrMembresiaAmbigua`.
+- Sin cambio: la bandeja de Reacción y los casos de emergencia siguen exigiendo membresía en `pool_membresia` (DEC-028). Las tablas `pool_membresia` se conservan.
+
+**Migración:** `0008_bandeja_unica.sql`. Crea la bandeja de chat del tenant que tiene conversaciones sin ruta y no tiene bandeja de chat, y enruta cada conversación sin ruta activa a la bandeja de chat más antigua de su tenant, con revisiones nuevas y `bandeja.revision` al día. No toca rutas existentes. Idempotente: `cmd/migrate` (el de este repo y el de core, que embebe `migrations.FS`) la reaplica sin efecto.
+
+**Cambios:**
+- `internal/autorizacion`: `clientePuede` compara tenant contra `cliente_id`; `internoPuede` exige rol `ejecutivo` y ruta activa a una bandeja de chat; `PuedeVerBandeja` decide por rol en la de chat y por membresía en las demás; nuevo `EsMiembroBandejaChat`.
+- `internal/bandejas`: `ResolverMiBandeja(ctx, tenantID)` devuelve la bandeja de chat más antigua del tenant; nuevo `EnrutarABandejaUnica` (crea bandeja si falta, avanza revisión, inserta ruta) en la tx del llamador.
+- `internal/conversacion`: `CrearPorEvento` enruta la conversación nueva en su transacción.
+- `adapters/http/bandejas`, `conversaciones_api.go`: la bandeja del sujeto exige rol `ejecutivo`; mensaje del 404 compartido (`SinBandejaChat`).
+- `adapters/http/conversacion`: comentarios.
+- Pruebas: las de conversación ya no siembran `pool_membresia` y usan tenant = cliente; los actores sin acceso pasan a ser monitorista. Nuevas: evento → bandeja del Ejecutivo → reclamo → persona de la empresa lee y escribe, sin filas sembradas; migración 0008 sobre datos previos y reaplicada; ocho creaciones concurrentes de un tenant nuevo dan una sola bandeja y revisiones 1..8.
+
+**Archivos modificados:**
+- `internal/autorizacion/autorizacion.go`, `internal/autorizacion/autorizacion_integration_test.go`
+- `internal/bandejas/bandejas.go`, `internal/bandejas/bandejas_integration_test.go`, `internal/bandejas/bandeja_unica_integration_test.go` (nuevo)
+- `internal/conversacion/conversacion.go`, `internal/conversacion/ciclo_vida_test.go`
+- `adapters/http/bandejas/bandejas.go`, `adapters/http/bandejas/bandejas_test.go`, `adapters/http/bandejas/bandejas_integration_test.go`
+- `adapters/http/conversacion/conversacion.go` y sus pruebas `atencion_`, `conversacion_`, `enviar_`, `lectura_`, `reclamo_perdido_integration_test.go`
+- `conversaciones_api.go`, `conversaciones_api_integration_test.go`, `atencion_api_integration_test.go`, `conversacion_de_viaje_integration_test.go`, `bandeja_unica_integration_test.go` (nuevo)
+- `migrations/mensajeria/0008_bandeja_unica.sql` (nuevo)
+- `CHANGELOG.md`
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/...`, `go test -race -p 1 ./...` con `MENSAJERIA_TEST_DB` (Postgres.app local, base desechable: 71 pruebas de primer nivel PASS, 0 SKIP) y sin él, `arch-test@v0.1.1` OK. Sin el lock por tenant, la prueba concurrente falla (5 y 6 bandejas en lugar de 1).
+
 ## 2026-11-03 11:56 — Reclamar solo desde el pool (DEC-123) y versión monotónica del reclamo de emergencia
 
 **Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno (bandeja de conversaciones y de Reacción). Cambia lo que observan: `POST /reclamos` sobre una conversación que ya tiene responsable responde `409` aunque mande la versión vigente; y el reclamo de un caso de emergencia ya no reabre en versión 1 al transferir.

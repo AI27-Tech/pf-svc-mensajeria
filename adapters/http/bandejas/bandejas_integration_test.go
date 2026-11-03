@@ -32,7 +32,7 @@ func TestListarTrabajoBandejaHTTP(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		bandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 		convA   = "11111111-1111-1111-1111-111111111111"
 		convB   = "22222222-2222-2222-2222-222222222222"
@@ -52,9 +52,6 @@ func TestListarTrabajoBandejaHTTP(t *testing.T) {
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa, revision)
 		 VALUES ('`+convA+`', '`+tenant+`', '`+bandeja+`', true, 1),
 		        ('`+convB+`', '`+tenant+`', '`+bandeja+`', true, 2)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+ejec+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
@@ -66,8 +63,13 @@ func TestListarTrabajoBandejaHTTP(t *testing.T) {
 	mux := http.NewServeMux()
 	mod.Routes(mux)
 
+	// otro es monitorista: no es miembro de la bandeja de chat (DEC-127).
 	interno := func(sub string) *auth.Claims {
-		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: "ejecutivo", Audiencia: auth.AudienciaInterno}
+		rol := "ejecutivo"
+		if sub == otro {
+			rol = "monitorista"
+		}
+		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: auth.AudienciaInterno}
 	}
 	get := func(sub, query string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/bandejas/"+bandeja+"/trabajo"+query, nil)
@@ -77,9 +79,9 @@ func TestListarTrabajoBandejaHTTP(t *testing.T) {
 		return rec
 	}
 
-	// Sin membresía: 401.
+	// Monitorista (no Ejecutivo): 401, como antes sin membresía.
 	if rec := get(otro, ""); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("sin membresía: status %d, quiere 401; cuerpo %s", rec.Code, rec.Body.String())
+		t.Fatalf("monitorista: status %d, quiere 401; cuerpo %s", rec.Code, rec.Body.String())
 	}
 
 	// Bootstrap: 200 con las dos conversaciones y revisión 2.

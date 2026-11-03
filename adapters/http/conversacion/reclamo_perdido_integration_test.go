@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	rpTenant  = "t1"
+	rpTenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 	rpConv    = "11111111-1111-1111-1111-111111111111"
 	rpCliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	rpBandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -52,10 +52,6 @@ func rpServidor(t *testing.T) func(method, path, sub string, body any) *httptest
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+rpConv+`', '`+rpTenant+`', '`+rpBandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+rpBandeja+`', '`+rpOrigen+`', '`+rpTenant+`', 'ejecutivo', 1, true),
-		        ('`+rpBandeja+`', '`+rpDestino+`', '`+rpTenant+`', 'ejecutivo', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	t.Cleanup(closePool)

@@ -16,7 +16,7 @@ import (
 // handler llega a llamarlo, el texto de la causa queda disponible para filtrarse.
 type trabajadorPG struct{ llamado bool }
 
-func (f *trabajadorPG) ResolverMiBandeja(context.Context, string, string) (string, error) {
+func (f *trabajadorPG) ResolverMiBandeja(context.Context, string) (string, error) {
 	f.llamado = true
 	return "", errors.New(`ERROR: invalid input syntax for type uuid: "no-es-uuid" (SQLSTATE 22P02)`)
 }

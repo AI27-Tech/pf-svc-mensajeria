@@ -37,7 +37,7 @@ func TestReclamarConversacionHTTP(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		conv    = "11111111-1111-1111-1111-111111111111"
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		bandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -53,9 +53,6 @@ func TestReclamarConversacionHTTP(t *testing.T) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+conv+`', '`+tenant+`', '`+bandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+ejec+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
@@ -72,8 +69,13 @@ func TestReclamarConversacionHTTP(t *testing.T) {
 	mux := http.NewServeMux()
 	mod.Routes(mux)
 
+	// otro es monitorista: no es miembro de la bandeja de chat (DEC-127).
 	interno := func(sub string) *auth.Claims {
-		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: "ejecutivo", Audiencia: auth.AudienciaInterno}
+		rol := "ejecutivo"
+		if sub == otro {
+			rol = "monitorista"
+		}
+		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: auth.AudienciaInterno}
 	}
 
 	// Llama al handler con los claims ya en contexto (como auth.Middleware).
@@ -86,12 +88,12 @@ func TestReclamarConversacionHTTP(t *testing.T) {
 		return rec
 	}
 
-	// Sin membresía: 401, no toca el reclamo.
+	// Monitorista (no Ejecutivo): 401 como antes sin membresía; no toca el reclamo.
 	if rec := reclamar(otro, 0); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("reclamar sin membresía: status %d, quiere 401; cuerpo %s", rec.Code, rec.Body.String())
+		t.Fatalf("reclamar como monitorista: status %d, quiere 401; cuerpo %s", rec.Code, rec.Body.String())
 	}
 
-	// Con membresía, primer reclamo (versión esperada 0): 201 con el Reclamo.
+	// Ejecutivo sin filas de membresía, primer reclamo (versión esperada 0): 201 con el Reclamo.
 	rec := reclamar(ejec, 0)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("primer reclamo: status %d, quiere 201; cuerpo %s", rec.Code, rec.Body.String())
@@ -149,7 +151,7 @@ func TestTransferirConversacionHTTP(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		conv    = "11111111-1111-1111-1111-111111111111"
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		bandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -165,9 +167,6 @@ func TestTransferirConversacionHTTP(t *testing.T) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+conv+`', '`+tenant+`', '`+bandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+origen+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 	// Reclamo activo del origen en versión 1.
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.reclamo (conversacion_id, tenant_id, actor_real, version)
