@@ -35,7 +35,7 @@ func TestObtenerConversacionDeViaje(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		bandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 		ejec    = "dddddddd-dddd-dddd-dddd-dddddddddddd"
@@ -62,9 +62,6 @@ func TestObtenerConversacionDeViaje(t *testing.T) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+convAbierta+`', '`+tenant+`', '`+bandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+ejec+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
@@ -91,12 +88,14 @@ func TestObtenerConversacionDeViaje(t *testing.T) {
 		ultimaSq int64
 	}{
 		{"abierta, cliente dueño", clienteT1, viajeAbierto, http.StatusOK, convAbierta, 4},
-		{"abierta, miembro del pool", como(ejec, tenant, "ejecutivo", auth.AudienciaInterno), viajeAbierto, http.StatusOK, convAbierta, 4},
+		{"abierta, ejecutivo sin filas de membresía", como(ejec, tenant, "ejecutivo", auth.AudienciaInterno), viajeAbierto, http.StatusOK, convAbierta, 4},
 		{"todas cerradas: la más reciente", clienteT1, viajeCerrado, http.StatusOK, convCerradaB, 2},
 		{"sin conversación", clienteT1, viajeSin, http.StatusNotFound, "", 0},
 		{"otro tenant", como(cliente, "t2", "cliente", auth.AudienciaCliente), viajeAbierto, http.StatusNotFound, "", 0},
-		{"otro cliente del tenant", como(uuid.NewString(), tenant, "cliente", auth.AudienciaCliente), viajeAbierto, http.StatusNotFound, "", 0},
-		{"interno sin membresía", como(extrano, tenant, "ejecutivo", auth.AudienciaInterno), viajeAbierto, http.StatusNotFound, "", 0},
+		// DEC-124: otro usuario de la misma empresa (sub ≠ cliente_id) la lee.
+		{"otro usuario de la empresa", como(uuid.NewString(), tenant, "cliente", auth.AudienciaCliente), viajeAbierto, http.StatusOK, convAbierta, 4},
+		// DEC-127: un rol que no es Ejecutivo recibe el 404 de antes.
+		{"interno monitorista", como(extrano, tenant, "monitorista", auth.AudienciaInterno), viajeAbierto, http.StatusNotFound, "", 0},
 		{"interno sin ruta activa (cerrada)", como(ejec, tenant, "ejecutivo", auth.AudienciaInterno), viajeCerrado, http.StatusNotFound, "", 0},
 		{"sin claims", nil, viajeAbierto, http.StatusUnauthorized, "", 0},
 	}

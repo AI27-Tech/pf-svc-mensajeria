@@ -110,14 +110,14 @@ func TestTrabajoYCatchUp(t *testing.T) {
 	}
 }
 
-// TestResolverMiBandeja prueba la resolución de la bandeja de chat del sujeto
-// por membresía efectiva del pool (E8-T15, cola única DEC-103), contra Postgres
-// real. Afirma:
-//   - sujeto con membresía activa en una bandeja de chat -> devuelve esa bandeja;
-//   - sujeto sin membresía de chat -> ErrBandejaNoEncontrada (el handler lo mapea
-//     a 404), aunque sea miembro de una bandeja de OTRO tipo (emergencias);
-//   - sujeto con membresía activa en dos bandejas de chat -> ErrMembresiaAmbigua
-//     (dato inconsistente con la cola única; no se elige una en silencio).
+// TestResolverMiBandeja prueba la resolución de la bandeja única de
+// conversaciones del tenant (DEC-127), contra Postgres real. Quién es miembro lo
+// decide el rol en el llamador; aquí no hay pool_membresia. Afirma:
+//   - tenant con una bandeja de chat y una de emergencias -> la de chat;
+//   - tenant con solo bandeja de emergencias -> ErrBandejaNoEncontrada (el
+//     handler lo mapea a 404);
+//   - tenant con dos bandejas de chat (sembradas antes de DEC-127) -> la más
+//     antigua, el mismo criterio que la creación y la migración 0008.
 //
 // Se salta si MENSAJERIA_TEST_DB no está definido.
 func TestResolverMiBandeja(t *testing.T) {
@@ -133,56 +133,46 @@ func TestResolverMiBandeja(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant      = "t1"
-		bandejaChat = "cccccccc-cccc-cccc-cccc-cccccccccccc"
-		bandejaEmer = "dddddddd-dddd-dddd-dddd-dddddddddddd"
-		ejecutivo   = "11111111-1111-1111-1111-111111111111"
-		reaccion    = "22222222-2222-2222-2222-222222222222"
-		ajeno       = "33333333-3333-3333-3333-333333333333"
+		tenant       = "t1"
+		tenantSolo   = "t2"
+		bandejaChat  = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		bandejaEmer  = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		bandejaEmer2 = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 	)
 	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision) VALUES
-		 ('`+bandejaChat+`', '`+tenant+`', 'chat', 'pool chat', 0),
-		 ('`+bandejaEmer+`', '`+tenant+`', 'emergencias', 'pool reacción', 0)`)
-	// ejecutivo: membresía activa en la bandeja de chat.
-	// reaccion: membresía activa solo en la de emergencias (no es de chat).
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, activa) VALUES
-		 ('`+bandejaChat+`', '`+ejecutivo+`', '`+tenant+`', 'ejecutivo', true),
-		 ('`+bandejaEmer+`', '`+reaccion+`', '`+tenant+`', 'reaccion', true)`)
+		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision, creado_en) VALUES
+		 ('`+bandejaEmer+`', '`+tenant+`', 'emergencias', 'pool reacción', 0, '2026-01-01T00:00:00Z'),
+		 ('`+bandejaChat+`', '`+tenant+`', 'chat', 'pool chat', 0, '2026-01-02T00:00:00Z'),
+		 ('`+bandejaEmer2+`', '`+tenantSolo+`', 'emergencias', 'pool reacción', 0, '2026-01-01T00:00:00Z')`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
 	svc := bandejas.NewServicio(pool)
 
-	// Caso 1: el ejecutivo resuelve su bandeja de chat.
-	got, err := svc.ResolverMiBandeja(ctx, tenant, ejecutivo)
+	// Caso 1: la bandeja de chat del tenant, aunque la de emergencias sea más antigua.
+	got, err := svc.ResolverMiBandeja(ctx, tenant)
 	if err != nil {
-		t.Fatalf("ResolverMiBandeja (ejecutivo): %v", err)
+		t.Fatalf("ResolverMiBandeja: %v", err)
 	}
 	if got != bandejaChat {
 		t.Fatalf("bandeja resuelta = %q, quiere %q", got, bandejaChat)
 	}
 
-	// Caso 2a: un sujeto ajeno, sin ninguna membresía, no tiene bandeja.
-	if _, err := svc.ResolverMiBandeja(ctx, tenant, ajeno); !errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-		t.Fatalf("sujeto sin membresía: err = %v, quiere ErrBandejaNoEncontrada", err)
+	// Caso 2: un tenant con solo bandeja de emergencias no tiene bandeja de chat.
+	if _, err := svc.ResolverMiBandeja(ctx, tenantSolo); !errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
+		t.Fatalf("tenant sin bandeja de chat: err = %v, quiere ErrBandejaNoEncontrada", err)
 	}
 
-	// Caso 2b: membresía SOLO en una bandeja de emergencias no cuenta como de chat.
-	if _, err := svc.ResolverMiBandeja(ctx, tenant, reaccion); !errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-		t.Fatalf("sujeto solo en emergencias: err = %v, quiere ErrBandejaNoEncontrada", err)
+	// Caso 3: dos bandejas de chat -> la más antigua.
+	const bandejaChatVieja = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision, creado_en)
+		 VALUES ('`+bandejaChatVieja+`', '`+tenant+`', 'chat', 'pool chat viejo', 0, '2025-12-31T00:00:00Z')`)
+	got, err = svc.ResolverMiBandeja(ctx, tenant)
+	if err != nil {
+		t.Fatalf("ResolverMiBandeja con dos de chat: %v", err)
 	}
-
-	// Caso 3: membresía activa en DOS bandejas de chat -> ambigua (no elige una).
-	const bandejaChat2 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision)
-		 VALUES ('`+bandejaChat2+`', '`+tenant+`', 'chat', 'otro pool chat', 0)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, activa)
-		 VALUES ('`+bandejaChat2+`', '`+ejecutivo+`', '`+tenant+`', 'ejecutivo', true)`)
-	if _, err := svc.ResolverMiBandeja(ctx, tenant, ejecutivo); !errors.Is(err, bandejas.ErrMembresiaAmbigua) {
-		t.Fatalf("sujeto en dos bandejas de chat: err = %v, quiere ErrMembresiaAmbigua", err)
+	if got != bandejaChatVieja {
+		t.Fatalf("con dos bandejas de chat = %q, quiere la más antigua %q", got, bandejaChatVieja)
 	}
 }

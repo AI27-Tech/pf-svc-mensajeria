@@ -37,7 +37,7 @@ func TestConversacionesAPI(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		conv    = "11111111-1111-1111-1111-111111111111"
 		convSL  = "22222222-2222-2222-2222-222222222222" // solo_lectura
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -57,10 +57,6 @@ func TestConversacionesAPI(t *testing.T) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa, revision)
 		 VALUES ('`+conv+`', '`+tenant+`', '`+bandeja+`', true, 1)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+ejec+`', '`+tenant+`', 'ejecutivo', 1, true),
-		        ('`+bandeja+`', '`+destino+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
@@ -111,8 +107,14 @@ func TestConversacionesAPI(t *testing.T) {
 	if len(tb2.Items) != 0 || tb2.Revision != 1 {
 		t.Fatalf("catch-up desde 1: %d items, revision %d; quiere 0 items y revision 1", len(tb2.Items), tb2.Revision)
 	}
-	if _, err := api.ListarTrabajoBandeja(interno(otro), msgclient.ListarTrabajoMiBandejaParams{}); categoria(err) != platformerrors.CategoryNoEncontrado {
-		t.Fatalf("bandeja sin pool: categoría %v, quiere no_encontrado", categoria(err))
+	// Un rol que no es Ejecutivo no tiene bandeja (DEC-127): el mismo 404 que
+	// antes recibía quien no tenía membresía, por las dos vías.
+	ctxMonitorista := como(otro, "monitorista", auth.AudienciaInterno)
+	if _, err := api.ListarTrabajoBandeja(ctxMonitorista, msgclient.ListarTrabajoMiBandejaParams{}); categoria(err) != platformerrors.CategoryNoEncontrado {
+		t.Fatalf("bandeja de monitorista: categoría %v, quiere no_encontrado", categoria(err))
+	}
+	if got := statusHTTP(ctxMonitorista, http.MethodGet, "/api/v1/bandeja/trabajo", nil); got != http.StatusNotFound {
+		t.Fatalf("paridad bandeja de monitorista: HTTP %d, quiere 404", got)
 	}
 
 	// Obtener: el cliente dueño la lee; sin reclamo, version_reclamo 0.
@@ -124,13 +126,14 @@ func TestConversacionesAPI(t *testing.T) {
 		t.Fatalf("conversación: id %s estado %s version %d; quiere %s abierta 0", c.Id, c.Estado, c.VersionReclamo, conv)
 	}
 
-	// Denegación: un interno sin membresía no reclama. Misma categoría que HTTP 401.
-	_, err = api.ReclamarConversacion(interno(otro), convUUID, msgclient.VersionEsperadaEntrada{VersionEsperada: 0})
+	// Denegación: un interno que no es Ejecutivo no reclama (DEC-127), con la
+	// misma categoría que antes sin membresía y que HTTP 401.
+	_, err = api.ReclamarConversacion(ctxMonitorista, convUUID, msgclient.VersionEsperadaEntrada{VersionEsperada: 0})
 	if categoria(err) != platformerrors.CategoryNoAutorizado {
-		t.Fatalf("reclamar sin membresía: categoría %v, quiere no_autorizado", categoria(err))
+		t.Fatalf("reclamar como monitorista: categoría %v, quiere no_autorizado", categoria(err))
 	}
 	rutaReclamos := "/api/v1/conversaciones/" + conv + "/reclamos"
-	if got := statusHTTP(interno(otro), http.MethodPost, rutaReclamos, msgclient.VersionEsperadaEntrada{}); got != categoria(err).HTTPStatus() {
+	if got := statusHTTP(ctxMonitorista, http.MethodPost, rutaReclamos, msgclient.VersionEsperadaEntrada{}); got != categoria(err).HTTPStatus() {
 		t.Fatalf("paridad denegación: HTTP %d, en proceso %d", got, categoria(err).HTTPStatus())
 	}
 

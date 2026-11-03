@@ -51,7 +51,7 @@ func TestEnviarMensajeHTTP(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		conv    = "11111111-1111-1111-1111-111111111111"
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		bandeja = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -67,9 +67,6 @@ func TestEnviarMensajeHTTP(t *testing.T) {
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa)
 		 VALUES ('`+conv+`', '`+tenant+`', '`+bandeja+`', true)`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+ejec+`', '`+tenant+`', 'ejecutivo', 1, true)`)
 	// El ejecutivo tiene el reclamo activo (enviar lo exige para audiencia Interno).
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.reclamo (conversacion_id, tenant_id, actor_real, version)
@@ -158,7 +155,7 @@ func TestEnviarMensajeHTTPConversacionSoloLectura(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant  = "t1"
+		tenant  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" // tenant = cliente (DEC-112)
 		conv    = "11111111-1111-1111-1111-111111111111"
 		cliente = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		cmid    = "99999999-9999-9999-9999-999999999999"

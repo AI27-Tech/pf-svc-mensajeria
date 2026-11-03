@@ -64,8 +64,8 @@ type casoDeEmergencia interface {
 	Activar(ctx context.Context, in emergencias.EntradaActivacion) (emergencias.ResultadoActivacion, error)
 	AgregarNota(ctx context.Context, in emergencias.EntradaNota) (string, error)
 	Reclamar(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error)
-	Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo) error
-	Transferir(ctx context.Context, tenantID, emergenciaID, origen, destino string, esperada msgtipos.VersionReclamo) error
+	Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo, mando bool) error
+	Transferir(ctx context.Context, tenantID, emergenciaID, actor, destino string, esperada msgtipos.VersionReclamo, mando bool) error
 	Resolver(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) error
 	Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal string) error
 	ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]emergencias.CasoProyectado, error)
@@ -194,10 +194,13 @@ func (a *emergenciasAPI) LiberarReclamoEmergencia(ctx context.Context, _ msgclie
 		return err
 	}
 	eid := emergenciaID.String()
-	if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
-		return err
+	mando := conMando(claims)
+	if !mando {
+		if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
+			return err
+		}
 	}
-	err = a.emergencias.Liberar(ctx, claims.TenantID, eid, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(versionEsperada))
+	err = a.emergencias.Liberar(ctx, claims.TenantID, eid, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(versionEsperada), mando)
 	if errors.Is(err, emergencias.ErrSinReclamo) {
 		return platformerrors.NewNoEncontrado("reclamo no encontrado")
 	}
@@ -213,10 +216,13 @@ func (a *emergenciasAPI) TransferirEmergencia(ctx context.Context, _ msgclient.I
 		return nil, err
 	}
 	eid := emergenciaID.String()
-	if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
-		return nil, err
+	mando := conMando(claims)
+	if !mando {
+		if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
+			return nil, err
+		}
 	}
-	err = a.emergencias.Transferir(ctx, claims.TenantID, eid, claims.Subject, body.ResponsableDestinoId.String(), msgtipos.VersionReclamo(body.VersionEsperada))
+	err = a.emergencias.Transferir(ctx, claims.TenantID, eid, claims.Subject, body.ResponsableDestinoId.String(), msgtipos.VersionReclamo(body.VersionEsperada), mando)
 	if errors.Is(err, emergencias.ErrSinReclamo) {
 		return nil, platformerrors.NewNoEncontrado("reclamo no encontrado")
 	}
@@ -346,12 +352,22 @@ func traducir(err error) error {
 	return platformerrors.NewRotoErr(err, "mensajeria: error interno")
 }
 
+// conMando: un Supervisor o Coordinador libera o transfiere el caso sin ser
+// miembro del pool de Reacción ni su responsable (DEC-126).
+func conMando(c *auth.Claims) bool {
+	return c.Audiencia == auth.AudienciaInterno && emergencias.TieneMando(c.Rol)
+}
+
 // traducirConflicto mapea el conflicto de versión del dominio a 409
-// conflicto_version_reclamo; cualquier otro error pasa por traducir.
+// conflicto_version_reclamo y al no responsable a 403 prohibido (DEC-126);
+// cualquier otro error pasa por traducir.
 func traducirConflicto(err error) error {
 	var conflicto emergencias.ErrConflictoVersion
 	if errors.As(err, &conflicto) {
 		return platformerrors.NewConflicto("conflicto_version_reclamo")
+	}
+	if errors.Is(err, emergencias.ErrNoEsResponsable) {
+		return platformerrors.NewProhibido("solo el responsable, un supervisor o un coordinador libera o transfiere el caso")
 	}
 	return traducir(err)
 }

@@ -86,7 +86,7 @@ func TestActivarEsIdempotentePorActivacion(t *testing.T) {
 
 // TestReclamoConcurrenteProduceGanadorYConflicto afirma: dos reclamos
 // concurrentes sobre el caso recién activado (versión 0) producen exactamente un
-// ganador (versión 1) y un conflicto.
+// ganador (versión 1) y un conflicto, y los dos intentos quedan auditados.
 func TestReclamoConcurrenteProduceGanadorYConflicto(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -131,6 +131,22 @@ func TestReclamoConcurrenteProduceGanadorYConflicto(t *testing.T) {
 	}
 	if ganadores != 1 || conflictos != 1 {
 		t.Fatalf("se esperaba 1 ganador y 1 conflicto; hubo %d y %d", ganadores, conflictos)
+	}
+
+	// Los dos intentos quedan auditados, sin conversación (DEC-125).
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+	var ganados, perdidos, sinCaso int
+	if err := admin.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE accion = 'emergencia.reclamo.intento_ganado'),
+		        count(*) FILTER (WHERE accion = 'emergencia.reclamo.intento_perdido'
+		                           AND detalle->>'version_esperada' = '0' AND detalle->>'version_actual' = '1'),
+		        count(*) FILTER (WHERE conversacion_id IS NOT NULL OR detalle->>'caso_emergencia_id' <> $1)
+		   FROM mensajeria.auditoria_mensajeria`, caso.EmergenciaID).Scan(&ganados, &perdidos, &sinCaso); err != nil {
+		t.Fatalf("leer auditoría: %v", err)
+	}
+	if ganados != 1 || perdidos != 1 || sinCaso != 0 {
+		t.Fatalf("auditoría: %d ganados, %d perdidos (0→1), %d ajenas; quiere 1, 1, 0", ganados, perdidos, sinCaso)
 	}
 }
 
@@ -233,11 +249,11 @@ func TestDobleTransferenciaVersionMonotonica(t *testing.T) {
 		t.Fatalf("A reclama: %v", err)
 	}
 	v1 := versionCaso()
-	if err := svc.Transferir(ctx, tenant, id, actorA, actorB, 1); err != nil {
+	if err := svc.Transferir(ctx, tenant, id, actorA, actorB, 1, false); err != nil {
 		t.Fatalf("A→B: %v", err)
 	}
 	v2 := versionCaso()
-	if err := svc.Transferir(ctx, tenant, id, actorB, actorA, 2); err != nil {
+	if err := svc.Transferir(ctx, tenant, id, actorB, actorA, 2, false); err != nil {
 		t.Fatalf("B→A: %v", err)
 	}
 	v3 := versionCaso()
@@ -247,8 +263,8 @@ func TestDobleTransferenciaVersionMonotonica(t *testing.T) {
 
 	rid, _ := reclamoActivo()
 	for paso, err := range map[string]error{
-		"transferir con la versión previa": svc.Transferir(ctx, tenant, id, actorA, actorB, 1),
-		"liberar con la versión previa":    svc.Liberar(ctx, tenant, id, rid, actorA, 1),
+		"transferir con la versión previa": svc.Transferir(ctx, tenant, id, actorA, actorB, 1, false),
+		"liberar con la versión previa":    svc.Liberar(ctx, tenant, id, rid, actorA, 1, false),
 		"resolver con la versión previa":   svc.Resolver(ctx, tenant, id, actorA, 1),
 		"reclamar con la versión de B":     func() error { _, e := svc.Reclamar(ctx, tenant, id, actorB, 2); return e }(),
 	} {
@@ -281,7 +297,7 @@ func TestDobleTransferenciaVersionMonotonica(t *testing.T) {
 	}
 
 	// Liberar deja el caso en 3; del pool, la versión 0 es obsoleta y la 3 abre en 4.
-	if err := svc.Liberar(ctx, tenant, id, rid, actorA, 3); err != nil {
+	if err := svc.Liberar(ctx, tenant, id, rid, actorA, 3, false); err != nil {
 		t.Fatalf("liberar: %v", err)
 	}
 	if v := versionCaso(); v != 3 {
