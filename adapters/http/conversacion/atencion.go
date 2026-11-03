@@ -10,6 +10,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
@@ -58,7 +59,8 @@ func (h Handlers) marcarAtendida(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
@@ -69,7 +71,7 @@ func (h Handlers) marcarAtendida(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Atencion.MarcarAtendida(r.Context(), claims.TenantID, convID, claims.Subject, msgtipos.VersionReclamo(entrada.VersionEsperada)); err != nil {
+	if err := h.Atencion.MarcarAtendida(r.Context(), tenant, convID, claims.Subject, msgtipos.VersionReclamo(entrada.VersionEsperada)); err != nil {
 		escribirError(w, TraducirAtencion(err))
 		return
 	}
@@ -88,7 +90,8 @@ func (h Handlers) registrarRecibo(tipo conversacion.Recibo) http.HandlerFunc {
 		}
 		convID := r.PathValue("id")
 
-		if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+		tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+		if err != nil {
 			escribirError(w, err)
 			return
 		}
@@ -99,7 +102,7 @@ func (h Handlers) registrarRecibo(tipo conversacion.Recibo) http.HandlerFunc {
 			return
 		}
 
-		if err := h.Atencion.RegistrarRecibo(r.Context(), claims.TenantID, convID, claims.Subject, tipo, msgtipos.SecuenciaMensaje(entrada.HastaSecuencia)); err != nil {
+		if err := h.Atencion.RegistrarRecibo(r.Context(), tenant, convID, claims.Subject, tipo, msgtipos.SecuenciaMensaje(entrada.HastaSecuencia)); err != nil {
 			escribirError(w, TraducirAtencion(err))
 			return
 		}
@@ -121,7 +124,13 @@ func (h Handlers) listarAuditoria(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pagina, err := h.Auditoria.Listar(r.Context(), claims.TenantID, r.PathValue("id"), r.URL.Query().Get("cursor"))
+	convID := r.PathValue("id")
+	tenant, err := h.Autz.TenantDeConversacion(r.Context(), convID, claims)
+	if err != nil {
+		escribirError(w, err)
+		return
+	}
+	pagina, err := h.Auditoria.Listar(r.Context(), tenant, convID, r.URL.Query().Get("cursor"))
 	if err != nil {
 		escribirError(w, TraducirAtencion(err))
 		return

@@ -1,449 +1,250 @@
-// Package emergencias es el adaptador HTTP entrante de la familia de emergencia
-// (contrato tracer.17: /api/v1/viajes/{id}/emergencias y sus subrecursos). El
-// bff antepone auth.Middleware, así que los claims llegan en el contexto. El
-// dominio vive en internal/emergencias; esta capa decodifica el contrato,
-// autoriza y traduce los errores de dominio a códigos HTTP.
+// Package emergencias es el adaptador HTTP entrante de la familia de emergencia:
+// las rutas por viaje (contrato tracer.17, /api/v1/viajes/{id}/emergencias...) y
+// la bandeja de Reacción y las acciones por id del caso (tracer.34,
+// /api/v1/bandeja/emergencias y /api/v1/emergencias/{eid}...). El bff antepone
+// auth.Middleware, así que los claims llegan en el contexto.
+//
+// Esta capa solo decodifica el contrato, llama a la superficie en proceso
+// (mensajeria.EmergenciasAPI, la única copia de las reglas) y codifica la
+// respuesta. No autoriza ni traduce errores de dominio: lo hace la superficie.
 package emergencias
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/google/uuid"
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
-	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 
 	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
-	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
-	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
 
-// Autorizador decide el acceso a un caso de emergencia (internal/autorizacion).
-type Autorizador interface {
-	PuedeAtenderEmergencia(ctx context.Context, tenantID, emergenciaID string, c *auth.Claims) error
-}
-
-// Emergencias es el caso de uso del dominio (internal/emergencias).
-type Emergencias interface {
-	Activar(ctx context.Context, in emergencias.EntradaActivacion) (emergencias.ResultadoActivacion, error)
-	AgregarNota(ctx context.Context, in emergencias.EntradaNota) (string, error)
-	Reclamar(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error)
-	Liberar(ctx context.Context, tenantID, emergenciaID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo, mando bool) error
-	Transferir(ctx context.Context, tenantID, emergenciaID, actor, destino string, esperada msgtipos.VersionReclamo, mando bool) error
-	Resolver(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) error
-	Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal string) error
-	ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]emergencias.CasoProyectado, error)
+// API es la superficie de emergencia que estos handlers sirven. La satisface
+// mensajeria.EmergenciasAPI; se declara aquí (consumidor) porque el paquete raíz
+// importa este y no puede ser importado de vuelta.
+type API interface {
+	ListarEmergencias(ctx context.Context, viajeID msgclient.Id) (*msgclient.PaginaEmergencias, error)
+	ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (*msgclient.CasoEmergencia, bool, error)
+	AgregarNotaEmergencia(ctx context.Context, viajeID, emergenciaID msgclient.Id, body msgclient.NotaEmergenciaEntrada) error
+	ListarBandejaEmergencias(ctx context.Context, params msgclient.ListarBandejaEmergenciasParams) (*msgclient.PaginaBandejaEmergencias, error)
+	ObtenerEmergencia(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error)
+	ListarNotasEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, params msgclient.ListarNotasEmergenciaPorIdParams) (*msgclient.PaginaNotasEmergencia, error)
+	ReclamarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error)
+	LiberarReclamoEmergenciaPorId(ctx context.Context, emergenciaID, reclamoID msgclient.Id, params msgclient.LiberarReclamoEmergenciaPorIdParams) error
+	TransferirEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
+	ResolverEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) (*msgclient.EmergenciaReaccion, error)
+	CerrarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error)
 }
 
 // Handlers agrupa las dependencias de los handlers de emergencia.
 type Handlers struct {
-	Autz        Autorizador
-	Emergencias Emergencias
+	API API
 }
 
-// Montar registra las rutas de emergencia en el mux.
+// Montar registra las rutas de emergencia en el mux. Cada acción por viaje y su
+// gemela por id comparten handler: solo cambia de dónde sale {eid}.
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/viajes/{id}/emergencias", h.listar)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias", h.activar)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/notas", h.agregarNota)
-	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/reclamos", h.reclamar)
-	mux.HandleFunc("DELETE /api/v1/viajes/{id}/emergencias/{eid}/reclamos/{rid}", h.liberar)
-	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/transferencias", h.transferir)
-	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/resolucion", h.resolver)
-	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/cierre", h.cerrar)
+
+	mux.HandleFunc("GET /api/v1/bandeja/emergencias", h.bandeja)
+	mux.HandleFunc("GET /api/v1/emergencias/{eid}", h.obtener)
+	mux.HandleFunc("GET /api/v1/emergencias/{eid}/notas", h.listarNotas)
+
+	for _, base := range []string{"/api/v1/viajes/{id}/emergencias/{eid}", "/api/v1/emergencias/{eid}"} {
+		mux.HandleFunc("POST "+base+"/reclamos", h.reclamar)
+		mux.HandleFunc("DELETE "+base+"/reclamos/{rid}", h.liberar)
+		mux.HandleFunc("POST "+base+"/transferencias", h.transferir)
+	}
+	// resolver y cerrar responden distinto por familia: 200 sin cuerpo por viaje
+	// (como hasta tracer.33), 200 con el caso por id (tracer.34).
+	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/resolucion", h.resolver(false))
+	mux.HandleFunc("POST /api/v1/emergencias/{eid}/resolucion", h.resolver(true))
+	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias/{eid}/cierre", h.cerrar(false))
+	mux.HandleFunc("POST /api/v1/emergencias/{eid}/cierre", h.cerrar(true))
 }
 
-// listar devuelve los casos de emergencia del viaje, proyectados por audiencia
-// (ADR 21 §6). Al Cliente le entrega la vista mínima: solo casos no cerrados y
-// sin los campos internos (origen, actor, reclamo). A Interno, el caso completo.
 func (h Handlers) listar(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+	viaje, ok := idRuta(w, r, "id")
+	if !ok {
 		return
 	}
-	viajeID := r.PathValue("id")
-	esCliente := claims.Audiencia == auth.AudienciaCliente
-
-	casos, err := h.Emergencias.ListarPorViaje(r.Context(), claims.TenantID, viajeID, esCliente)
-	if err != nil {
-		escribirError(w, traducir(err))
-		return
-	}
-
-	items := make([]msgclient.CasoEmergencia, 0, len(casos))
-	for _, c := range casos {
-		items = append(items, proyectar(c, esCliente))
-	}
-	escribirJSON(w, http.StatusOK, msgclient.PaginaEmergencias{Items: items})
+	pagina, err := h.API.ListarEmergencias(r.Context(), viaje)
+	responder(w, http.StatusOK, pagina, err)
 }
 
-// proyectar mapea un caso leído al CasoEmergencia del contrato. Para audiencia
-// Cliente oculta los campos internos (origen, actor_real, reclamo_activo quedan
-// en su cero), que solo se entregan a Interno (ADR 21 §3, §6).
-func proyectar(c emergencias.CasoProyectado, esCliente bool) msgclient.CasoEmergencia {
-	caso := msgclient.CasoEmergencia{
-		Id:             uuidOCero(c.ID),
-		ViajeId:        uuidOCero(c.ViajeID),
-		Estado:         msgclient.EstadoEmergencia(c.Estado),
-		VersionReclamo: int64(c.VersionReclamo),
-		ActivadaEn:     c.ActivadaEn,
-		ResueltaEn:     c.ResueltaEn,
-		CerradaEn:      c.CerradaEn,
-	}
-	if c.ClienteID != "" {
-		caso.ClienteId = uuidOCero(c.ClienteID)
-	}
-	if esCliente {
-		return caso
-	}
-	// Interno ve los campos internos.
-	caso.Origen = msgclient.OrigenActivacion(c.Origen)
-	if id, err := uuid.Parse(c.ActorReal); err == nil {
-		caso.ActorReal = &id
-	}
-	return caso
-}
-
-func uuidOCero(s string) msgclient.Id {
-	id, _ := uuid.Parse(s)
-	return id
-}
-
-// activar crea un caso de emergencia sobre el viaje. Cliente dentro de su
-// organización o interno de monitoreo (ADR 21 §1; el alcance fino por viaje lo
-// impone la composición de bff, igual que conversación no revalida el viaje).
-// Idempotente por activacion_id: una reentrega devuelve 200 con el caso original.
+// activar responde 201 con el caso nuevo, o 200 con el original si es una
+// reentrega de la misma activacion_id.
 func (h Handlers) activar(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+	viaje, ok := idRuta(w, r, "id")
+	if !ok {
 		return
 	}
-	viajeID := r.PathValue("id")
-
 	var entrada msgclient.ActivarEmergenciaEntrada
-	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
-		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
+	if !decodificar(w, r, &entrada) {
 		return
 	}
-
-	origen := msgclient.OrigenActivacionOperacion
-	if claims.Audiencia == auth.AudienciaCliente {
-		origen = msgclient.OrigenActivacionCliente
-	}
-
-	res, err := h.Emergencias.Activar(r.Context(), emergencias.EntradaActivacion{
-		TenantID:     claims.TenantID,
-		ViajeID:      viajeID,
-		ClienteID:    clienteDeClaims(claims),
-		ActorReal:    claims.Subject,
-		Origen:       origen,
-		ActivacionID: entrada.ActivacionId.String(),
-	})
-	if err != nil {
-		escribirError(w, traducir(err))
-		return
-	}
-
-	id, err := uuid.Parse(res.EmergenciaID)
-	if err != nil {
-		escribirError(w, traducir(err))
-		return
-	}
+	caso, idempotente, err := h.API.ActivarEmergencia(r.Context(), viaje, entrada)
 	estado := http.StatusCreated
-	if res.Idempotente {
+	if idempotente {
 		estado = http.StatusOK
 	}
-	escribirJSON(w, estado, msgclient.CasoEmergencia{Id: id})
+	responder(w, estado, caso, err)
 }
 
-// agregarNota agrega una nota append-only al caso. Permitida mientras el caso no
-// esté cerrado (ADR 21 §4). Texto ≤1000, recortado; vacío tras recorte → 400.
 func (h Handlers) agregarNota(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+	viaje, ok := idRuta(w, r, "id")
+	if !ok {
 		return
 	}
-	eid := r.PathValue("eid")
-
+	eid, ok := idRuta(w, r, "eid")
+	if !ok {
+		return
+	}
 	var entrada msgclient.NotaEmergenciaEntrada
-	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
-		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
+	if !decodificar(w, r, &entrada) {
 		return
 	}
-	cuerpo := strings.TrimSpace(entrada.Cuerpo)
-	if cuerpo == "" || len([]rune(cuerpo)) > 1000 {
-		escribirError(w, platformerrors.NewValidacion("la nota debe tener de 1 a 1000 caracteres"))
-		return
-	}
-
-	_, err := h.Emergencias.AgregarNota(r.Context(), emergencias.EntradaNota{
-		TenantID:       claims.TenantID,
-		EmergenciaID:   eid,
-		ActorReal:      claims.Subject,
-		AudienciaAutor: string(claims.Audiencia),
-		Cuerpo:         cuerpo,
-	})
-	if err != nil {
-		if errors.Is(err, emergencias.ErrCerrada) {
-			escribirError(w, platformerrors.NewConflicto("emergencia_cerrada"))
-			return
-		}
-		if errors.Is(err, emergencias.ErrNoEncontrada) {
-			escribirError(w, platformerrors.NewNoEncontrado("emergencia no encontrada"))
-			return
-		}
-		escribirError(w, traducir(err))
-		return
-	}
-	w.WriteHeader(http.StatusCreated)
+	responder[struct{}](w, http.StatusCreated, nil, h.API.AgregarNotaEmergencia(r.Context(), viaje, eid, entrada))
 }
 
-// reclamar toma del pool el reclamo del caso (abierta → en_atencion). Solo
-// miembros del pool de Reacción (DEC-028). Caso con reclamo activo (DEC-125) o
-// versión no vigente → 409.
+func (h Handlers) bandeja(w http.ResponseWriter, r *http.Request) {
+	pagina, err := h.API.ListarBandejaEmergencias(r.Context(), msgclient.ListarBandejaEmergenciasParams{})
+	responder(w, http.StatusOK, pagina, err)
+}
+
+func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
+	eid, ok := idRuta(w, r, "eid")
+	if !ok {
+		return
+	}
+	caso, err := h.API.ObtenerEmergencia(r.Context(), eid)
+	responder(w, http.StatusOK, caso, err)
+}
+
+func (h Handlers) listarNotas(w http.ResponseWriter, r *http.Request) {
+	eid, ok := idRuta(w, r, "eid")
+	if !ok {
+		return
+	}
+	pagina, err := h.API.ListarNotasEmergenciaPorId(r.Context(), eid, msgclient.ListarNotasEmergenciaPorIdParams{})
+	responder(w, http.StatusOK, pagina, err)
+}
+
 func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+	eid, ok := idRuta(w, r, "eid")
+	if !ok {
 		return
 	}
-	eid := r.PathValue("eid")
-
-	if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
-		escribirError(w, err)
-		return
-	}
-
 	var entrada msgclient.VersionEsperadaEntrada
-	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
-		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
+	if !decodificar(w, r, &entrada) {
 		return
 	}
-
-	if _, err := h.Emergencias.Reclamar(r.Context(), claims.TenantID, eid, claims.Subject,
-		msgtipos.VersionReclamo(entrada.VersionEsperada)); err != nil {
-		escribirError(w, traducirConflicto(err))
-		return
-	}
-	w.WriteHeader(http.StatusCreated)
+	reclamo, err := h.API.ReclamarEmergenciaPorId(r.Context(), eid, entrada)
+	responder(w, http.StatusCreated, reclamo, err)
 }
 
-// liberar cierra el reclamo activo y devuelve el caso al pool. version_esperada
-// obligatoria en el query. Solo el responsable o un Supervisor/Coordinador
-// (DEC-126): otro actor → 403. Conflicto → 409; sin reclamo → 404.
+// liberar exige version_esperada en el query.
 func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+	eid, ok := idRuta(w, r, "eid")
+	if !ok {
 		return
 	}
-	eid := r.PathValue("eid")
-	rid := r.PathValue("rid")
-
+	rid, ok := idRuta(w, r, "rid")
+	if !ok {
+		return
+	}
 	ver, err := strconv.ParseInt(r.URL.Query().Get("version_esperada"), 10, 64)
 	if err != nil {
-		escribirError(w, platformerrors.NewValidacion("version_esperada inválida o faltante"))
+		boundary.WriteError(w, platformerrors.NewValidacion("version_esperada inválida o faltante"))
 		return
 	}
-
-	mando := conMando(claims)
-	if !mando {
-		if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
-			escribirError(w, err)
-			return
-		}
-	}
-
-	if err := h.Emergencias.Liberar(r.Context(), claims.TenantID, eid, rid, claims.Subject,
-		msgtipos.VersionReclamo(ver), mando); err != nil {
-		if errors.Is(err, emergencias.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
-			return
-		}
-		escribirError(w, traducirConflicto(err))
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	err = h.API.LiberarReclamoEmergenciaPorId(r.Context(), eid, rid,
+		msgclient.LiberarReclamoEmergenciaPorIdParams{VersionEsperada: ver})
+	responder[struct{}](w, http.StatusNoContent, nil, err)
 }
 
-// transferir mueve la responsabilidad del caso a otro miembro de Reacción. Mismo
-// permiso que liberar (DEC-126).
 func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+	eid, ok := idRuta(w, r, "eid")
+	if !ok {
 		return
 	}
-	eid := r.PathValue("eid")
-
-	mando := conMando(claims)
-	if !mando {
-		if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
-			escribirError(w, err)
-			return
-		}
-	}
-
 	var entrada msgclient.TransferenciaEntrada
-	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
-		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
+	if !decodificar(w, r, &entrada) {
 		return
 	}
+	reclamo, err := h.API.TransferirEmergenciaPorId(r.Context(), eid, entrada)
+	responder(w, http.StatusCreated, reclamo, err)
+}
 
-	if err := h.Emergencias.Transferir(r.Context(), claims.TenantID, eid, claims.Subject,
-		entrada.ResponsableDestinoId.String(), msgtipos.VersionReclamo(entrada.VersionEsperada), mando); err != nil {
-		if errors.Is(err, emergencias.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
+func (h Handlers) resolver(conCuerpo bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		eid, ok := idRuta(w, r, "eid")
+		if !ok {
 			return
 		}
-		escribirError(w, traducirConflicto(err))
-		return
-	}
-	w.WriteHeader(http.StatusCreated)
-}
-
-// resolver pasa el caso a resuelta (solo el responsable vigente, ADR 21 §5).
-// Exige una nota de resolución 1..1000: se resuelve primero (valida estado y
-// versión) y, en éxito, se registra la nota con es_resolucion=true.
-func (h Handlers) resolver(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
-		return
-	}
-	eid := r.PathValue("eid")
-
-	if err := h.Autz.PuedeAtenderEmergencia(r.Context(), claims.TenantID, eid, claims); err != nil {
-		escribirError(w, err)
-		return
-	}
-
-	var entrada msgclient.ResolucionEmergenciaEntrada
-	if err := json.NewDecoder(r.Body).Decode(&entrada); err != nil {
-		escribirError(w, platformerrors.NewValidacion("cuerpo inválido"))
-		return
-	}
-	nota := strings.TrimSpace(entrada.Nota)
-	if nota == "" || len([]rune(nota)) > 1000 {
-		escribirError(w, platformerrors.NewValidacion("la nota de resolución debe tener de 1 a 1000 caracteres"))
-		return
-	}
-
-	if err := h.Emergencias.Resolver(r.Context(), claims.TenantID, eid, claims.Subject,
-		msgtipos.VersionReclamo(entrada.VersionEsperada)); err != nil {
-		if errors.Is(err, emergencias.ErrTransicionInvalida) {
-			escribirError(w, platformerrors.NewConflicto("transicion_invalida"))
+		var entrada msgclient.ResolucionEmergenciaEntrada
+		if !decodificar(w, r, &entrada) {
 			return
 		}
-		if errors.Is(err, emergencias.ErrSinReclamo) {
-			escribirError(w, platformerrors.NewNoEncontrado("reclamo no encontrado"))
+		caso, err := h.API.ResolverEmergenciaPorId(r.Context(), eid, entrada)
+		if !conCuerpo {
+			caso = nil
+		}
+		responder(w, http.StatusOK, caso, err)
+	}
+}
+
+func (h Handlers) cerrar(conCuerpo bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		eid, ok := idRuta(w, r, "eid")
+		if !ok {
 			return
 		}
-		escribirError(w, traducirConflicto(err))
-		return
-	}
-
-	// La nota de resolución queda en el expediente. Si falla, el caso ya está
-	// resuelto; se reporta el error pero la transición no se revierte (resuelta
-	// es irreversible, ADR 21 §6).
-	if _, err := h.Emergencias.AgregarNota(r.Context(), emergencias.EntradaNota{
-		TenantID:       claims.TenantID,
-		EmergenciaID:   eid,
-		ActorReal:      claims.Subject,
-		AudienciaAutor: string(claims.Audiencia),
-		Cuerpo:         nota,
-		EsResolucion:   true,
-	}); err != nil {
-		escribirError(w, traducir(err))
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-// cerrar cierra administrativamente el caso (resuelta → cerrada). Interno dentro
-// del alcance o admin (ADR 21 §5); el cliente no cierra.
-func (h Handlers) cerrar(w http.ResponseWriter, r *http.Request) {
-	claims := boundary.Claims(r.Context())
-	if claims == nil {
-		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
-		return
-	}
-	if claims.Audiencia == auth.AudienciaCliente {
-		escribirError(w, platformerrors.NewNoAutorizado("el cliente no cierra emergencias"))
-		return
-	}
-	eid := r.PathValue("eid")
-
-	if err := h.Emergencias.Cerrar(r.Context(), claims.TenantID, eid, claims.Subject); err != nil {
-		if errors.Is(err, emergencias.ErrTransicionInvalida) {
-			escribirError(w, platformerrors.NewConflicto("transicion_invalida"))
-			return
+		caso, err := h.API.CerrarEmergenciaPorId(r.Context(), eid)
+		if !conCuerpo {
+			caso = nil
 		}
-		if errors.Is(err, emergencias.ErrNoEncontrada) {
-			escribirError(w, platformerrors.NewNoEncontrado("emergencia no encontrada"))
-			return
-		}
-		escribirError(w, traducir(err))
+		responder(w, http.StatusOK, caso, err)
+	}
+}
+
+// idRuta lee un parámetro de ruta UUID. Un valor que no es UUID no nombra ningún
+// recurso: 404, como un recurso inexistente.
+func idRuta(w http.ResponseWriter, r *http.Request, nombre string) (msgclient.Id, bool) {
+	id, err := uuid.Parse(r.PathValue(nombre))
+	if err != nil {
+		boundary.WriteError(w, platformerrors.NewNoEncontrado("recurso no encontrado"))
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+func decodificar(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		boundary.WriteError(w, platformerrors.NewValidacion("cuerpo inválido"))
+		return false
+	}
+	return true
+}
+
+// responder escribe el error (sin su causa interna, boundary.WriteError) o el
+// estado con el cuerpo; un cuerpo nil no se escribe.
+func responder[T any](w http.ResponseWriter, status int, cuerpo *T, err error) {
+	if err != nil {
+		boundary.WriteError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-}
-
-// clienteDeClaims devuelve el cliente_id a persistir en el caso. Para una
-// activación de cliente, es el Subject del token (el usuario-cliente, igual que
-// conversacion.cliente_id se compara contra el sub). Para interno, mensajeria no
-// conoce el cliente del viaje (lo proyecta de viaje.*); va vacío y se persiste
-// NULL.
-func clienteDeClaims(c *auth.Claims) string {
-	if c.Audiencia == auth.AudienciaCliente {
-		return c.Subject
+	if cuerpo == nil {
+		w.WriteHeader(status)
+		return
 	}
-	return ""
-}
-
-// traducir conserva la categoría de un PlatformError y envuelve cualquier otro
-// como error interno.
-func traducir(err error) error {
-	if platformerrors.AsCategory(err) != platformerrors.CategoryUnknown {
-		return err
-	}
-	return platformerrors.NewRotoErr(err, "mensajeria: error interno")
-}
-
-// conMando: un Supervisor o Coordinador libera o transfiere el caso sin ser
-// miembro del pool de Reacción ni su responsable (DEC-126).
-func conMando(c *auth.Claims) bool {
-	return c.Audiencia == auth.AudienciaInterno && emergencias.TieneMando(c.Rol)
-}
-
-// traducirConflicto mapea el conflicto de versión del dominio a 409
-// conflicto_version_reclamo y al no responsable a 403 prohibido (DEC-126);
-// cualquier otro error pasa por traducir.
-func traducirConflicto(err error) error {
-	var conflicto emergencias.ErrConflictoVersion
-	if errors.As(err, &conflicto) {
-		return platformerrors.NewConflicto("conflicto_version_reclamo")
-	}
-	if errors.Is(err, emergencias.ErrNoEsResponsable) {
-		return platformerrors.NewProhibido("solo el responsable, un supervisor o un coordinador libera o transfiere el caso")
-	}
-	return traducir(err)
-}
-
-func escribirJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(cuerpo)
 }
-
-// escribirError emite el error sin su causa interna (boundary.WriteError).
-func escribirError(w http.ResponseWriter, err error) { boundary.WriteError(w, err) }

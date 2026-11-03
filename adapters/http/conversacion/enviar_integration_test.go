@@ -86,7 +86,7 @@ func TestEnviarMensajeHTTP(t *testing.T) {
 	mux := http.NewServeMux()
 	mod.Routes(mux)
 
-	claims := &auth.Claims{Subject: ejec, TenantID: tenant, Rol: "ejecutivo", Audiencia: auth.AudienciaInterno}
+	claims := &auth.Claims{Subject: ejec, TenantID: "ai27", Rol: "ejecutivo", Audiencia: auth.AudienciaInterno}
 
 	enviar := func(body msgclient.EnviarMensajeEntrada) *httptest.ResponseRecorder {
 		b, _ := json.Marshal(body)

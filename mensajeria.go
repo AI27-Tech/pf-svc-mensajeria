@@ -198,16 +198,14 @@ func New(p Pools, d Deps) (*Module, error) {
 // juego de handlers de conversación.
 //
 // Emergencia (M9) se monta desde tracer.17 (DEC-100): la familia
-// /api/v1/viajes/{id}/emergencias sobre internal/emergencias. El catch-up de
-// bandeja (M3) ya entró en tracer.14.
+// /api/v1/viajes/{id}/emergencias y, desde tracer.34, la bandeja de Reacción y
+// las acciones por id del caso, todas sobre la superficie Emergencias(). El
+// catch-up de bandeja (M3) ya entró en tracer.14.
 func (m *Module) Routes(mux *http.ServeMux) {
 	m.handlersConversacion().Montar(mux)
 	m.handlersBandeja().Montar(mux)
 
-	emerhttp.Handlers{
-		Autz:        m.autz,
-		Emergencias: m.emergencias,
-	}.Montar(mux)
+	emerhttp.Handlers{API: m.Emergencias()}.Montar(mux)
 }
 
 // Workers devuelve los workers embebidos del módulo (ADR 29 §6), cada uno con el

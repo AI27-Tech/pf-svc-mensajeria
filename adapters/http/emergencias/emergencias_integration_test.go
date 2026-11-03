@@ -23,9 +23,9 @@ import (
 )
 
 const (
-	emTenant  = "t-em"
+	emTenant  = "e0000000-0000-0000-0000-0000000000e0" // empresa cliente: tenant == cliente_id (DEC-112)
 	emViaje   = "11111111-1111-1111-1111-111111111111"
-	emBandeja = "33333333-3333-3333-3333-333333333333"
+	clienteU  = "22222222-2222-2222-2222-222222222222" // usuario del portal de la empresa
 	reaccionA = "44444444-4444-4444-4444-444444444444"
 	reaccionB = "55555555-5555-5555-5555-555555555555"
 	superv    = "66666666-6666-6666-6666-666666666666"
@@ -41,8 +41,10 @@ type escenario struct {
 	caso  string
 }
 
-// montar siembra la bandeja de Reacción con A y B como miembros (Supervisor,
-// Coordinador y Monitorista sin fila de membresía) y activa un caso.
+// montar no siembra bandejas ni membresías (DEC-130: Reacción es miembro por su
+// rol y la bandeja nace con el primer caso). El cliente de la empresa activa un
+// caso, que queda bajo el tenant de la empresa; los internos llegan con el tenant
+// de AI27 (DEC-129).
 func montar(t *testing.T) escenario {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -54,13 +56,6 @@ func montar(t *testing.T) escenario {
 	dbtest.Reiniciar(t, ctx, admin)
 	t.Cleanup(func() { dbtest.Reiniciar(t, ctx, admin) })
 	dbtest.AplicarMigraciones(t, ctx, admin)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre)
-		 VALUES ('`+emBandeja+`', '`+emTenant+`', 'emergencias', 'Reacción')`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+emBandeja+`', '`+reaccionA+`', '`+emTenant+`', 'reaccion', 1, true),
-		        ('`+emBandeja+`', '`+reaccionB+`', '`+emTenant+`', 'reaccion', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	t.Cleanup(closePool)
@@ -73,7 +68,7 @@ func montar(t *testing.T) escenario {
 	mod.Routes(mux)
 	e := escenario{ctx: ctx, admin: admin, mux: mux, mod: mod}
 
-	rec := e.pedir(reaccionA, "reaccion", http.MethodPost, "/api/v1/viajes/"+emViaje+"/emergencias",
+	rec := e.pedir(clienteU, "cliente", http.MethodPost, "/api/v1/viajes/"+emViaje+"/emergencias",
 		msgclient.ActivarEmergenciaEntrada{ActivacionId: uuid.New()})
 	var caso msgclient.CasoEmergencia
 	if err := json.Unmarshal(rec.Body.Bytes(), &caso); rec.Code != http.StatusCreated || err != nil {
@@ -83,8 +78,13 @@ func montar(t *testing.T) escenario {
 	return e
 }
 
+// claims arma el token: el cliente con el tenant de su empresa, el interno con
+// el de AI27 (DEC-129).
 func claims(sub, rol string) *auth.Claims {
-	return &auth.Claims{Subject: sub, TenantID: emTenant, Rol: rol, Audiencia: auth.AudienciaInterno}
+	if rol == "cliente" {
+		return &auth.Claims{Subject: sub, TenantID: emTenant, Rol: rol, Audiencia: auth.AudienciaCliente}
+	}
+	return &auth.Claims{Subject: sub, TenantID: "ai27", Rol: rol, Audiencia: auth.AudienciaInterno}
 }
 
 // pedir llama al mux como bff: claims del sujeto en el contexto.
@@ -101,6 +101,16 @@ func (e escenario) pedir(sub, rol, metodo, ruta string, cuerpo any) *httptest.Re
 }
 
 func (e escenario) ruta() string { return "/api/v1/viajes/" + emViaje + "/emergencias/" + e.caso }
+
+// pedirComo llama al mux como un usuario cliente de la empresa (tenant) dada.
+func (e escenario) pedirComo(sub, tenant, metodo, ruta string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(metodo, ruta, nil)
+	req = req.WithContext(auth.ContextWithClaims(e.ctx,
+		&auth.Claims{Subject: sub, TenantID: tenant, Rol: "cliente", Audiencia: auth.AudienciaCliente}))
+	rec := httptest.NewRecorder()
+	e.mux.ServeHTTP(rec, req)
+	return rec
+}
 
 func (e escenario) reclamar(sub, rol string, v int64) *httptest.ResponseRecorder {
 	return e.pedir(sub, rol, http.MethodPost, e.ruta()+"/reclamos", msgclient.VersionEsperadaEntrada{VersionEsperada: v})
@@ -198,7 +208,7 @@ func TestReclamarCasoConResponsableHTTP(t *testing.T) {
 
 // TestLiberarTransferirCasoAjenoHTTP cubre DEC-126: otro miembro de Reacción no
 // libera ni transfiere el caso de A (403 por HTTP y en proceso); un Monitorista
-// sin membresía sigue en 401; Supervisor y Coordinador, sin fila de membresía,
+// recibe 403 (DEC-132); Supervisor y Coordinador, sin fila de membresía,
 // liberan y transfieren el caso ajeno; el responsable libera y transfiere el
 // suyo. Se salta sin MENSAJERIA_TEST_DB.
 func TestLiberarTransferirCasoAjenoHTTP(t *testing.T) {
@@ -238,8 +248,8 @@ func TestLiberarTransferirCasoAjenoHTTP(t *testing.T) {
 		msgclient.TransferenciaEntrada{ResponsableDestinoId: uuid.MustParse(reaccionB), VersionEsperada: 1}); platformerrors.AsCategory(err) != platformerrors.CategoryProhibido {
 		t.Fatalf("B transfiere el de A en proceso: err %v, quiere prohibido", err)
 	}
-	// Sin membresía ni mando, la guarda de acceso sigue respondiendo 401.
-	quiere("Monitorista libera", e.liberar(t, monit, "monitorista", 1), http.StatusUnauthorized)
+	// Sin rol de Reacción ni mando: 403 sobre un caso que existe (DEC-132).
+	quiere("Monitorista libera", e.liberar(t, monit, "monitorista", 1), http.StatusForbidden)
 	responsable("tras los rechazos", reaccionA, 1)
 
 	// Supervisor transfiere el de A a B (HTTP); Coordinador libera el de B (en proceso).
