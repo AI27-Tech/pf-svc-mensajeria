@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-11-02 17:59 — Pruebas E3-T3: versión previa a la transferencia y lectura sin envío
+
+**Para quién:** quien cierra la definición de terminado de E3-T3. Faltaban dos pruebas: P20 (una escritura en vuelo con la versión previa a una transferencia se rechaza) y lectura-sin-envío tras perder el reclamo. Solo pruebas; no cambia código de producción.
+
+**Resumen:** prueba de integración HTTP contra Postgres, como llama el bff.
+- `TestVersionAnteriorATransferenciaHTTP`: tras transferir, el responsable anterior envía y libera con la versión previa: ambos `409 conflicto`, no queda mensaje, y el destino envía con la versión que le dio la transferencia (`201`).
+- `TestLecturaSinEnvioTrasPerderReclamoHTTP` (por liberación y por transferencia): el ejecutivo anterior, con membresía vigente, obtiene la conversación y lista mensajes (`200`, ve el mensaje que envió con el reclamo) y su envío da `409 conflicto`.
+
+**Hallazgo, no corregido aquí:** `Transferir` reabre el reclamo del destino en versión 1 en lugar de avanzarla (la historia pide "incrementa `version`"). En el escenario de una transferencia el `409` lo produce la guarda de actor, no la versión. Medido: tras A→B→A, un envío de A con la versión previa entra (`201`), y un reclamar con la versión previa reasigna el reclamo (`201`, versión 2). P20 queda abierta en esa variante hasta corregir `Transferir`.
+
+**Cambios:**
+- `adapters/http/conversacion/reclamo_perdido_integration_test.go` (nuevo).
+- `CHANGELOG.md`.
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria`, `go test ./...` con y sin `MENSAJERIA_TEST_DB` (Postgres 18 local, base desechable), `arch-test@v0.1.1` OK.
+
 ## 2026-11-02 17:55 — No filtrar el error interno en la respuesta HTTP (seguridad)
 
 **Para quién:** cualquier cliente de las rutas HTTP de mensajeria (hoy el bff). Medido: un token con sujeto que no es UUID respondía `502` con el texto crudo de Postgres en el cuerpo (`"mensajeria: error interno: bandejas: iterar membresía: ERROR: invalid input syntax for type uuid: \"no-es-uuid\" (SQLSTATE 22P02)"`). Ahora responde `401 {"codigo":"no_autorizado","mensaje":"sin claims"}` sin llegar a SQL.
@@ -20,6 +36,7 @@
 - `emergencias_api_test.go`: el sujeto de prueba pasa a UUID; nueva prueba de sujeto no UUID en proceso.
 
 **Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...`, `go build ./cmd/api ./cmd/mensajeria`, `go test ./...` con y sin `MENSAJERIA_TEST_DB` (Postgres 18 local, base desechable), `arch-test@v0.1.1` OK. La prueba nueva de bandejas falla sobre `pf-msg-d` (502 con el texto de Postgres) y pasa con el arreglo.
+
 
 ## 2026:11:02 16:57 — Superficie en proceso de conversación y bandeja (`ConversacionesAPI`)
 
