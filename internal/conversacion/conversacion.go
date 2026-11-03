@@ -210,6 +210,20 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: publicar mensaje.creado en outbox: %w", err)
 	}
 
+	// Un mensaje nuevo del cliente desmarca atendida, en la tx del envío
+	// (DEC-122 #1). El envío interno no la toca: responder no marca ni desmarca
+	// (DEC-117). Sin evento propio: el registro del contrato no tiene uno para
+	// desmarcar (brecha reportada, no se inventa).
+	if !esInterno(in.RolAlEnviar) {
+		if _, err := tx.Exec(ctx,
+			`UPDATE mensajeria.estado_atendido SET atendida = false
+			  WHERE conversacion_id = $1 AND tenant_id = $2 AND atendida`,
+			in.ConversacionID, in.TenantID,
+		); err != nil {
+			return ResultadoEnvio{}, fmt.Errorf("conversacion: desmarcar atendida: %w", err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return ResultadoEnvio{}, fmt.Errorf("conversacion: commit del envío: %w", err)
 	}
@@ -609,6 +623,36 @@ func (s *Servicio) ClienteDeConversacion(ctx context.Context, tenantID, conversa
 		return "", nil
 	}
 	return *clienteID, nil
+}
+
+// ConversacionDeViaje devuelve el id de la conversación del viaje para el tenant
+// (contrato obtenerConversacionDeViaje): la no cerrada si existe (a lo más una,
+// índice una_conversacion_activa_por_viaje); si todas están cerradas, la más
+// reciente por creado_en (la tabla no guarda la hora de cierre).
+// ErrConversacionNoEncontrada si el viaje no tiene conversación en el tenant. No
+// decide ACCESO: lo hace la frontera con autorizacion.PuedeEscribir.
+func (s *Servicio) ConversacionDeViaje(ctx context.Context, tenantID, viajeID string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var id string
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM mensajeria.conversacion
+		  WHERE tenant_id = $1 AND viaje_id = $2
+		  ORDER BY estado = 'cerrada', creado_en DESC, id DESC
+		  LIMIT 1`,
+		tenantID, viajeID,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrConversacionNoEncontrada
+	}
+	if err != nil {
+		return "", fmt.Errorf("conversacion: buscar conversación del viaje: %w", err)
+	}
+	return id, nil
 }
 
 // ErrConversacionNoEncontrada la devuelve ClienteDeConversacion cuando la
