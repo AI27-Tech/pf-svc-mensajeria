@@ -22,8 +22,8 @@ func (e escenario) porID(caso string) string { return "/api/v1/emergencias/" + c
 
 // TestOperacionesPorIdHTTP recorre la bandeja de Reacción y el caso por su id
 // (tracer.34) con las reglas de DEC-129 a DEC-132, sin filas de membresía:
-//   - la bandeja la ven Reacción, Supervisor y Coordinador (404 para Ejecutivo y
-//     Cliente), sin datos del viaje, del más antiguo al más reciente y sin
+//   - la bandeja la ven Reacción, Supervisor y Coordinador (403 para Ejecutivo y
+//     404 para Cliente, DEC-132), sin datos del viaje, del más antiguo al más reciente y sin
 //     cerrados;
 //   - obtenerEmergencia trae viaje_id, cliente_id (la empresa) y el reclamo
 //     activo; 403 a otro rol interno y al Cliente de la empresa, 404 al Cliente de
@@ -77,7 +77,7 @@ func TestOperacionesPorIdHTTP(t *testing.T) {
 	if strings.Contains(crudo, "viaje_id") || strings.Contains(crudo, "cliente_id") {
 		t.Fatalf("la bandeja de Reacción no lleva viaje ni cliente: %s", crudo)
 	}
-	quiere("bandeja como ejecutivo", get(ejec, "ejecutivo", "/api/v1/bandeja/emergencias", nil), http.StatusNotFound, "")
+	quiere("bandeja como ejecutivo", get(ejec, "ejecutivo", "/api/v1/bandeja/emergencias", nil), http.StatusForbidden, "")
 	quiere("bandeja como cliente", get(clienteU, "cliente", "/api/v1/bandeja/emergencias", nil), http.StatusNotFound, "")
 
 	// Detalle: 200 a Reacción y Supervisor con viaje y empresa; 403 / 404 al resto.

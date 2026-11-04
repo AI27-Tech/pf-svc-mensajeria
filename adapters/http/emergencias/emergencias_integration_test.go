@@ -322,6 +322,11 @@ func TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &porMonitoreo); rec.Code != http.StatusCreated || err != nil {
 		t.Fatalf("Monitorista activa: status %d cuerpo %s", rec.Code, rec.Body.String())
 	}
+	// La activación devuelve el caso completo, no solo su id (contrato).
+	if porMonitoreo.ViajeId.String() != emViaje || porMonitoreo.Estado != "abierta" ||
+		porMonitoreo.ActivadaEn.IsZero() || porMonitoreo.Origen != "operacion" {
+		t.Fatalf("respuesta de activar: %+v; quiere viaje %s, abierta, activada_en y origen operacion", porMonitoreo, emViaje)
+	}
 	var tenant, cliente, origen string
 	if err := e.admin.QueryRow(e.ctx,
 		`SELECT tenant_id, cliente_id::text, origen FROM mensajeria.emergencia WHERE id = $1`,
@@ -361,15 +366,47 @@ func TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP(t *testing.T) {
 	if rec := activar(monit, "monitorista", noExiste); rec.Code != http.StatusNotFound {
 		t.Fatalf("Monitorista activa sobre un viaje desconocido: status %d, quiere 404; cuerpo %s", rec.Code, rec.Body.String())
 	}
+	// Reacción, Ejecutivo y Administrador no activan (DEC-045 #9): 403 sin crear caso.
+	for _, rol := range []string{"reaccion", "ejecutivo", "administrador", "jefe_operativo"} {
+		if rec := activar(uuid.New().String(), rol, emViaje); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s activa: status %d, quiere 403; cuerpo %s", rol, rec.Code, rec.Body.String())
+		}
+	}
 	var casos int
 	if err := e.admin.QueryRow(e.ctx, `SELECT count(*) FROM mensajeria.emergencia`).Scan(&casos); err != nil || casos != 2 {
 		t.Fatalf("casos = %d (err %v), quiere 2: los rechazos no crean nada", casos, err)
 	}
 
-	// Reacción ve los dos casos completos, sin acotar por tenant (DEC-129).
-	items = listar(e.pedir(reaccionA, "reaccion", http.MethodGet, rutaViaje, nil))
-	if len(items) != 2 || items[0].Origen != "cliente" || items[1].Origen != "operacion" ||
-		items[1].ActorReal == nil || items[1].ActorReal.String() != monit {
-		t.Fatalf("Reacción: %+v; quiere los dos casos con origen cliente/operacion y el actor de Monitoreo", items)
+	// El monitoreo y el Administrador ven los dos casos completos, sin acotar por
+	// tenant (DEC-129, DEC-135). Reacción y Ejecutivo no listan por viaje: 403.
+	for _, rol := range []string{"supervisor", "administrador"} {
+		items = listar(e.pedir(uuid.New().String(), rol, http.MethodGet, rutaViaje, nil))
+		if len(items) != 2 || items[0].Origen != "cliente" || items[1].Origen != "operacion" ||
+			items[1].ActorReal == nil || items[1].ActorReal.String() != monit {
+			t.Fatalf("%s: %+v; quiere los dos casos con origen cliente/operacion y el actor de Monitoreo", rol, items)
+		}
+	}
+	for _, rol := range []string{"reaccion", "ejecutivo"} {
+		if rec := e.pedir(uuid.New().String(), rol, http.MethodGet, rutaViaje, nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s lista por viaje: status %d, quiere 403; cuerpo %s", rol, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Notas: anotan el monitoreo y el Administrador; Reacción y Ejecutivo no
+	// (DEC-121 #4, DEC-135).
+	rutaNotas := rutaViaje + "/" + porMonitoreo.Id.String() + "/notas"
+	nota := msgclient.NotaEmergenciaEntrada{Cuerpo: "unidad detenida en caseta"}
+	for rol, want := range map[string]int{
+		"monitorista": http.StatusCreated, "administrador": http.StatusCreated,
+		"reaccion": http.StatusForbidden, "ejecutivo": http.StatusForbidden,
+	} {
+		if rec := e.pedir(uuid.New().String(), rol, http.MethodPost, rutaNotas, nota); rec.Code != want {
+			t.Fatalf("nota como %s: status %d, quiere %d; cuerpo %s", rol, rec.Code, want, rec.Body.String())
+		}
+	}
+	var notas int
+	if err := e.admin.QueryRow(e.ctx, `SELECT count(*) FROM mensajeria.nota_emergencia WHERE emergencia_id = $1`,
+		porMonitoreo.Id).Scan(&notas); err != nil || notas != 2 {
+		t.Fatalf("notas = %d (err %v), quiere 2: los rechazos no escriben", notas, err)
 	}
 }

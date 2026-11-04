@@ -52,11 +52,46 @@ func (f *casoFake) Resolver(context.Context, string, string, string, msgtipos.Ve
 func (f *casoFake) Cerrar(context.Context, string, string, string) error { panic("no se invoca") }
 
 func ctxConAudiencia(aud auth.Audiencia) context.Context {
+	rol := "cliente"
+	if aud == auth.AudienciaInterno {
+		rol = "monitorista"
+	}
+	return ctxConRol(aud, rol)
+}
+
+func ctxConRol(aud auth.Audiencia, rol string) context.Context {
 	return auth.ContextWithClaims(context.Background(), &auth.Claims{
 		Subject:   "11111111-1111-1111-1111-111111111111",
 		TenantID:  "t-1",
+		Rol:       rol,
 		Audiencia: aud,
 	})
+}
+
+// TestEmergencias_RolesDelMonitoreo: listar por viaje lo hacen monitoreo y
+// Administrador; activar, solo monitoreo (DEC-045 #9, DEC-135). Los demás roles
+// internos reciben 403 antes de tocar el dominio (el doble entra en pánico si se
+// llamara a Activar).
+func TestEmergencias_RolesDelMonitoreo(t *testing.T) {
+	api := &emergenciasAPI{emergencias: &casoFake{casos: []emergencias.CasoProyectado{unCaso()}}}
+	lista := map[string]bool{"monitorista": true, "supervisor": true, "coordinador": true, "administrador": true,
+		"reaccion": false, "ejecutivo": false, "jefe_operativo": false}
+	for rol, puede := range lista {
+		_, err := api.ListarEmergencias(ctxConRol(auth.AudienciaInterno, rol), uuid.New())
+		if puede && err != nil {
+			t.Errorf("listar como %s: %v, quiere éxito", rol, err)
+		}
+		if !puede && platformerrors.AsCategory(err) != platformerrors.CategoryProhibido {
+			t.Errorf("listar como %s: err %v, quiere prohibido", rol, err)
+		}
+	}
+	for _, rol := range []string{"administrador", "reaccion", "ejecutivo", "jefe_operativo"} {
+		_, _, err := api.ActivarEmergencia(ctxConRol(auth.AudienciaInterno, rol), uuid.New(),
+			msgclient.ActivarEmergenciaEntrada{ActivacionId: uuid.New()})
+		if platformerrors.AsCategory(err) != platformerrors.CategoryProhibido {
+			t.Errorf("activar como %s: err %v, quiere prohibido", rol, err)
+		}
+	}
 }
 
 // unCaso es un caso interno con todos los campos poblados.
