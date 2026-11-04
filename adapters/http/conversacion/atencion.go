@@ -40,7 +40,7 @@ func TraducirAtencion(err error) error {
 	case errors.Is(err, conversacion.ErrNoEsResponsable):
 		return platformerrors.NewProhibido("solo el responsable activo marca atendida")
 	case errors.Is(err, conversacion.ErrSinReclamoActivo):
-		return platformerrors.NewConflicto("conflicto_version_reclamo")
+		return platformerrors.NewConflictoCodigo("conflicto_version_reclamo", "mensajeria: conflicto_version_reclamo")
 	case errors.Is(err, conversacion.ErrConversacionNoEncontrada), errors.Is(err, auditoria.ErrConversacionNoEncontrada):
 		return platformerrors.NewNoEncontrado("conversacion no encontrada")
 	case errors.Is(err, auditoria.ErrCursorInvalido):

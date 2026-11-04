@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
+	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
+	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	"github.com/google/uuid"
 )
 
@@ -167,6 +169,19 @@ func TestOperacionesPorIdHTTP(t *testing.T) {
 	var cerrado msgclient.CasoEmergencia
 	if err := json.Unmarshal(cierre.Body.Bytes(), &cerrado); cierre.Code != http.StatusOK || err != nil || cerrado.Estado != "cerrada" || cerrado.ViajeId.String() != emViaje {
 		t.Fatalf("Monitorista cierra: status %d cuerpo %s; quiere 200 con el caso cerrado", cierre.Code, cierre.Body.String())
+	}
+
+	// Anotar sobre el caso cerrado: 409 con el código del contrato, por HTTP y en
+	// proceso (la superficie que usa core), no el genérico "conflicto".
+	nota := e.pedir(monit, "monitorista", http.MethodPost, e.ruta()+"/notas", msgclient.NotaEmergenciaEntrada{Cuerpo: "tarde"})
+	quiere("nota en cerrada", nota.Code, http.StatusConflict, nota.Body.String())
+	if c := codigo(t, nota); c != "emergencia_cerrada" {
+		t.Fatalf("nota en cerrada por HTTP: codigo %q, quiere emergencia_cerrada", c)
+	}
+	ctxMonit := auth.ContextWithClaims(e.ctx, &auth.Claims{Subject: monit, TenantID: "ai27", Rol: "monitorista", Audiencia: auth.AudienciaInterno})
+	err := e.mod.Emergencias().AgregarNotaEmergencia(ctxMonit, uuid.MustParse(emViaje), uuid.MustParse(e.caso), msgclient.NotaEmergenciaEntrada{Cuerpo: "tarde"})
+	if c := platformerrors.CodigoDe(err); c != "emergencia_cerrada" {
+		t.Fatalf("nota en cerrada en proceso: codigo %q (err %v), quiere emergencia_cerrada", c, err)
 	}
 
 	// La bandeja ya no trae el caso cerrado.

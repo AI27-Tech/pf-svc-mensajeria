@@ -163,8 +163,8 @@ func TestReclamarCasoConResponsableHTTP(t *testing.T) {
 	if rec := e.reclamar(reaccionA, "reaccion", 0); rec.Code != http.StatusCreated {
 		t.Fatalf("A reclama del pool: status %d, quiere 201; cuerpo %s", rec.Code, rec.Body.String())
 	}
-	if rec := e.reclamar(reaccionB, "reaccion", 1); rec.Code != http.StatusConflict || codigo(t, rec) != "conflicto" {
-		t.Fatalf("B reclama el de A: status %d codigo %q, quiere 409 conflicto", rec.Code, codigo(t, rec))
+	if rec := e.reclamar(reaccionB, "reaccion", 1); rec.Code != http.StatusConflict || codigo(t, rec) != "conflicto_version_reclamo" {
+		t.Fatalf("B reclama el de A: status %d codigo %q, quiere 409 conflicto_version_reclamo", rec.Code, codigo(t, rec))
 	}
 	ctxB := auth.ContextWithClaims(e.ctx, claims(reaccionB, "reaccion"))
 	if _, err := e.mod.Emergencias().ReclamarEmergencia(ctxB, uuid.MustParse(emViaje), uuid.MustParse(e.caso),
