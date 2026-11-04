@@ -1,5 +1,39 @@
 # CHANGELOG
 
+## 2026-11-04 16:50 — Vínculo pegajoso Ejecutivo↔cliente (DEC-128, DEC-103 #2 y #3)
+
+**Para quién:** el panel interno (bandeja de conversaciones y reclamo), el `bff` y `pf-svc-core` en proceso. Cambia lo que observan: un Ejecutivo ya no ve ni reclama la conversación nueva de un cliente cuyo dueño, otro Ejecutivo, está disponible; y el Cliente ya no puede reclamar.
+
+**Resumen:** el vínculo de DEC-103 no estaba implementado: toda conversación nueva caía al pool para todos. Ahora el primer Ejecutivo que reclama una conversación de una empresa cliente queda como su dueño, y las conversaciones nuevas de esa empresa le llegan solo a él mientras esté disponible (actividad en `mensajeria` en los últimos *N* minutos, 30 por defecto). Si no lo está, o deja de estarlo, la conversación es del pool y quien la reclama pasa a ser el nuevo dueño.
+
+**Comportamiento:**
+- Primer reclamo de una conversación de un cliente sin dueño: el reclamante queda como dueño (`dueno_cliente`, con fecha y la conversación que lo originó). La auditoría del reclamo lleva `nuevo_dueno`.
+- Conversación nueva (`viaje.mensajeria_habilitada`) de un cliente con dueño disponible: nace dirigida a él. Aparece en su `listarTrabajoMiBandeja` y no en la de otros Ejecutivos (ni en el bootstrap ni en el catch-up, ni por la ruta con `{id}`). Supervisor y Coordinador la ven (DEC-131).
+- Otro Ejecutivo que reclama una conversación dirigida recibe `409 conflicto_version_reclamo`, como un reclamo sobre una conversación ya tomada (DEC-123): el panel recarga y ya no la ve. El intento queda en la auditoría con `dirigida_a`.
+- La dirección vence sin job: se evalúa al leer y al reclamar. Vence cuando el dueño pasa *N* sin actividad y no revive si vuelve; termina también cuando alguien la reclama.
+- Dueño no disponible: quien reclama una conversación del cliente pasa a ser el dueño; la auditoría lleva `nuevo_dueno` y `dueno_anterior`. Con el dueño disponible, reclamar una conversación del pool de ese cliente no cambia al dueño.
+- Actividad: reclamar, enviar (interno), marcar atendida y registrar un recibo, en la misma transacción de la acción.
+- El Cliente que reclama recibe `403` (el contrato dice que solo reclama el `ejecutivo`); antes pasaba la guarda y el reclamo lo habría hecho dueño.
+- Límite conocido: cuando una dirección vence, o el dueño la reclama, la revisión de la bandeja no avanza. Los demás Ejecutivos la ven en su siguiente bootstrap, no en el catch-up.
+
+**Cambios:**
+- `internal/vinculo` (nuevo): `Dirigir`, `DirigidaAOtro`, `Tomar`, `Actividad` y las condiciones SQL de dirección y visibilidad.
+- `internal/reclamos`: el reclamo rechaza la conversación dirigida a otro (`ErrConflictoVersion.DirigidaA`) y registra dueño y actividad.
+- `internal/conversacion`: la creación dirige al dueño; envío interno, atendida y recibos registran actividad.
+- `internal/bandejas`: las cuatro lecturas reciben el lector y filtran las dirigidas a otro Ejecutivo.
+- `internal/autorizacion`: acción `Reclamar` (Cliente prohibido) y `LectorDirigidas`.
+- `mensajeria.go`: `Deps.VentanaDisponible` (cero vale 30 minutos). `cmd/api` y `cmd/mensajeria` la leen de `MENSAJERIA_DISPONIBLE_MINUTOS`.
+- Pruebas: `TestVinculoPegajosoEjecutivoCliente` (dos módulos con *N* de 1 h y 10 ms sobre la misma base).
+
+**Migración:** `0009_vinculo_ejecutivo_cliente.sql`: tablas `dueno_cliente` y `actividad_ejecutivo`, columna `ruta_conversacion.dirigida_a`, grants SELECT/INSERT/UPDATE. Aditiva e idempotente; las conversaciones existentes quedan en el pool.
+
+**Archivos modificados:**
+- `migrations/mensajeria/0009_vinculo_ejecutivo_cliente.sql`, `internal/vinculo/vinculo.go`
+- `internal/reclamos/reclamos.go`, `internal/conversacion/conversacion.go`, `internal/conversacion/atencion.go`, `internal/bandejas/bandejas.go`, `internal/autorizacion/autorizacion.go`
+- `mensajeria.go`, `conversaciones_api.go`, `adapters/http/bandejas/bandejas.go`, `adapters/http/conversacion/conversacion.go`
+- `cmd/api/main.go`, `cmd/mensajeria/main.go`, `README.md`
+- `vinculo_pegajoso_integration_test.go`, `adapters/http/bandejas/bandejas_test.go`, `internal/bandejas/bandejas_integration_test.go`
+
 ## 2026-11-04 16:20 — Los 409 llevan el código de máquina del contrato
 
 **Para quién:** el `bff`, `pf-svc-core` y los dos frontends. Cambia lo que observan: el campo `codigo` de un 409 de `mensajeria` deja de ser siempre `"conflicto"` y trae el código que declara el contrato.

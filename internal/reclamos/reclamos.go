@@ -33,6 +33,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -41,12 +42,20 @@ import (
 // ErrConflictoVersion es el conflicto de concurrencia optimista: el perdedor de
 // dos reclamos concurrentes lo recibe. El paquete raíz lo mapea a la taxonomía
 // de la plataforma (409). Lleva las versiones para diagnóstico.
+//
+// DirigidaA no vacío: la conversación sigue dirigida a otro Ejecutivo, su dueño
+// (DEC-128), y solo él la reclama. Es conflicto como el reclamo de DEC-123: el
+// panel recarga su bandeja, donde esa conversación ya no aparece.
 type ErrConflictoVersion struct {
-	Esperada msgtipos.VersionReclamo
-	Actual   msgtipos.VersionReclamo
+	Esperada  msgtipos.VersionReclamo
+	Actual    msgtipos.VersionReclamo
+	DirigidaA string
 }
 
 func (e ErrConflictoVersion) Error() string {
+	if e.DirigidaA != "" {
+		return fmt.Sprintf("reclamos: conversación dirigida a su dueño %s", e.DirigidaA)
+	}
 	return fmt.Sprintf("reclamos: conflicto de versión: esperada %d, actual %d", e.Esperada, e.Actual)
 }
 
@@ -74,6 +83,9 @@ type Publicador interface {
 type Servicio struct {
 	pool Begin
 	pub  Publicador
+	// Ventana es N, la disponibilidad del dueño del cliente (DEC-128). Cero vale
+	// vinculo.VentanaPorDefecto.
+	Ventana vinculo.Ventana
 }
 
 // NewServicio construye el servicio de reclamos.
@@ -87,6 +99,11 @@ func NewServicio(pool Begin, pub Publicador) *Servicio {
 // DEC-123) o la versión no es la vigente, devuelve ErrConflictoVersion y NO
 // modifica nada. La carrera real la arbitra Postgres: de dos reclamos
 // concurrentes desde el pool, el índice único parcial deja abrir a uno solo.
+//
+// Vínculo pegajoso (DEC-128): una conversación dirigida a otro Ejecutivo, su
+// dueño disponible, devuelve ErrConflictoVersion con DirigidaA. El reclamo
+// ganado registra la actividad del reclamante y puede hacerlo dueño del cliente
+// (vinculo.Tomar).
 //
 // Cada intento queda en auditoria_mensajeria (E3-T6): el ganado en la misma tx
 // del reclamo, el perdido en una tx propia tras el conflicto.
@@ -116,10 +133,14 @@ func (s *Servicio) auditarIntentoPerdido(ctx context.Context, tenantID, conversa
 		return fmt.Errorf("reclamos: abrir transacción de auditoría: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	detalle := map[string]any{"version_esperada": c.Esperada, "version_actual": c.Actual}
+	if c.DirigidaA != "" {
+		detalle["dirigida_a"] = c.DirigidaA
+	}
 	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
 		TenantID: tenantID, ConversacionID: conversacionID, ActorReal: actorReal,
 		Accion:  auditoria.AccionReclamoPerdido,
-		Detalle: map[string]any{"version_esperada": c.Esperada, "version_actual": c.Actual},
+		Detalle: detalle,
 	}); err != nil {
 		return err
 	}
@@ -151,6 +172,14 @@ func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actor
 	if hay || esperada != actual {
 		return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual}
 	}
+	// Dirigida a su dueño disponible (DEC-128 #2): solo él la reclama.
+	dueno, err := vinculo.DirigidaAOtro(ctx, tx, tenantID, conversacionID, actorReal, s.Ventana)
+	if err != nil {
+		return 0, err
+	}
+	if dueno != "" {
+		return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual, DirigidaA: dueno}
+	}
 	nueva := int64(actual) + 1
 	reclamoID, err := abrir(ctx, tx, tenantID, conversacionID, actorReal, nueva)
 	if esViolacionUnica(err) {
@@ -163,10 +192,23 @@ func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actor
 		return 0, err
 	}
 
+	// El reclamo es actividad del Ejecutivo y puede hacerlo dueño del cliente
+	// (DEC-103 #2 y #3). El cambio de dueño queda en la auditoría del reclamo.
+	toma, err := vinculo.Tomar(ctx, tx, tenantID, conversacionID, actorReal, s.Ventana)
+	if err != nil {
+		return 0, err
+	}
+	detalle := map[string]any{"reclamo_id": reclamoID, "version_esperada": esperada, "version_reclamo": nueva}
+	if toma.Nuevo {
+		detalle["nuevo_dueno"] = true
+		if toma.Anterior != "" {
+			detalle["dueno_anterior"] = toma.Anterior
+		}
+	}
 	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
 		TenantID: tenantID, ConversacionID: conversacionID, ActorReal: actorReal,
 		Accion:  auditoria.AccionReclamoGanado,
-		Detalle: map[string]any{"reclamo_id": reclamoID, "version_esperada": esperada, "version_reclamo": nueva},
+		Detalle: detalle,
 	}); err != nil {
 		return 0, err
 	}

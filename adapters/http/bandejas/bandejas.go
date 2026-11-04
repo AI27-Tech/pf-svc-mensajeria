@@ -27,12 +27,14 @@ type Autorizador interface {
 
 // Trabajador sirve el bootstrap y el catch-up de una bandeja (internal/bandejas).
 type Trabajador interface {
-	Trabajo(ctx context.Context, tenantID, bandejaID string) ([]msgclient.Conversacion, int64, error)
-	CambiosDesde(ctx context.Context, tenantID, bandejaID string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
+	// lector es autorizacion.LectorDirigidas: el Ejecutivo no ve las
+	// conversaciones dirigidas a otro (DEC-128).
+	Trabajo(ctx context.Context, tenantID, bandejaID, lector string) ([]msgclient.Conversacion, int64, error)
+	CambiosDesde(ctx context.Context, tenantID, bandejaID, lector string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
 	// TrabajoChat y CambiosChatDesde sirven la unión de las bandejas de chat de
 	// todos los tenants, la bandeja del sujeto interno (DEC-129).
-	TrabajoChat(ctx context.Context) ([]msgclient.Conversacion, int64, error)
-	CambiosChatDesde(ctx context.Context, desde int64) ([]msgclient.Conversacion, int64, bool, error)
+	TrabajoChat(ctx context.Context, lector string) ([]msgclient.Conversacion, int64, error)
+	CambiosChatDesde(ctx context.Context, lector string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
 }
 
 // SinBandejaChat es el mensaje del 404 de la bandeja del sujeto: rol que no la
@@ -67,19 +69,21 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 		escribirError(w, err)
 		return
 	}
+	lector := autorizacion.LectorDirigidas(claims)
 	h.servirTrabajo(w, r,
 		func() ([]msgclient.Conversacion, int64, error) {
-			return h.Bandeja.Trabajo(r.Context(), tenant, bandejaID)
+			return h.Bandeja.Trabajo(r.Context(), tenant, bandejaID, lector)
 		},
 		func(desde int64) ([]msgclient.Conversacion, int64, bool, error) {
-			return h.Bandeja.CambiosDesde(r.Context(), tenant, bandejaID, desde)
+			return h.Bandeja.CambiosDesde(r.Context(), tenant, bandejaID, lector, desde)
 		})
 }
 
 // miTrabajo sirve el trabajo de la bandeja del SUJETO, sin {id}: la unión de las
 // bandejas de chat de todos los tenants (DEC-127, DEC-129). La ven el Ejecutivo y,
 // en lectura, Supervisor y Coordinador (DEC-131); cualquier otro rol y el cliente
-// reciben 404 (no tienen bandeja, contrato listarTrabajoMiBandeja).
+// reciben 404 (no tienen bandeja, contrato listarTrabajoMiBandeja). El Ejecutivo
+// no ve las conversaciones dirigidas a otro Ejecutivo (DEC-128).
 func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {
@@ -90,10 +94,11 @@ func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
 		escribirError(w, platformerrors.NewNoEncontrado(SinBandejaChat))
 		return
 	}
+	lector := autorizacion.LectorDirigidas(claims)
 	h.servirTrabajo(w, r,
-		func() ([]msgclient.Conversacion, int64, error) { return h.Bandeja.TrabajoChat(r.Context()) },
+		func() ([]msgclient.Conversacion, int64, error) { return h.Bandeja.TrabajoChat(r.Context(), lector) },
 		func(desde int64) ([]msgclient.Conversacion, int64, bool, error) {
-			return h.Bandeja.CambiosChatDesde(r.Context(), desde)
+			return h.Bandeja.CambiosChatDesde(r.Context(), lector, desde)
 		})
 }
 

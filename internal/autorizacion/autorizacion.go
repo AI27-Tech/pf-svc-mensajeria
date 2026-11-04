@@ -59,8 +59,11 @@ type Accion int
 const (
 	// Leer: detalle, mensajes y bandeja.
 	Leer Accion = iota
-	// Escribir: enviar, reclamar, liberar, transferir, atendida y recibos.
+	// Escribir: enviar, liberar, transferir, atendida y recibos.
 	Escribir
+	// Reclamar: tomar la conversación del pool. Solo el Ejecutivo; a diferencia
+	// de Escribir, el Cliente tampoco (un reclamo lo haría dueño, DEC-128).
+	Reclamar
 )
 
 // Permiso es lo que un interno pide sobre un caso de emergencia.
@@ -93,6 +96,7 @@ var (
 	rolesConversacion = map[Accion][]roles.Rol{
 		Leer:     {roles.RolEjecutivo, roles.RolSupervisor, roles.RolCoordinador},
 		Escribir: {roles.RolEjecutivo},
+		Reclamar: {roles.RolEjecutivo},
 	}
 	rolesEmergencia = map[Permiso][]roles.Rol{
 		VerCaso:       {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
@@ -116,6 +120,16 @@ func PuedeEnEmergencias(rol string, p Permiso) bool { return tiene(rolesEmergenc
 // Ejecutivo por ser miembro (DEC-127) y Supervisor/Coordinador en lectura
 // (DEC-131).
 func LeeBandejaChat(rol string) bool { return tiene(rolesConversacion[Leer], rol) }
+
+// LectorDirigidas es el lector de la bandeja de conversaciones para el filtro
+// de dirigidas (DEC-128): el Ejecutivo que lee, que no ve las dirigidas a otro.
+// Vacío para Supervisor y Coordinador, que las ven todas en lectura (DEC-131).
+func LectorDirigidas(c *auth.Claims) string {
+	if c.Rol == string(roles.RolEjecutivo) {
+		return c.Subject
+	}
+	return ""
+}
 
 // VeBandejaEmergencias dice si el rol ve la bandeja única de emergencias:
 // Reacción por ser miembro (DEC-130) y Supervisor/Coordinador (DEC-131).
@@ -149,11 +163,15 @@ func (s *Servicio) TenantDeConversacion(ctx context.Context, conversacionID stri
 }
 
 // Conversacion autoriza la acción sobre la conversación y devuelve su tenant.
-// Cualquier usuario de la empresa cliente dueña lee y escribe (DEC-124). Un
+// Cualquier usuario de la empresa cliente dueña lee y escribe (DEC-124), pero
+// no reclama (contrato reclamarConversacion: solo `ejecutivo`): prohibido. Un
 // interno necesita el rol de la acción (rolesConversacion) y que la conversación
 // esté enrutada a la bandeja de conversaciones (DEC-127); si no, prohibido.
 func (s *Servicio) Conversacion(ctx context.Context, conversacionID string, c *auth.Claims, a Accion) (string, error) {
 	tenant, err := s.TenantDeConversacion(ctx, conversacionID, c)
+	if err == nil && c.Audiencia == auth.AudienciaCliente && a == Reclamar {
+		return "", platformerrors.NewProhibido("autorizacion: el cliente no reclama conversaciones")
+	}
 	if err != nil || c.Audiencia == auth.AudienciaCliente {
 		return tenant, err
 	}
