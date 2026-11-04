@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-11-04 16:40 — platform-go v0.1.9: un token sin rol ni audiencia se rechaza
+
+**Para quién:** quien llama a `mensajeria` con un token. Un token verificado que no trae claim `audiencia` ni `rol` ahora recibe 401 `no_autorizado`; antes se tomaba como audiencia Interno, que no se acota por tenant (DEC-129). Los tokens con `audiencia` explícita, con `rol` `cliente` o con cualquiera de los roles internos se comportan igual que antes.
+
+**Cambios:**
+- `go.mod`/`go.sum`: `pf-pkg-platform-go` v0.1.8 → v0.1.9 (PR #41 de platform-go). Sin cambio de código.
+
+**Verificación:** `gofmt` limpio, `go vet ./...`, `go build ./...` (incluye `./cmd/...`), `go test ./...` sin BD y con `MENSAJERIA_TEST_DB` (Postgres 16 local), `arch-test` (v0.1.1 del CI y v0.1.9) en verde. Ninguna prueba arma un token sin rol contra el `auth.Verifier` real (las que usan claims sin rol pasan por autenticadores falsos), así que no se tocó ningún fixture.
+
 ## 2026-11-04 16:20 — Los 409 llevan el código de máquina del contrato
 
 **Para quién:** el `bff`, `pf-svc-core` y los dos frontends. Cambia lo que observan: el campo `codigo` de un 409 de `mensajeria` deja de ser siempre `"conflicto"` y trae el código que declara el contrato.
