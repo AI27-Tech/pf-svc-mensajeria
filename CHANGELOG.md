@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## 2026-11-04 — Emergencias del monitoreo por rol (DEC-135), bandeja con 403 para internos (DEC-132) y activación con el caso completo
+## 2026-11-04 13:51 — Emergencias del monitoreo por rol (DEC-135), bandeja con 403 para internos (DEC-132) y activación con el caso completo
 
 **Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno. Cambia lo que observan: activar, anotar y listar los casos de un viaje ahora revisan el rol del interno, y la activación devuelve el caso completo en lugar de solo su id.
 
