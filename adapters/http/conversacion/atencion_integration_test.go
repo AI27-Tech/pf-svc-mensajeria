@@ -93,7 +93,11 @@ func (e escenarioAtencion) pedir(sub, rol, metodo, ruta string, cuerpo any) *htt
 		_ = json.NewEncoder(&body).Encode(cuerpo)
 	}
 	req := httptest.NewRequest(metodo, ruta, &body)
-	req = req.WithContext(auth.ContextWithClaims(e.ctx, &auth.Claims{Subject: sub, TenantID: atTenant, Rol: rol, Audiencia: aud}))
+	tenant := atTenant
+	if aud == auth.AudienciaInterno {
+		tenant = "ai27" // el interno llega con el tenant de AI27 (DEC-129)
+	}
+	req = req.WithContext(auth.ContextWithClaims(e.ctx, &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: aud}))
 	rec := httptest.NewRecorder()
 	e.mux.ServeHTTP(rec, req)
 	return rec
@@ -135,7 +139,8 @@ func TestMarcarAtendidaHTTP(t *testing.T) {
 		{"miembro no responsable", atOtro, "ejecutivo", 1, http.StatusForbidden},
 		{"miembro no responsable con versión obsoleta", atOtro, "ejecutivo", 0, http.StatusConflict},
 		{"cliente dueño", atCliente, "cliente", 1, http.StatusForbidden},
-		{"monitorista, no miembro", atExtrano, "monitorista", 1, http.StatusUnauthorized},
+		{"monitorista, no miembro", atExtrano, "monitorista", 1, http.StatusForbidden},
+		{"supervisor solo lee (DEC-131)", atExtrano, "supervisor", 1, http.StatusForbidden},
 		{"responsable con versión obsoleta", atEjec, "ejecutivo", 0, http.StatusConflict},
 		{"responsable con versión vigente", atEjec, "ejecutivo", 1, http.StatusNoContent},
 	}
@@ -238,7 +243,7 @@ func TestRecibosP23HTTP(t *testing.T) {
 	}
 
 	// Sin acceso: no autorizado y sin efecto.
-	if c := recibo(atExtrano, "monitorista", "leido", 3); c != http.StatusUnauthorized {
+	if c := recibo(atExtrano, "monitorista", "leido", 3); c != http.StatusForbidden {
 		t.Fatalf("recibo de monitorista: status %d, quiere 401", c)
 	}
 	if got := cursor(atExtrano, "leido_hasta"); got != -1 {

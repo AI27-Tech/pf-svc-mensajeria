@@ -16,7 +16,7 @@ import (
 )
 
 // TestListarTrabajoBandejaHTTP prueba el handler de punta a punta contra Postgres
-// real: autorización por membresía de pool, bootstrap (items + revisión) y
+// real: autorización por rol sin acotar por tenant, bootstrap (items + revisión) y
 // catch-up incremental por desde_revision. Llama al handler como lo llama bff
 // (claims en contexto).
 func TestListarTrabajoBandejaHTTP(t *testing.T) {
@@ -69,7 +69,8 @@ func TestListarTrabajoBandejaHTTP(t *testing.T) {
 		if sub == otro {
 			rol = "monitorista"
 		}
-		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: auth.AudienciaInterno}
+		// El interno llega con el tenant de AI27, no el del cliente (DEC-129).
+		return &auth.Claims{Subject: sub, TenantID: "ai27", Rol: rol, Audiencia: auth.AudienciaInterno}
 	}
 	get := func(sub, query string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/bandejas/"+bandeja+"/trabajo"+query, nil)
@@ -79,9 +80,9 @@ func TestListarTrabajoBandejaHTTP(t *testing.T) {
 		return rec
 	}
 
-	// Monitorista (no Ejecutivo): 401, como antes sin membresía.
-	if rec := get(otro, ""); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("monitorista: status %d, quiere 401; cuerpo %s", rec.Code, rec.Body.String())
+	// Monitorista (no Ejecutivo): 403 sobre una bandeja que existe (DEC-132).
+	if rec := get(otro, ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("monitorista: status %d, quiere 403; cuerpo %s", rec.Code, rec.Body.String())
 	}
 
 	// Bootstrap: 200 con las dos conversaciones y revisión 2.

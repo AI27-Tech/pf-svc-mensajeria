@@ -2,10 +2,11 @@ package bandejas_test
 
 import (
 	"context"
-	"errors"
+	"slices"
 	"testing"
 	"time"
 
+	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/dbtest"
 )
@@ -110,17 +111,18 @@ func TestTrabajoYCatchUp(t *testing.T) {
 	}
 }
 
-// TestResolverMiBandeja prueba la resolución de la bandeja única de
-// conversaciones del tenant (DEC-127), contra Postgres real. Quién es miembro lo
-// decide el rol en el llamador; aquí no hay pool_membresia. Afirma:
-//   - tenant con una bandeja de chat y una de emergencias -> la de chat;
-//   - tenant con solo bandeja de emergencias -> ErrBandejaNoEncontrada (el
-//     handler lo mapea a 404);
-//   - tenant con dos bandejas de chat (sembradas antes de DEC-127) -> la más
-//     antigua, el mismo criterio que la creación y la migración 0008.
+// TestTrabajoChatUneTenants prueba la bandeja de conversaciones del interno
+// (DEC-129) contra Postgres real: la unión de las bandejas de chat de dos tenants
+// con una revisión coherente. EnrutarABandejaUnica estampa cada alta con la
+// revisión siguiente de TODAS las bandejas de chat, así que:
+//   - altas A1, B1, A2 toman las revisiones 1, 2 y 3;
+//   - TrabajoChat trae las tres con revisión 3; CambiosChatDesde(1) trae B1 y A2;
+//   - la bandeja de A sigue con catch-up propio monotónico: revisión 3,
+//     CambiosDesde(A, 1) trae A2;
+//   - una bandeja de emergencias no entra a la unión.
 //
 // Se salta si MENSAJERIA_TEST_DB no está definido.
-func TestResolverMiBandeja(t *testing.T) {
+func TestTrabajoChatUneTenants(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -133,46 +135,71 @@ func TestResolverMiBandeja(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant       = "t1"
-		tenantSolo   = "t2"
-		bandejaChat  = "cccccccc-cccc-cccc-cccc-cccccccccccc"
-		bandejaEmer  = "dddddddd-dddd-dddd-dddd-dddddddddddd"
-		bandejaEmer2 = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+		tA = "a0000000-0000-0000-0000-00000000000a"
+		tB = "b0000000-0000-0000-0000-00000000000b"
+		a1 = "a1000000-0000-0000-0000-000000000001"
+		a2 = "a2000000-0000-0000-0000-000000000002"
+		b1 = "b1000000-0000-0000-0000-000000000001"
 	)
 	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision, creado_en) VALUES
-		 ('`+bandejaEmer+`', '`+tenant+`', 'emergencias', 'pool reacción', 0, '2026-01-01T00:00:00Z'),
-		 ('`+bandejaChat+`', '`+tenant+`', 'chat', 'pool chat', 0, '2026-01-02T00:00:00Z'),
-		 ('`+bandejaEmer2+`', '`+tenantSolo+`', 'emergencias', 'pool reacción', 0, '2026-01-01T00:00:00Z')`)
+		`INSERT INTO mensajeria.conversacion (id, tenant_id, viaje_id, cliente_id) VALUES
+		 ('`+a1+`', '`+tA+`', gen_random_uuid(), '`+tA+`'),
+		 ('`+a2+`', '`+tA+`', gen_random_uuid(), '`+tA+`'),
+		 ('`+b1+`', '`+tB+`', gen_random_uuid(), '`+tB+`')`)
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.bandeja (tenant_id, tipo, nombre, revision)
+		 VALUES ('`+tA+`', 'emergencias', 'Emergencias', 9)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
+	for _, c := range [][2]string{{tA, a1}, {tB, b1}, {tA, a2}} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("abrir tx: %v", err)
+		}
+		if err := bandejas.EnrutarABandejaUnica(ctx, tx, c[0], c[1]); err != nil {
+			t.Fatalf("enrutar %s: %v", c[1], err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
 	svc := bandejas.NewServicio(pool)
 
-	// Caso 1: la bandeja de chat del tenant, aunque la de emergencias sea más antigua.
-	got, err := svc.ResolverMiBandeja(ctx, tenant)
-	if err != nil {
-		t.Fatalf("ResolverMiBandeja: %v", err)
-	}
-	if got != bandejaChat {
-		t.Fatalf("bandeja resuelta = %q, quiere %q", got, bandejaChat)
-	}
-
-	// Caso 2: un tenant con solo bandeja de emergencias no tiene bandeja de chat.
-	if _, err := svc.ResolverMiBandeja(ctx, tenantSolo); !errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-		t.Fatalf("tenant sin bandeja de chat: err = %v, quiere ErrBandejaNoEncontrada", err)
+	ids := func(items []msgclient.Conversacion) []string {
+		var out []string
+		for _, c := range items {
+			out = append(out, c.Id.String())
+		}
+		return out
 	}
 
-	// Caso 3: dos bandejas de chat -> la más antigua.
-	const bandejaChatVieja = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre, revision, creado_en)
-		 VALUES ('`+bandejaChatVieja+`', '`+tenant+`', 'chat', 'pool chat viejo', 0, '2025-12-31T00:00:00Z')`)
-	got, err = svc.ResolverMiBandeja(ctx, tenant)
+	items, rev, err := svc.TrabajoChat(ctx)
 	if err != nil {
-		t.Fatalf("ResolverMiBandeja con dos de chat: %v", err)
+		t.Fatalf("TrabajoChat: %v", err)
 	}
-	if got != bandejaChatVieja {
-		t.Fatalf("con dos bandejas de chat = %q, quiere la más antigua %q", got, bandejaChatVieja)
+	if got, want := ids(items), []string{a1, b1, a2}; rev != 3 || !slices.Equal(got, want) {
+		t.Fatalf("TrabajoChat = %v rev %d, quiere %v rev 3", got, rev, want)
+	}
+
+	items, rev, fuera, err := svc.CambiosChatDesde(ctx, 1)
+	if err != nil {
+		t.Fatalf("CambiosChatDesde: %v", err)
+	}
+	if got, want := ids(items), []string{b1, a2}; rev != 3 || fuera || !slices.Equal(got, want) {
+		t.Fatalf("CambiosChatDesde(1) = %v rev %d fuera %v, quiere %v rev 3", got, rev, fuera, want)
+	}
+
+	var bandejaA string
+	if err := admin.QueryRow(ctx,
+		`SELECT id::text FROM mensajeria.bandeja WHERE tenant_id = $1 AND tipo = 'chat'`, tA).Scan(&bandejaA); err != nil {
+		t.Fatalf("leer bandeja de A: %v", err)
+	}
+	items, rev, _, err = svc.CambiosDesde(ctx, tA, bandejaA, 1)
+	if err != nil {
+		t.Fatalf("CambiosDesde(A): %v", err)
+	}
+	if got, want := ids(items), []string{a2}; rev != 3 || !slices.Equal(got, want) {
+		t.Fatalf("CambiosDesde(A, 1) = %v rev %d, quiere %v rev 3", got, rev, want)
 	}
 }

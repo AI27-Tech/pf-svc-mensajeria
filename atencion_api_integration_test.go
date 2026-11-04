@@ -69,7 +69,8 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	mod.Routes(mux)
 
 	como := func(sub, rol string) context.Context {
-		return auth.ContextWithClaims(ctx, &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: auth.AudienciaInterno})
+		// El interno llega con el tenant de AI27, no el del cliente (DEC-129).
+		return auth.ContextWithClaims(ctx, &auth.Claims{Subject: sub, TenantID: "ai27", Rol: rol, Audiencia: auth.AudienciaInterno})
 	}
 	categoria := func(err error) platformerrors.Category { return platformerrors.AsCategory(err) }
 	statusHTTP := func(ctxReq context.Context, metodo, ruta string, cuerpo any) int {
@@ -133,10 +134,13 @@ func TestConversacionesAPIAtencion(t *testing.T) {
 	if got := leidoAI27(); got != 2 {
 		t.Fatalf("leído AI27 tras recibo del responsable: %d, quiere 2", got)
 	}
-	// Un rol que no es miembro de la bandeja (DEC-127) recibe la misma denegación
-	// que antes recibía quien no tenía membresía.
-	if err := api.RegistrarReciboLeido(como(uuid.NewString(), "monitorista"), convUUID, msgclient.ReciboEntrada{HastaSecuencia: 1}); categoria(err) != platformerrors.CategoryNoAutorizado {
-		t.Fatalf("recibo de monitorista: categoría %v, quiere no_autorizado", categoria(err))
+	// Un rol que no es miembro de la bandeja (DEC-127) recibe 403 (DEC-132).
+	if err := api.RegistrarReciboLeido(como(uuid.NewString(), "monitorista"), convUUID, msgclient.ReciboEntrada{HastaSecuencia: 1}); categoria(err) != platformerrors.CategoryProhibido {
+		t.Fatalf("recibo de monitorista: categoría %v, quiere prohibido", categoria(err))
+	}
+	// Un supervisor lee pero no registra recibos (DEC-131).
+	if err := api.RegistrarReciboLeido(como(uuid.NewString(), "supervisor"), convUUID, msgclient.ReciboEntrada{HastaSecuencia: 1}); categoria(err) != platformerrors.CategoryProhibido {
+		t.Fatalf("recibo de supervisor: categoría %v, quiere prohibido", categoria(err))
 	}
 
 	// Auditoría: solo administrador; trae la atendida con su actor.

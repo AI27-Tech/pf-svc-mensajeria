@@ -70,7 +70,11 @@ func TestConversacionesAPI(t *testing.T) {
 	mod.Routes(mux)
 
 	como := func(sub, rol string, aud auth.Audiencia) context.Context {
-		return auth.ContextWithClaims(ctx, &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: aud})
+		t := tenant
+		if aud == auth.AudienciaInterno {
+			t = "ai27" // el interno llega con el tenant de AI27 (DEC-129)
+		}
+		return auth.ContextWithClaims(ctx, &auth.Claims{Subject: sub, TenantID: t, Rol: rol, Audiencia: aud})
 	}
 	interno := func(sub string) context.Context { return como(sub, "ejecutivo", auth.AudienciaInterno) }
 	ctxCliente := como(cliente, "cliente", auth.AudienciaCliente)
@@ -126,11 +130,11 @@ func TestConversacionesAPI(t *testing.T) {
 		t.Fatalf("conversación: id %s estado %s version %d; quiere %s abierta 0", c.Id, c.Estado, c.VersionReclamo, conv)
 	}
 
-	// Denegación: un interno que no es Ejecutivo no reclama (DEC-127), con la
-	// misma categoría que antes sin membresía y que HTTP 401.
+	// Denegación: un interno que no es Ejecutivo no reclama (DEC-127): 403 sobre
+	// una conversación que existe (DEC-132), igual por HTTP.
 	_, err = api.ReclamarConversacion(ctxMonitorista, convUUID, msgclient.VersionEsperadaEntrada{VersionEsperada: 0})
-	if categoria(err) != platformerrors.CategoryNoAutorizado {
-		t.Fatalf("reclamar como monitorista: categoría %v, quiere no_autorizado", categoria(err))
+	if categoria(err) != platformerrors.CategoryProhibido {
+		t.Fatalf("reclamar como monitorista: categoría %v, quiere prohibido", categoria(err))
 	}
 	rutaReclamos := "/api/v1/conversaciones/" + conv + "/reclamos"
 	if got := statusHTTP(ctxMonitorista, http.MethodPost, rutaReclamos, msgclient.VersionEsperadaEntrada{}); got != categoria(err).HTTPStatus() {
