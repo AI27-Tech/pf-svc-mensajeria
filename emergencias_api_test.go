@@ -13,14 +13,23 @@ import (
 	"github.com/google/uuid"
 )
 
-// casoFake es un casoDeEmergencia doble: solo implementa ListarPorViaje con un
-// caso fijo; el resto no se invoca en estas pruebas.
+// casoFake es un casoDeEmergencia doble: solo implementa ListarPorViaje con
+// casos fijos; el resto no se invoca en estas pruebas.
 type casoFake struct {
 	casos []emergencias.CasoProyectado
 }
 
-func (f *casoFake) ListarPorViaje(_ context.Context, _, _ string, _ bool) ([]emergencias.CasoProyectado, error) {
+func (f *casoFake) ListarPorViaje(context.Context, string) ([]emergencias.CasoProyectado, error) {
 	return f.casos, nil
+}
+func (f *casoFake) Bandeja(context.Context) ([]emergencias.CasoProyectado, error) {
+	panic("no se invoca")
+}
+func (f *casoFake) Obtener(context.Context, string, string) (emergencias.CasoProyectado, error) {
+	panic("no se invoca")
+}
+func (f *casoFake) ListarNotas(context.Context, string, string) ([]emergencias.NotaProyectada, error) {
+	panic("no se invoca")
 }
 func (f *casoFake) Activar(context.Context, emergencias.EntradaActivacion) (emergencias.ResultadoActivacion, error) {
 	panic("no se invoca")
@@ -54,6 +63,7 @@ func ctxConAudiencia(aud auth.Audiencia) context.Context {
 func unCaso() emergencias.CasoProyectado {
 	return emergencias.CasoProyectado{
 		ID:             uuid.New().String(),
+		TenantID:       "t-1",
 		ViajeID:        uuid.New().String(),
 		ClienteID:      uuid.New().String(),
 		Estado:         "en_atencion",
@@ -86,6 +96,31 @@ func TestListarEmergencias_ClienteOcultaCamposInternos(t *testing.T) {
 	}
 	if got.Origen != "" {
 		t.Errorf("cliente NO debe ver origen, fue %q", got.Origen)
+	}
+}
+
+// TestListarEmergencias_ClienteSoloSuEmpresaYNoCerrados: el dominio devuelve los
+// casos del viaje de todos los tenants (DEC-129); al Cliente solo le quedan los
+// de su empresa que no están cerrados (ADR 21 §6). El interno los ve todos.
+func TestListarEmergencias_ClienteSoloSuEmpresaYNoCerrados(t *testing.T) {
+	propio, ajeno, cerrado := unCaso(), unCaso(), unCaso()
+	ajeno.TenantID = "t-otro"
+	cerrado.Estado = "cerrada"
+	api := &emergenciasAPI{emergencias: &casoFake{casos: []emergencias.CasoProyectado{propio, ajeno, cerrado}}}
+
+	pag, err := api.ListarEmergencias(ctxConAudiencia(auth.AudienciaCliente), uuid.New())
+	if err != nil {
+		t.Fatalf("ListarEmergencias: %v", err)
+	}
+	if len(pag.Items) != 1 || pag.Items[0].Id.String() != propio.ID {
+		t.Fatalf("cliente: got %+v, want solo el caso %s", pag.Items, propio.ID)
+	}
+	pag, err = api.ListarEmergencias(ctxConAudiencia(auth.AudienciaInterno), uuid.New())
+	if err != nil {
+		t.Fatalf("ListarEmergencias interno: %v", err)
+	}
+	if len(pag.Items) != 3 {
+		t.Fatalf("interno: got %d casos, want 3", len(pag.Items))
 	}
 }
 

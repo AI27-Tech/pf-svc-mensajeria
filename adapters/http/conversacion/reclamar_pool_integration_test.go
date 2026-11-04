@@ -45,7 +45,7 @@ func TestReclamarSoloDesdeElPoolHTTP(t *testing.T) {
 		t.Fatalf("B reclama la de A por HTTP: status %d codigo %q, quiere 409 conflicto; cuerpo %s", rec.Code, errB.Codigo, rec.Body.String())
 	}
 	// Y por la superficie en proceso (adaptador de pf-svc-core): mismo conflicto.
-	ctxB := auth.ContextWithClaims(e.ctx, &auth.Claims{Subject: atOtro, TenantID: atTenant, Rol: "ejecutivo", Audiencia: auth.AudienciaInterno})
+	ctxB := auth.ContextWithClaims(e.ctx, &auth.Claims{Subject: atOtro, TenantID: "ai27", Rol: "ejecutivo", Audiencia: auth.AudienciaInterno})
 	if _, err := e.mod.Conversaciones().ReclamarConversacion(ctxB, uuid.MustParse(atConv), msgclient.VersionEsperadaEntrada{VersionEsperada: 1}); platformerrors.AsCategory(err) != platformerrors.CategoryConflicto {
 		t.Fatalf("B reclama la de A en proceso: err %v, quiere conflicto", err)
 	}

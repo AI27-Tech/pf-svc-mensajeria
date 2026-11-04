@@ -20,15 +20,19 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/google/uuid"
 )
 
-// Autorizador decide el acceso a una conversación (internal/autorizacion).
+// Autorizador decide el acceso a una conversación (internal/autorizacion) y
+// devuelve el tenant de la conversación, que es el que usan las llamadas
+// siguientes: un interno no se acota por el tenant de su token (DEC-129).
 type Autorizador interface {
-	PuedeEscribir(ctx context.Context, tenantID, conversacionID string, c *auth.Claims) error
+	Conversacion(ctx context.Context, conversacionID string, c *auth.Claims, a autorizacion.Accion) (string, error)
+	TenantDeConversacion(ctx context.Context, conversacionID string, c *auth.Claims) (string, error)
 }
 
 // Reclamador toma, libera y transfiere el reclamo de una conversación
@@ -55,7 +59,7 @@ type Enviador interface {
 	MensajePorID(ctx context.Context, tenantID, mensajeID string) (*msgclient.Mensaje, error)
 	ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error)
 	ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error)
-	ConversacionDeViaje(ctx context.Context, tenantID, viajeID string) (string, error)
+	ConversacionDeViaje(ctx context.Context, viajeID string) (string, error)
 	ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error)
 }
 
@@ -94,9 +98,9 @@ func (h Handlers) Montar(mux *http.ServeMux) {
 }
 
 // obtener atiende GET /api/v1/conversaciones/{id}: hidrata el agregado
-// Conversacion para el bootstrap. Autoriza el ACCESO (empresa cliente dueña,
-// DEC-124; o rol `ejecutivo` sobre la bandeja de chat, DEC-127); un sin-acceso recibe el mismo 404 que si no existiera
-// (Addendum §7, poseer el UUID no autoriza). Devuelve el agregado completo; el
+// Conversacion para el bootstrap. Autoriza la LECTURA (empresa cliente dueña,
+// DEC-124; `ejecutivo`, `supervisor` o `coordinador`, DEC-127/131). El Cliente de
+// otra empresa recibe 404 y otro rol interno 403 (DEC-132). Devuelve el agregado completo; el
 // consumidor (bff) recorta por audiencia para su schema de cliente.
 func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
@@ -106,12 +110,13 @@ func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Leer)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
 
-	conv, err := h.Conversacion.ObtenerConversacion(r.Context(), claims.TenantID, convID)
+	conv, err := h.Conversacion.ObtenerConversacion(r.Context(), tenant, convID)
 	if err != nil {
 		if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
 			escribirError(w, platformerrors.NewNoEncontrado("conversacion no encontrada"))
@@ -140,9 +145,9 @@ func (h Handlers) obtenerDeViaje(w http.ResponseWriter, r *http.Request) {
 }
 
 // ObtenerDeViaje resuelve la conversación del viaje, autoriza el acceso con la
-// misma guarda que obtenerConversacion y la hidrata. Sin acceso responde 404,
-// igual que un viaje sin conversación (contrato: poseer el viaje_id no
-// autoriza). Devuelve errores ya traducidos a la taxonomía. Exportada para que
+// misma guarda que obtenerConversacion y la hidrata. El Cliente de otra empresa
+// recibe 404, igual que un viaje sin conversación; otro rol interno recibe 403
+// (contrato, DEC-132). Devuelve errores ya traducidos a la taxonomía. Exportada para que
 // la superficie en proceso (mensajeria.ConversacionesAPI) siga el MISMO camino.
 func (h Handlers) ObtenerDeViaje(ctx context.Context, claims *auth.Claims, viajeID string) (*msgclient.Conversacion, error) {
 	noEncontrada := platformerrors.NewNoEncontrado("conversacion no encontrada")
@@ -150,20 +155,20 @@ func (h Handlers) ObtenerDeViaje(ctx context.Context, claims *auth.Claims, viaje
 	if err != nil {
 		return nil, noEncontrada // un id que no es UUID no nombra ningún viaje
 	}
-	convID, err := h.Conversacion.ConversacionDeViaje(ctx, claims.TenantID, viaje.String())
+	// Se busca por viaje sin acotar por tenant: la guarda decide después si el
+	// llamante la ve (Cliente de otra empresa → 404; otro rol interno → 403).
+	convID, err := h.Conversacion.ConversacionDeViaje(ctx, viaje.String())
 	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
 		return nil, noEncontrada
 	}
 	if err != nil {
 		return nil, traducir(err)
 	}
-	if err := h.Autz.PuedeEscribir(ctx, claims.TenantID, convID, claims); err != nil {
-		if platformerrors.AsCategory(err) == platformerrors.CategoryNoAutorizado {
-			return nil, noEncontrada
-		}
+	tenant, err := h.Autz.Conversacion(ctx, convID, claims, autorizacion.Leer)
+	if err != nil {
 		return nil, err
 	}
-	conv, err := h.Conversacion.ObtenerConversacion(ctx, claims.TenantID, convID)
+	conv, err := h.Conversacion.ObtenerConversacion(ctx, tenant, convID)
 	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
 		return nil, noEncontrada
 	}
@@ -186,7 +191,8 @@ func (h Handlers) listarMensajes(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Leer)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
@@ -215,7 +221,7 @@ func (h Handlers) listarMensajes(w http.ResponseWriter, r *http.Request) {
 		lim = int(*limite)
 	}
 
-	items, hayMas, err := h.Conversacion.ListarMensajes(r.Context(), claims.TenantID, convID, antesDe, despuesDe, lim)
+	items, hayMas, err := h.Conversacion.ListarMensajes(r.Context(), tenant, convID, antesDe, despuesDe, lim)
 	if err != nil {
 		escribirError(w, traducir(err))
 		return
@@ -238,7 +244,8 @@ func queryInt(r *http.Request, nombre string) (*int64, error) {
 }
 
 // reclamar toma del pool el reclamo de una conversación. Exige claims, autoriza
-// con internal/autorizacion (rol `ejecutivo`, DEC-127), reclama con la versión esperada y
+// la escritura con internal/autorizacion (rol `ejecutivo`, DEC-127; supervisor y
+// coordinador solo leen, DEC-131), reclama con la versión esperada y
 // devuelve 201 con el Reclamo. El conflicto de versión del dominio, también el de
 // una conversación que ya tiene responsable (DEC-123), se traduce a 409
 // (addendum §4 punto 5).
@@ -250,7 +257,8 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
@@ -261,13 +269,13 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := h.Reclamos.Reclamar(r.Context(), claims.TenantID, convID, claims.Subject, msgtipos.VersionReclamo(entrada.VersionEsperada))
+	_, err = h.Reclamos.Reclamar(r.Context(), tenant, convID, claims.Subject, msgtipos.VersionReclamo(entrada.VersionEsperada))
 	if err != nil {
 		escribirError(w, TraducirReclamo(err))
 		return
 	}
 
-	reclamo, err := h.Reclamo.ReclamoActivo(r.Context(), claims.TenantID, convID)
+	reclamo, err := h.Reclamo.ReclamoActivo(r.Context(), tenant, convID)
 	if err != nil {
 		// shortcut: hidratación en una lectura aparte del reclamo, no en la tx del
 		// Reclamar; una liberación concurrente entre ambas podría dar ErrSinReclamo.
@@ -297,12 +305,13 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
 
-	err = h.Reclamos.Liberar(r.Context(), claims.TenantID, convID, rid, claims.Subject, msgtipos.VersionReclamo(ver))
+	err = h.Reclamos.Liberar(r.Context(), tenant, convID, rid, claims.Subject, msgtipos.VersionReclamo(ver))
 	if err != nil {
 		escribirError(w, TraducirReclamo(err))
 		return
@@ -323,7 +332,8 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
@@ -338,14 +348,14 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 		motivo = *entrada.Motivo
 	}
 
-	err := h.Reclamos.Transferir(r.Context(), claims.TenantID, convID, claims.Subject,
+	err = h.Reclamos.Transferir(r.Context(), tenant, convID, claims.Subject,
 		entrada.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(entrada.VersionEsperada))
 	if err != nil {
 		escribirError(w, TraducirReclamo(err))
 		return
 	}
 
-	reclamo, err := h.Reclamo.ReclamoActivo(r.Context(), claims.TenantID, convID)
+	reclamo, err := h.Reclamo.ReclamoActivo(r.Context(), tenant, convID)
 	if err != nil {
 		escribirError(w, traducir(err))
 		return
@@ -366,7 +376,8 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	if err := h.Autz.PuedeEscribir(r.Context(), claims.TenantID, convID, claims); err != nil {
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	if err != nil {
 		escribirError(w, err)
 		return
 	}
@@ -377,7 +388,7 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	alias, err := h.ResolverAlias(r.Context(), claims.TenantID, convID)
+	alias, err := h.ResolverAlias(r.Context(), tenant, convID)
 	if err != nil {
 		escribirError(w, traducir(err))
 		return
@@ -394,7 +405,7 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := h.Conversacion.Enviar(r.Context(), conversacion.EntradaEnvio{
-		TenantID:               claims.TenantID,
+		TenantID:               tenant,
 		ConversacionID:         convID,
 		ActorReal:              claims.Subject,
 		ClientMessageID:        entrada.ClientMessageId.String(),
@@ -433,7 +444,7 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mensaje, err := h.Conversacion.MensajePorID(r.Context(), claims.TenantID, res.MensajeID)
+	mensaje, err := h.Conversacion.MensajePorID(r.Context(), tenant, res.MensajeID)
 	if err != nil {
 		escribirError(w, traducir(err))
 		return

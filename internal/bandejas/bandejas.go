@@ -48,28 +48,6 @@ func NewServicio(db Consultor) *Servicio {
 // existe para el tenant. El llamador la mapea a no_encontrado.
 var ErrBandejaNoEncontrada = errors.New("bandejas: bandeja no encontrada")
 
-// ResolverMiBandeja devuelve el id de la bandeja única de conversaciones del
-// tenant (DEC-127, DEC-103 #1): el llamante no nombra la bandeja. Quién es
-// miembro lo decide el rol, no esta función (autorizacion.EsMiembroBandejaChat);
-// el llamador lo verifica antes. Filtra por tipo 'chat' para no devolver una
-// bandeja de Reacción. Sin bandeja de chat en el tenant -> ErrBandejaNoEncontrada
-// (el llamador lo mapea a 404).
-//
-// Si un tenant tiene más de una bandeja de chat (sembradas antes de DEC-127),
-// la única es la más antigua, el mismo criterio que bandejaReaccion de
-// emergencias y que EnrutarABandejaUnica.
-func (s *Servicio) ResolverMiBandeja(ctx context.Context, tenantID string) (string, error) {
-	var bandejaID string
-	err := s.db.QueryRow(ctx, sqlBandejaChat, tenantID).Scan(&bandejaID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrBandejaNoEncontrada
-	}
-	if err != nil {
-		return "", fmt.Errorf("bandejas: resolver bandeja de conversaciones: %w", err)
-	}
-	return bandejaID, nil
-}
-
 // sqlBandejaChat elige la bandeja única de conversaciones del tenant.
 const sqlBandejaChat = `SELECT id FROM mensajeria.bandeja
 	 WHERE tenant_id = $1 AND tipo = 'chat'
@@ -88,14 +66,19 @@ type Ejecutor interface {
 // tiene. Avanza bandeja.revision y estampa esa revisión en la ruta nueva, para
 // que el catch-up la reporte como alta (0003_ruta_revision).
 //
-// Un lock transaccional por tenant serializa la creación de la bandeja: dos
-// conversaciones nuevas del mismo tenant no crean dos bandejas.
+// La revisión que estampa es la siguiente de TODAS las bandejas de chat, no solo
+// la de su tenant: así la unión de bandejas que ve un interno (DEC-129) tiene una
+// revisión coherente, la máxima, y su catch-up es "rutas con revisión mayor"
+// (TrabajoChat, CambiosChatDesde). La revisión de cada bandeja sigue siendo
+// monotónica, así que el catch-up por {id} no cambia.
+//
+// Un lock transaccional global serializa el enrutamiento: dos conversaciones
+// nuevas no crean dos bandejas para un tenant ni toman la misma revisión.
 func EnrutarABandejaUnica(ctx context.Context, tx Ejecutor, tenantID, conversacionID string) error {
 	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtext('mensajeria.bandeja_chat'), hashtext($1))`,
-		tenantID,
+		`SELECT pg_advisory_xact_lock(hashtext('mensajeria.bandeja_chat'))`,
 	); err != nil {
-		return fmt.Errorf("bandejas: bloquear bandeja del tenant: %w", err)
+		return fmt.Errorf("bandejas: bloquear bandejas de conversaciones: %w", err)
 	}
 
 	var bandejaID string
@@ -113,7 +96,8 @@ func EnrutarABandejaUnica(ctx context.Context, tx Ejecutor, tenantID, conversaci
 
 	if _, err := tx.Exec(ctx,
 		`WITH rev AS (
-		   UPDATE mensajeria.bandeja SET revision = revision + 1
+		   UPDATE mensajeria.bandeja
+		      SET revision = (SELECT max(revision) + 1 FROM mensajeria.bandeja WHERE tipo = 'chat')
 		    WHERE id = $1 AND tenant_id = $2
 		   RETURNING revision)
 		 INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, revision)
@@ -138,8 +122,8 @@ func (s *Servicio) Trabajo(ctx context.Context, tenantID, bandejaID string) ([]m
 	if err != nil {
 		return nil, 0, err
 	}
-	items, err := s.consultar(ctx, tenantID, bandejaID,
-		`AND r.activa ORDER BY r.revision`)
+	items, err := s.consultar(ctx,
+		`WHERE r.bandeja_id = $1 AND r.tenant_id = $2 AND r.activa ORDER BY r.revision`, bandejaID, tenantID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -160,12 +144,61 @@ func (s *Servicio) CambiosDesde(ctx context.Context, tenantID, bandejaID string,
 	if err != nil {
 		return nil, 0, false, err
 	}
-	items, err := s.consultar(ctx, tenantID, bandejaID,
-		`AND r.revision > $3 ORDER BY r.revision`, desde)
+	items, err := s.consultar(ctx,
+		`WHERE r.bandeja_id = $1 AND r.tenant_id = $2 AND r.revision > $3 ORDER BY r.revision`, bandejaID, tenantID, desde)
 	if err != nil {
 		return nil, 0, false, err
 	}
 	return items, rev, false, nil
+}
+
+// TrabajoChat es el BOOTSTRAP de la bandeja de conversaciones de un interno
+// (listarTrabajoMiBandeja, DEC-129): la unión de las bandejas de chat de todos los
+// tenants, sin acotar por el tenant de quien pregunta. Su revisión es la máxima
+// de esas bandejas; EnrutarABandejaUnica estampa cada alta por encima de ella,
+// así que todo lo que cambie después del bootstrap tiene revisión mayor. La
+// revisión se lee ANTES que las filas, como en Trabajo: una alta concurrente
+// queda en las filas con una revisión que el catch-up vuelve a entregar, nunca al
+// revés.
+func (s *Servicio) TrabajoChat(ctx context.Context) ([]msgclient.Conversacion, int64, error) {
+	rev, err := s.revisionChat(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	items, err := s.consultar(ctx,
+		`WHERE b.tipo = 'chat' AND r.activa ORDER BY r.revision, r.id`)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, rev, nil
+}
+
+// CambiosChatDesde es el CATCH-UP de la unión de TrabajoChat: las rutas de
+// cualquier bandeja de chat con revisión mayor a `desde`, incluidas las
+// inactivas. Igual que CambiosDesde, sin purga no hay fuera de ventana.
+func (s *Servicio) CambiosChatDesde(ctx context.Context, desde int64) ([]msgclient.Conversacion, int64, bool, error) {
+	rev, err := s.revisionChat(ctx)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	items, err := s.consultar(ctx,
+		`WHERE b.tipo = 'chat' AND r.revision > $1 ORDER BY r.revision, r.id`, desde)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return items, rev, false, nil
+}
+
+// revisionChat es la revisión de la unión de bandejas de chat: la máxima (0 si
+// no hay ninguna).
+func (s *Servicio) revisionChat(ctx context.Context) (int64, error) {
+	var rev int64
+	if err := s.db.QueryRow(ctx,
+		`SELECT COALESCE(max(revision), 0) FROM mensajeria.bandeja WHERE tipo = 'chat'`,
+	).Scan(&rev); err != nil {
+		return 0, fmt.Errorf("bandejas: leer revisión de las bandejas de conversaciones: %w", err)
+	}
+	return rev, nil
 }
 
 // revisionColeccion lee bandeja.revision, el cursor de dominio de la colección.
@@ -185,14 +218,12 @@ func (s *Servicio) revisionColeccion(ctx context.Context, tenantID, bandejaID st
 	return rev, nil
 }
 
-// consultar lee las conversaciones de la bandeja con el filtro dado sobre la
-// ruta (r). Une ruta_conversacion → conversacion y un LEFT JOIN al reclamo
+// consultar lee las conversaciones con el WHERE dado sobre la ruta (r). Une ruta_conversacion → conversacion y un LEFT JOIN al reclamo
 // activo para version_reclamo (required en el contrato); sin reclamo activo, la
 // versión más alta de la conversación (0 si nunca se reclamó), con la que se
 // reclama desde el pool. El filtro y sus args extra los pone el llamador
-// (bootstrap: activa; catch-up: revision > desde).
-func (s *Servicio) consultar(ctx context.Context, tenantID, bandejaID, filtro string, extraArgs ...any) ([]msgclient.Conversacion, error) {
-	args := append([]any{bandejaID, tenantID}, extraArgs...)
+// (bootstrap: activa; catch-up: revision > desde). b es la bandeja de la ruta.
+func (s *Servicio) consultar(ctx context.Context, donde string, args ...any) ([]msgclient.Conversacion, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
 		        c.escritura_hasta, c.creado_en, r.bandeja_id,
@@ -203,9 +234,11 @@ func (s *Servicio) consultar(ctx context.Context, tenantID, bandejaID, filtro st
 		   FROM mensajeria.ruta_conversacion r
 		   JOIN mensajeria.conversacion c
 		     ON c.id = r.conversacion_id AND c.tenant_id = r.tenant_id
+		   JOIN mensajeria.bandeja b
+		     ON b.id = r.bandeja_id AND b.tenant_id = r.tenant_id
 		   LEFT JOIN mensajeria.reclamo rec
 		     ON rec.conversacion_id = c.id AND rec.tenant_id = c.tenant_id AND rec.cerrado_en IS NULL
-		  WHERE r.bandeja_id = $1 AND r.tenant_id = $2 `+filtro,
+		 `+donde,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("bandejas: consultar trabajo: %w", err)

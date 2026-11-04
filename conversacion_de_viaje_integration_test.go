@@ -88,15 +88,17 @@ func TestObtenerConversacionDeViaje(t *testing.T) {
 		ultimaSq int64
 	}{
 		{"abierta, cliente dueño", clienteT1, viajeAbierto, http.StatusOK, convAbierta, 4},
-		{"abierta, ejecutivo sin filas de membresía", como(ejec, tenant, "ejecutivo", auth.AudienciaInterno), viajeAbierto, http.StatusOK, convAbierta, 4},
+		// DEC-129: el interno llega con el tenant de AI27, no el del cliente.
+		{"abierta, ejecutivo sin filas de membresía", como(ejec, "ai27", "ejecutivo", auth.AudienciaInterno), viajeAbierto, http.StatusOK, convAbierta, 4},
+		{"abierta, supervisor lee (DEC-131)", como(extrano, "ai27", "supervisor", auth.AudienciaInterno), viajeAbierto, http.StatusOK, convAbierta, 4},
 		{"todas cerradas: la más reciente", clienteT1, viajeCerrado, http.StatusOK, convCerradaB, 2},
 		{"sin conversación", clienteT1, viajeSin, http.StatusNotFound, "", 0},
 		{"otro tenant", como(cliente, "t2", "cliente", auth.AudienciaCliente), viajeAbierto, http.StatusNotFound, "", 0},
 		// DEC-124: otro usuario de la misma empresa (sub ≠ cliente_id) la lee.
 		{"otro usuario de la empresa", como(uuid.NewString(), tenant, "cliente", auth.AudienciaCliente), viajeAbierto, http.StatusOK, convAbierta, 4},
-		// DEC-127: un rol que no es Ejecutivo recibe el 404 de antes.
-		{"interno monitorista", como(extrano, tenant, "monitorista", auth.AudienciaInterno), viajeAbierto, http.StatusNotFound, "", 0},
-		{"interno sin ruta activa (cerrada)", como(ejec, tenant, "ejecutivo", auth.AudienciaInterno), viajeCerrado, http.StatusNotFound, "", 0},
+		// DEC-132: otro rol interno, o una conversación sin ruta, es 403.
+		{"interno monitorista", como(extrano, "ai27", "monitorista", auth.AudienciaInterno), viajeAbierto, http.StatusForbidden, "", 0},
+		{"interno sin ruta activa (cerrada)", como(ejec, "ai27", "ejecutivo", auth.AudienciaInterno), viajeCerrado, http.StatusForbidden, "", 0},
 		{"sin claims", nil, viajeAbierto, http.StatusUnauthorized, "", 0},
 	}
 	for _, c := range casos {

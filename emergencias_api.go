@@ -17,24 +17,27 @@ import (
 
 // EmergenciasAPI es la superficie pública en proceso del carril de emergencia
 // (E7). La consume el adaptador en proceso bff→mensajeria de pf-svc-core, que es
-// el único repo que ve a bff y a mensajeria a la vez. Su forma es exactamente el
-// puerto bff.MensajeriaPort (tipos de pf-pkg-contracts), de modo que el adaptador
-// la envuelva sin traducir.
+// el único repo que ve a bff y a mensajeria a la vez. Sus tipos son los de
+// pf-pkg-contracts, de modo que el adaptador la envuelva sin traducir.
 //
-// Por qué existe (00/05/09 decían bff→mensajeria SIEMPRE HTTP, sin Consultas()):
-// al co-ubicar mensajeria dentro de core (E7 en el deployment compuesto), la
-// arista se resuelve en proceso y necesita una superficie pública tipada con el
-// contrato, igual que operacion.ConsultasAPI y catalogos.ConsultasAPI. La lógica
-// de contrato (autorizar, proyectar por audiencia, traducir errores, orquestar
-// resolver=Resolver+AgregarNota) vive AQUÍ, en una sola copia; el handler HTTP de
-// adapters/http/emergencias delega en esta misma superficie (minimize reader
-// load: la regla de audiencia no se duplica).
+// Es la ÚNICA copia de las reglas de contrato de emergencia (autorizar,
+// proyectar por audiencia, traducir errores, orquestar resolver =
+// Resolver + AgregarNota): el handler HTTP de adapters/http/emergencias solo
+// decodifica, llama a esta superficie y codifica.
 //
-// Autorización e identidad: igual que el handler HTTP, lee los claims del ctx
-// (auth.ClaimsFromContext), no de un bearer. El bff antepone su middleware, así
-// que los claims ya viajan en el ctx cuando la llamada llega aquí en proceso. El
-// parámetro bearer del puerto bff lo consume el adaptador HTTP del bff, no esta
-// superficie.
+// Familias: las operaciones por viaje (tracer.17) y las gemelas por id del caso
+// (tracer.34, DEC-028) corren sobre los MISMOS casos de uso con las MISMAS
+// reglas; solo cambian los parámetros de ruta. Las por viaje no usan el viaje_id
+// para autorizar: el caso se nombra por su id.
+//
+// Reglas (internal/autorizacion): sin acotar por el tenant de quien pregunta
+// (DEC-129); Reacción por rol, sin filas de membresía (DEC-130); Supervisor y
+// Coordinador ven, liberan y transfieren pero no reclaman ni resuelven (DEC-131);
+// interno sin permiso → 403, Cliente sobre otra empresa → 404 (DEC-132).
+//
+// Autorización e identidad: lee los claims del ctx (auth.ClaimsFromContext), no
+// de un bearer. El bff antepone su middleware, así que los claims ya viajan en el
+// ctx cuando la llamada llega aquí en proceso.
 type EmergenciasAPI interface {
 	ListarEmergencias(ctx context.Context, viajeID msgclient.Id) (*msgclient.PaginaEmergencias, error)
 	ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (caso *msgclient.CasoEmergencia, idempotente bool, err error)
@@ -44,6 +47,15 @@ type EmergenciasAPI interface {
 	TransferirEmergencia(ctx context.Context, viajeID, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
 	ResolverEmergencia(ctx context.Context, viajeID, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) error
 	CerrarEmergencia(ctx context.Context, viajeID, emergenciaID msgclient.Id) error
+
+	ListarBandejaEmergencias(ctx context.Context, params msgclient.ListarBandejaEmergenciasParams) (*msgclient.PaginaBandejaEmergencias, error)
+	ObtenerEmergencia(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error)
+	ListarNotasEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, params msgclient.ListarNotasEmergenciaPorIdParams) (*msgclient.PaginaNotasEmergencia, error)
+	ReclamarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error)
+	LiberarReclamoEmergenciaPorId(ctx context.Context, emergenciaID, reclamoID msgclient.Id, params msgclient.LiberarReclamoEmergenciaPorIdParams) error
+	TransferirEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
+	ResolverEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) (*msgclient.EmergenciaReaccion, error)
+	CerrarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error)
 }
 
 // Emergencias construye la superficie pública de emergencia sobre los casos de
@@ -56,7 +68,8 @@ func (m *Module) Emergencias() EmergenciasAPI {
 // autorizador es la parte de autorizacion.Servicio que el carril de emergencia
 // usa. Se declara aquí (consumidor) para no acoplar la fachada al tipo concreto.
 type autorizador interface {
-	PuedeAtenderEmergencia(ctx context.Context, tenantID, emergenciaID string, c *auth.Claims) error
+	TenantDeEmergencia(ctx context.Context, emergenciaID string, c *auth.Claims) (string, error)
+	Emergencia(ctx context.Context, emergenciaID string, c *auth.Claims, p autorizacion.Permiso) (string, error)
 }
 
 // casoDeEmergencia es la parte de emergencias.Servicio que la fachada usa.
@@ -68,7 +81,10 @@ type casoDeEmergencia interface {
 	Transferir(ctx context.Context, tenantID, emergenciaID, actor, destino string, esperada msgtipos.VersionReclamo, mando bool) error
 	Resolver(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) error
 	Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal string) error
-	ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]emergencias.CasoProyectado, error)
+	ListarPorViaje(ctx context.Context, viajeID string) ([]emergencias.CasoProyectado, error)
+	Bandeja(ctx context.Context) ([]emergencias.CasoProyectado, error)
+	Obtener(ctx context.Context, tenantID, emergenciaID string) (emergencias.CasoProyectado, error)
+	ListarNotas(ctx context.Context, tenantID, emergenciaID string) ([]emergencias.NotaProyectada, error)
 }
 
 type emergenciasAPI struct {
@@ -94,42 +110,51 @@ func claimsDe(ctx context.Context) (*auth.Claims, error) {
 	return c, nil
 }
 
+// ListarEmergencias devuelve los casos del viaje. Al interno, todos y completos,
+// de cualquier tenant (DEC-129). Al Cliente, solo los de su empresa y no
+// cerrados, en la vista mínima (ADR 21 §6).
 func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclient.Id) (*msgclient.PaginaEmergencias, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
 	}
-	esCliente := claims.Audiencia == auth.AudienciaCliente
-	casos, err := a.emergencias.ListarPorViaje(ctx, claims.TenantID, viajeID.String(), esCliente)
+	casos, err := a.emergencias.ListarPorViaje(ctx, viajeID.String())
 	if err != nil {
 		return nil, traducir(err)
 	}
+	esCliente := claims.Audiencia == auth.AudienciaCliente
 	items := make([]msgclient.CasoEmergencia, 0, len(casos))
 	for _, c := range casos {
+		if esCliente && (c.TenantID != claims.TenantID || c.Estado == string(msgclient.EstadoEmergenciaCerrada)) {
+			continue
+		}
 		items = append(items, proyectar(c, esCliente))
 	}
 	return &msgclient.PaginaEmergencias{Items: items}, nil
 }
 
+// ActivarEmergencia crea el caso bajo la empresa del viaje, lo active el cliente
+// o Monitoreo (DEC-133). Viaje que mensajeria no conoce, o de otra empresa que la
+// del cliente que activa: 404 (DEC-132 #2).
 func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (*msgclient.CasoEmergencia, bool, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	origen := msgclient.OrigenActivacionOperacion
+	clienteActor := ""
 	if claims.Audiencia == auth.AudienciaCliente {
-		origen = msgclient.OrigenActivacionCliente
+		origen, clienteActor = msgclient.OrigenActivacionCliente, claims.TenantID
 	}
 	res, err := a.emergencias.Activar(ctx, emergencias.EntradaActivacion{
-		TenantID:     claims.TenantID,
 		ViajeID:      viajeID.String(),
-		ClienteID:    clienteDeClaims(claims),
+		ClienteActor: clienteActor,
 		ActorReal:    claims.Subject,
 		Origen:       origen,
 		ActivacionID: body.ActivacionId.String(),
 	})
 	if err != nil {
-		return nil, false, traducir(err)
+		return nil, false, traducirEmergencia(err)
 	}
 	id, err := uuid.Parse(res.EmergenciaID)
 	if err != nil {
@@ -138,174 +163,279 @@ func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclien
 	return &msgclient.CasoEmergencia{Id: id}, res.Idempotente, nil
 }
 
+// AgregarNotaEmergencia: el Cliente sobre un caso de su empresa o cualquier
+// interno (ADR 21 §4), sin acotar por tenant al interno (DEC-129).
 func (a *emergenciasAPI) AgregarNotaEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.NotaEmergenciaEntrada) error {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return err
 	}
-	cuerpo := strings.TrimSpace(body.Cuerpo)
-	if cuerpo == "" || len([]rune(cuerpo)) > 1000 {
-		return platformerrors.NewValidacion("la nota debe tener de 1 a 1000 caracteres")
+	cuerpo, err := notaValida(body.Cuerpo, "la nota debe tener de 1 a 1000 caracteres")
+	if err != nil {
+		return err
+	}
+	eid := emergenciaID.String()
+	tenant, err := a.autz.TenantDeEmergencia(ctx, eid, claims)
+	if err != nil {
+		return err
 	}
 	_, err = a.emergencias.AgregarNota(ctx, emergencias.EntradaNota{
-		TenantID:       claims.TenantID,
-		EmergenciaID:   emergenciaID.String(),
+		TenantID:       tenant,
+		EmergenciaID:   eid,
 		ActorReal:      claims.Subject,
 		AudienciaAutor: string(claims.Audiencia),
 		Cuerpo:         cuerpo,
 	})
-	if errors.Is(err, emergencias.ErrCerrada) {
-		return platformerrors.NewConflicto("emergencia_cerrada")
-	}
-	if errors.Is(err, emergencias.ErrNoEncontrada) {
-		return platformerrors.NewNoEncontrado("emergencia no encontrada")
-	}
-	if err != nil {
-		return traducir(err)
-	}
-	return nil
+	return traducirEmergencia(err)
 }
 
 func (a *emergenciasAPI) ReclamarEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error) {
-	claims, err := claimsDe(ctx)
-	if err != nil {
-		return nil, err
-	}
-	eid := emergenciaID.String()
-	if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
-		return nil, err
-	}
-	nueva, err := a.emergencias.Reclamar(ctx, claims.TenantID, eid, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada))
-	if err != nil {
-		return nil, traducirConflicto(err)
-	}
-	// shortcut: el dominio solo devuelve la versión nueva, no un Reclamo completo;
-	// el carril HTTP de mensajeria tampoco lo devolvía (201 sin cuerpo). Se
-	// devuelve el Reclamo con Version poblada (lo que el panel usa para la
-	// siguiente llamada optimista) y el resto en cero. Upgrade: si el panel llega
-	// a necesitar id/responsable/timestamps, el dominio debe exponer una lectura
-	// del reclamo vigente.
-	return &msgclient.Reclamo{Version: int64(nueva)}, nil
+	return a.ReclamarEmergenciaPorId(ctx, emergenciaID, body)
 }
 
 func (a *emergenciasAPI) LiberarReclamoEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID, reclamoID msgclient.Id, versionEsperada msgclient.VersionReclamo) error {
-	claims, err := claimsDe(ctx)
-	if err != nil {
-		return err
-	}
-	eid := emergenciaID.String()
-	mando := conMando(claims)
-	if !mando {
-		if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
-			return err
-		}
-	}
-	err = a.emergencias.Liberar(ctx, claims.TenantID, eid, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(versionEsperada), mando)
-	if errors.Is(err, emergencias.ErrSinReclamo) {
-		return platformerrors.NewNoEncontrado("reclamo no encontrado")
-	}
-	if err != nil {
-		return traducirConflicto(err)
-	}
-	return nil
+	return a.LiberarReclamoEmergenciaPorId(ctx, emergenciaID, reclamoID,
+		msgclient.LiberarReclamoEmergenciaPorIdParams{VersionEsperada: versionEsperada})
 }
 
 func (a *emergenciasAPI) TransferirEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error) {
+	return a.TransferirEmergenciaPorId(ctx, emergenciaID, body)
+}
+
+func (a *emergenciasAPI) ResolverEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) error {
+	_, err := a.ResolverEmergenciaPorId(ctx, emergenciaID, body)
+	return err
+}
+
+func (a *emergenciasAPI) CerrarEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id) error {
+	_, err := a.CerrarEmergenciaPorId(ctx, emergenciaID)
+	return err
+}
+
+// ListarBandejaEmergencias es la bandeja única de emergencias (DEC-130): la ven
+// Reacción, Supervisor y Coordinador (DEC-131); otro rol y el Cliente reciben 404
+// (no tienen bandeja). Excluye cerrados; del más antiguo al más reciente.
+func (a *emergenciasAPI) ListarBandejaEmergencias(ctx context.Context, _ msgclient.ListarBandejaEmergenciasParams) (*msgclient.PaginaBandejaEmergencias, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Audiencia == auth.AudienciaCliente || !autorizacion.VeBandejaEmergencias(claims.Rol) {
+		return nil, platformerrors.NewNoEncontrado("el sujeto no tiene bandeja de emergencias")
+	}
+	casos, err := a.emergencias.Bandeja(ctx)
+	if err != nil {
+		return nil, traducir(err)
+	}
+	items := make([]msgclient.EmergenciaReaccion, 0, len(casos))
+	for _, c := range casos {
+		items = append(items, vistaReaccion(c))
+	}
+	return &msgclient.PaginaBandejaEmergencias{Items: items}, nil
+}
+
+// ObtenerEmergencia devuelve el caso completo, con viaje_id y cliente_id, para
+// que el bff componga el detalle de Reacción.
+func (a *emergenciasAPI) ObtenerEmergencia(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error) {
+	caso, err := a.leerCaso(ctx, emergenciaID, autorizacion.VerCaso)
+	if err != nil {
+		return nil, err
+	}
+	out := proyectar(caso, false)
+	return &out, nil
+}
+
+// ListarNotasEmergenciaPorId: mismo acceso que ObtenerEmergencia; de la más
+// antigua a la más reciente.
+func (a *emergenciasAPI) ListarNotasEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, _ msgclient.ListarNotasEmergenciaPorIdParams) (*msgclient.PaginaNotasEmergencia, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
 	}
 	eid := emergenciaID.String()
-	mando := conMando(claims)
-	if !mando {
-		if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
-			return nil, err
-		}
-	}
-	err = a.emergencias.Transferir(ctx, claims.TenantID, eid, claims.Subject, body.ResponsableDestinoId.String(), msgtipos.VersionReclamo(body.VersionEsperada), mando)
-	if errors.Is(err, emergencias.ErrSinReclamo) {
-		return nil, platformerrors.NewNoEncontrado("reclamo no encontrado")
-	}
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.VerCaso)
 	if err != nil {
-		return nil, traducirConflicto(err)
+		return nil, err
 	}
-	// shortcut: el dominio de transferencia devuelve solo error; el carril HTTP
-	// devolvía 201 sin cuerpo. Se devuelve un Reclamo vacío, misma semántica.
-	// Upgrade: igual que ReclamarEmergencia, si el panel necesita el reclamo real.
-	return &msgclient.Reclamo{}, nil
+	notas, err := a.emergencias.ListarNotas(ctx, tenant, eid)
+	if err != nil {
+		return nil, traducir(err)
+	}
+	items := make([]msgclient.NotaEmergencia, 0, len(notas))
+	for _, n := range notas {
+		esResolucion := n.EsResolucion
+		nota := msgclient.NotaEmergencia{
+			Id:             uuidOCero(n.ID),
+			EmergenciaId:   uuidOCero(n.EmergenciaID),
+			AudienciaAutor: msgclient.Audiencia(n.AudienciaAutor),
+			Cuerpo:         n.Cuerpo,
+			EsResolucion:   &esResolucion,
+			CreadoEn:       n.CreadoEn,
+		}
+		if id, err := uuid.Parse(n.ActorReal); err == nil {
+			nota.ActorReal = &id
+		}
+		items = append(items, nota)
+	}
+	return &msgclient.PaginaNotasEmergencia{Items: items}, nil
 }
 
-func (a *emergenciasAPI) ResolverEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) error {
+// ReclamarEmergenciaPorId: solo Reacción (DEC-130, DEC-131) y solo si nadie
+// tiene el caso (DEC-125). Devuelve el reclamo abierto.
+func (a *emergenciasAPI) ReclamarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	eid := emergenciaID.String()
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.AtenderCaso)
+	if err != nil {
+		return nil, err
+	}
+	nueva, err := a.emergencias.Reclamar(ctx, tenant, eid, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada))
+	if err != nil {
+		return nil, traducirEmergencia(err)
+	}
+	return a.reclamoVigente(ctx, tenant, eid, nueva)
+}
+
+// LiberarReclamoEmergenciaPorId: el responsable (Reacción) o cualquier
+// Supervisor/Coordinador (DEC-126). Un miembro de Reacción que no es el
+// responsable recibe 403 desde el dominio.
+func (a *emergenciasAPI) LiberarReclamoEmergenciaPorId(ctx context.Context, emergenciaID, reclamoID msgclient.Id, params msgclient.LiberarReclamoEmergenciaPorIdParams) error {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return err
 	}
 	eid := emergenciaID.String()
-	if err := a.autz.PuedeAtenderEmergencia(ctx, claims.TenantID, eid, claims); err != nil {
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.MoverCaso)
+	if err != nil {
 		return err
 	}
-	nota := strings.TrimSpace(body.Nota)
-	if nota == "" || len([]rune(nota)) > 1000 {
-		return platformerrors.NewValidacion("la nota de resolución debe tener de 1 a 1000 caracteres")
-	}
-	err = a.emergencias.Resolver(ctx, claims.TenantID, eid, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada))
-	if errors.Is(err, emergencias.ErrTransicionInvalida) {
-		return platformerrors.NewConflicto("transicion_invalida")
-	}
-	if errors.Is(err, emergencias.ErrSinReclamo) {
-		return platformerrors.NewNoEncontrado("reclamo no encontrado")
-	}
+	err = a.emergencias.Liberar(ctx, tenant, eid, reclamoID.String(), claims.Subject,
+		msgtipos.VersionReclamo(params.VersionEsperada), conMando(claims))
+	return traducirEmergencia(err)
+}
+
+// TransferirEmergenciaPorId: mismo permiso que liberar (DEC-126). Devuelve el
+// reclamo nuevo del destino.
+func (a *emergenciasAPI) TransferirEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error) {
+	claims, err := claimsDe(ctx)
 	if err != nil {
-		return traducirConflicto(err)
+		return nil, err
+	}
+	eid := emergenciaID.String()
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.MoverCaso)
+	if err != nil {
+		return nil, err
+	}
+	// shortcut: no se verifica que el destino tenga rol `reaccion` (contrato,
+	// DEC-130): mensajeria no conoce los roles de otros usuarios; se verifica
+	// cuando haya proyección de identidad o el bff lo valide antes.
+	err = a.emergencias.Transferir(ctx, tenant, eid, claims.Subject, body.ResponsableDestinoId.String(),
+		msgtipos.VersionReclamo(body.VersionEsperada), conMando(claims))
+	if err != nil {
+		return nil, traducirEmergencia(err)
+	}
+	return a.reclamoVigente(ctx, tenant, eid, 0)
+}
+
+// ResolverEmergenciaPorId: solo el responsable vigente de Reacción (ADR 21 §5);
+// Supervisor y Coordinador no resuelven (DEC-131). Nota obligatoria 1..1000; sin
+// nota válida responde 400 y el caso no cambia. Devuelve la vista de Reacción.
+func (a *emergenciasAPI) ResolverEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) (*msgclient.EmergenciaReaccion, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	eid := emergenciaID.String()
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.AtenderCaso)
+	if err != nil {
+		return nil, err
+	}
+	nota, err := notaValida(body.Nota, "la nota de resolución debe tener de 1 a 1000 caracteres")
+	if err != nil {
+		return nil, err
+	}
+	if err := a.emergencias.Resolver(ctx, tenant, eid, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
+		return nil, traducirEmergencia(err)
 	}
 	// La nota de resolución queda en el expediente. Si falla, el caso ya está
 	// resuelto (irreversible, ADR 21 §6): se reporta pero no se revierte.
 	if _, err := a.emergencias.AgregarNota(ctx, emergencias.EntradaNota{
-		TenantID:       claims.TenantID,
+		TenantID:       tenant,
 		EmergenciaID:   eid,
 		ActorReal:      claims.Subject,
 		AudienciaAutor: string(claims.Audiencia),
 		Cuerpo:         nota,
 		EsResolucion:   true,
 	}); err != nil {
-		return traducir(err)
+		return nil, traducir(err)
 	}
-	return nil
+	caso, err := a.emergencias.Obtener(ctx, tenant, eid)
+	if err != nil {
+		return nil, traducirEmergencia(err)
+	}
+	out := vistaReaccion(caso)
+	return &out, nil
 }
 
-func (a *emergenciasAPI) CerrarEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id) error {
+// CerrarEmergenciaPorId: monitoreo o Administrador (ADR 21 §5, E8-T18); nunca
+// Reacción ni Ejecutivo (403). El alcance por viaje del monitoreo lo compone el
+// bff (mensajeria no conoce la asignación de unidades).
+func (a *emergenciasAPI) CerrarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if claims.Audiencia == auth.AudienciaCliente {
-		return platformerrors.NewNoAutorizado("el cliente no cierra emergencias")
-	}
-	err = a.emergencias.Cerrar(ctx, claims.TenantID, emergenciaID.String(), claims.Subject)
-	if errors.Is(err, emergencias.ErrTransicionInvalida) {
-		return platformerrors.NewConflicto("transicion_invalida")
-	}
-	if errors.Is(err, emergencias.ErrNoEncontrada) {
-		return platformerrors.NewNoEncontrado("emergencia no encontrada")
-	}
+	eid := emergenciaID.String()
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.CerrarCaso)
 	if err != nil {
-		return traducir(err)
+		return nil, err
 	}
-	return nil
+	if err := a.emergencias.Cerrar(ctx, tenant, eid, claims.Subject); err != nil {
+		return nil, traducirEmergencia(err)
+	}
+	caso, err := a.emergencias.Obtener(ctx, tenant, eid)
+	if err != nil {
+		return nil, traducirEmergencia(err)
+	}
+	out := proyectar(caso, false)
+	return &out, nil
+}
+
+// leerCaso autoriza el permiso y lee el caso.
+func (a *emergenciasAPI) leerCaso(ctx context.Context, emergenciaID msgclient.Id, p autorizacion.Permiso) (emergencias.CasoProyectado, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return emergencias.CasoProyectado{}, err
+	}
+	eid := emergenciaID.String()
+	tenant, err := a.autz.Emergencia(ctx, eid, claims, p)
+	if err != nil {
+		return emergencias.CasoProyectado{}, err
+	}
+	caso, err := a.emergencias.Obtener(ctx, tenant, eid)
+	return caso, traducirEmergencia(err)
+}
+
+// reclamoVigente hidrata el reclamo activo tras reclamar o transferir. Se lee
+// aparte, como en conversación; si una liberación concurrente ya lo cerró, se
+// devuelve solo la versión conocida (0 si no se conoce).
+func (a *emergenciasAPI) reclamoVigente(ctx context.Context, tenant, eid string, version msgtipos.VersionReclamo) (*msgclient.Reclamo, error) {
+	caso, err := a.emergencias.Obtener(ctx, tenant, eid)
+	if err != nil {
+		return nil, traducirEmergencia(err)
+	}
+	if r := reclamoContrato(caso); r != nil {
+		return r, nil
+	}
+	return &msgclient.Reclamo{Version: int64(version)}, nil
 }
 
 // proyectar mapea un caso leído al CasoEmergencia del contrato. Para audiencia
-// Cliente oculta los campos internos (origen, actor_real quedan en su cero), que
-// solo se entregan a Interno (ADR 21 §3, §6).
-//
-// shortcut: proyectar/uuidOCero/traducir/traducirConflicto/clienteDeClaims están
-// duplicadas con adapters/http/emergencias (funciones puras idénticas). No se
-// dedupe aquí porque el handler HTTP vive en un paquete que el root importa
-// (Routes), así que no puede importar el root sin ciclo; extraerlas a
-// internal/emergencias mete auth en el dominio y reescribe el handler de un
-// carril de seguridad sin tests de forma. Upgrade: si la regla de audiencia
-// cambia, extraer ProyectarCaso/Traducir a internal/emergencias y que ambos
-// llamadores la usen.
+// Cliente oculta los campos internos (origen, actor_real y reclamo_activo quedan
+// en su cero), que solo se entregan a Interno (ADR 21 §3, §6).
 func proyectar(c emergencias.CasoProyectado, esCliente bool) msgclient.CasoEmergencia {
 	caso := msgclient.CasoEmergencia{
 		Id:             uuidOCero(c.ID),
@@ -326,7 +456,39 @@ func proyectar(c emergencias.CasoProyectado, esCliente bool) msgclient.CasoEmerg
 	if id, err := uuid.Parse(c.ActorReal); err == nil {
 		caso.ActorReal = &id
 	}
+	caso.ReclamoActivo = reclamoContrato(c)
 	return caso
+}
+
+// vistaReaccion mapea un caso a EmergenciaReaccion: sin viaje, cliente, actor ni
+// notas (DEC-121 #2).
+func vistaReaccion(c emergencias.CasoProyectado) msgclient.EmergenciaReaccion {
+	return msgclient.EmergenciaReaccion{
+		Id:             uuidOCero(c.ID),
+		Estado:         msgclient.EstadoEmergencia(c.Estado),
+		Origen:         msgclient.OrigenActivacion(c.Origen),
+		VersionReclamo: int64(c.VersionReclamo),
+		ReclamoActivo:  reclamoContrato(c),
+		ActivadaEn:     c.ActivadaEn,
+		ResueltaEn:     c.ResueltaEn,
+		CerradaEn:      c.CerradaEn,
+	}
+}
+
+// reclamoContrato mapea el reclamo activo al Reclamo del contrato, o nil si el
+// caso está en el pool. El esquema Reclamo es el de conversación: su
+// conversacion_id lleva el id del caso, el agregado del reclamo de emergencia.
+func reclamoContrato(c emergencias.CasoProyectado) *msgclient.Reclamo {
+	if c.Reclamo == nil {
+		return nil
+	}
+	return &msgclient.Reclamo{
+		Id:             uuidOCero(c.Reclamo.ID),
+		ConversacionId: uuidOCero(c.ID),
+		ResponsableId:  uuidOCero(c.Reclamo.Responsable),
+		Version:        int64(c.Reclamo.Version),
+		AbiertoEn:      c.Reclamo.AbiertoEn,
+	}
 }
 
 func uuidOCero(s string) msgclient.Id {
@@ -334,13 +496,13 @@ func uuidOCero(s string) msgclient.Id {
 	return id
 }
 
-// clienteDeClaims devuelve el cliente_id a persistir en el caso. Para una
-// activación de cliente es el Subject del token; para interno va vacío (NULL).
-func clienteDeClaims(c *auth.Claims) string {
-	if c.Audiencia == auth.AudienciaCliente {
-		return c.Subject
+// notaValida recorta la nota y exige de 1 a 1000 caracteres (ADR 21 §4).
+func notaValida(texto, mensaje string) (string, error) {
+	nota := strings.TrimSpace(texto)
+	if nota == "" || len([]rune(nota)) > 1000 {
+		return "", platformerrors.NewValidacion("%s", mensaje)
 	}
-	return ""
+	return nota, nil
 }
 
 // traducir conserva la categoría de un PlatformError y envuelve cualquier otro
@@ -352,22 +514,36 @@ func traducir(err error) error {
 	return platformerrors.NewRotoErr(err, "mensajeria: error interno")
 }
 
-// conMando: un Supervisor o Coordinador libera o transfiere el caso sin ser
-// miembro del pool de Reacción ni su responsable (DEC-126).
+// conMando: un Supervisor o Coordinador libera o transfiere el caso sin ser su
+// responsable (DEC-126).
 func conMando(c *auth.Claims) bool {
 	return c.Audiencia == auth.AudienciaInterno && emergencias.TieneMando(c.Rol)
 }
 
-// traducirConflicto mapea el conflicto de versión del dominio a 409
-// conflicto_version_reclamo y al no responsable a 403 prohibido (DEC-126);
-// cualquier otro error pasa por traducir.
-func traducirConflicto(err error) error {
+// traducirEmergencia mapea los errores del dominio de emergencia a la taxonomía:
+// conflicto de versión → 409 conflicto_version_reclamo; transición inválida →
+// 409; caso cerrado → 409 emergencia_cerrada; sin reclamo, caso o viaje
+// inexistente (o de otra empresa, DEC-133) → 404; no es el responsable → 403
+// (DEC-126). nil pasa como nil.
+func traducirEmergencia(err error) error {
 	var conflicto emergencias.ErrConflictoVersion
-	if errors.As(err, &conflicto) {
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &conflicto):
 		return platformerrors.NewConflicto("conflicto_version_reclamo")
-	}
-	if errors.Is(err, emergencias.ErrNoEsResponsable) {
-		return platformerrors.NewProhibido("solo el responsable, un supervisor o un coordinador libera o transfiere el caso")
+	case errors.Is(err, emergencias.ErrTransicionInvalida):
+		return platformerrors.NewConflicto("transicion_invalida")
+	case errors.Is(err, emergencias.ErrCerrada):
+		return platformerrors.NewConflicto("emergencia_cerrada")
+	case errors.Is(err, emergencias.ErrSinReclamo):
+		return platformerrors.NewNoEncontrado("reclamo no encontrado")
+	case errors.Is(err, emergencias.ErrNoEncontrada):
+		return platformerrors.NewNoEncontrado("emergencia no encontrada")
+	case errors.Is(err, emergencias.ErrViajeNoEncontrado):
+		return platformerrors.NewNoEncontrado("viaje no encontrado")
+	case errors.Is(err, emergencias.ErrNoEsResponsable):
+		return platformerrors.NewProhibido("el actor no es el responsable del caso")
 	}
 	return traducir(err)
 }
