@@ -41,8 +41,8 @@ func TestReclamarSoloDesdeElPoolHTTP(t *testing.T) {
 	// B, miembro del pool, con la versión vigente (1): 409 conflicto por HTTP.
 	rec := e.pedir(atOtro, "ejecutivo", http.MethodPost, rutaConv+"/reclamos", msgclient.VersionEsperadaEntrada{VersionEsperada: 1})
 	var errB msgclient.Error
-	if err := json.Unmarshal(rec.Body.Bytes(), &errB); rec.Code != http.StatusConflict || err != nil || errB.Codigo != "conflicto" {
-		t.Fatalf("B reclama la de A por HTTP: status %d codigo %q, quiere 409 conflicto; cuerpo %s", rec.Code, errB.Codigo, rec.Body.String())
+	if err := json.Unmarshal(rec.Body.Bytes(), &errB); rec.Code != http.StatusConflict || err != nil || errB.Codigo != "conflicto_version_reclamo" {
+		t.Fatalf("B reclama la de A por HTTP: status %d codigo %q, quiere 409 conflicto_version_reclamo; cuerpo %s", rec.Code, errB.Codigo, rec.Body.String())
 	}
 	// Y por la superficie en proceso (adaptador de pf-svc-core): mismo conflicto.
 	ctxB := auth.ContextWithClaims(e.ctx, &auth.Claims{Subject: atOtro, TenantID: "ai27", Rol: "ejecutivo", Audiencia: auth.AudienciaInterno})

@@ -92,15 +92,15 @@ func rpEsperar(t *testing.T, paso string, rec *httptest.ResponseRecorder, status
 	return rec.Body.Bytes()
 }
 
-// rpConflicto falla si la respuesta no es el 409 de la taxonomía (codigo conflicto).
+// rpConflicto falla si la respuesta no es el 409 conflicto_version_reclamo del contrato.
 func rpConflicto(t *testing.T, paso string, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	var e msgclient.Error
 	if err := json.Unmarshal(rpEsperar(t, paso, rec, http.StatusConflict), &e); err != nil {
 		t.Fatalf("%s: decodificar Error: %v", paso, err)
 	}
-	if e.Codigo != "conflicto" {
-		t.Fatalf("%s: codigo %q, quiere conflicto", paso, e.Codigo)
+	if e.Codigo != "conflicto_version_reclamo" {
+		t.Fatalf("%s: codigo %q, quiere conflicto_version_reclamo", paso, e.Codigo)
 	}
 }
 

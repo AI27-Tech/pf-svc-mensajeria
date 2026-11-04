@@ -46,6 +46,12 @@ func TestWriteError(t *testing.T) {
 			wantStatus: 409,
 			wantBody:   `{"codigo":"conflicto","mensaje":"conflicto de versión del reclamo"}` + "\n",
 		},
+		{
+			name:       "conflicto con código de máquina: el código del contrato, no la categoría",
+			err:        fmt.Errorf("nota: %w", platformerrors.NewConflictoCodigo("emergencia_cerrada", "mensajeria: emergencia_cerrada")),
+			wantStatus: 409,
+			wantBody:   `{"codigo":"emergencia_cerrada","mensaje":"mensajeria: emergencia_cerrada"}` + "\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

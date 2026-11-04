@@ -131,7 +131,7 @@ func (h Handlers) servirTrabajo(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if fuera {
-		escribirError(w, platformerrors.NewConflicto("stream_resync_required"))
+		escribirError(w, platformerrors.NewConflictoCodigo("stream_resync_required", "mensajeria: stream_resync_required"))
 		return
 	}
 

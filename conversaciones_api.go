@@ -151,9 +151,9 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 	})
 	switch {
 	case errors.Is(err, conversacion.ErrConversacionSoloLectura):
-		return nil, platformerrors.NewConflicto("conversacion_solo_lectura")
+		return nil, platformerrors.NewConflictoCodigo("conversacion_solo_lectura", "mensajeria: conversacion_solo_lectura")
 	case errors.Is(err, conversacion.ErrSinReclamoActivo):
-		return nil, platformerrors.NewConflicto("conflicto_version_reclamo")
+		return nil, platformerrors.NewConflictoCodigo("conflicto_version_reclamo", "mensajeria: conflicto_version_reclamo")
 	case errors.Is(err, conversacion.ErrOverrideNoImplementado):
 		return nil, platformerrors.NewValidacion("motivo_override no está disponible en V1")
 	case err != nil:
@@ -192,7 +192,7 @@ func (a *conversacionesAPI) ListarTrabajoBandeja(ctx context.Context, params msg
 		return nil, traducir(err)
 	}
 	if fuera {
-		return nil, platformerrors.NewConflicto("stream_resync_required")
+		return nil, platformerrors.NewConflictoCodigo("stream_resync_required", "mensajeria: stream_resync_required")
 	}
 	if items == nil {
 		items = []msgclient.Conversacion{}

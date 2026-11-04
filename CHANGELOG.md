@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## 2026-11-04 16:20 — Los 409 llevan el código de máquina del contrato
+
+**Para quién:** el `bff`, `pf-svc-core` y los dos frontends. Cambia lo que observan: el campo `codigo` de un 409 de `mensajeria` deja de ser siempre `"conflicto"` y trae el código que declara el contrato.
+
+**Resumen:** `mensajeria` armaba sus conflictos con `NewConflicto("emergencia_cerrada")`, que guarda el texto como mensaje y no como código. Además, el borde HTTP escribía `codigo` con la categoría. Así que ningún consumidor recibía `emergencia_cerrada`, `conflicto_version_reclamo`, `conversacion_solo_lectura`, `transicion_invalida` ni `stream_resync_required`, ni por HTTP ni en proceso. El frontend interno ya compara contra `stream_resync_required`, `conversacion_solo_lectura` y `conflicto_version_reclamo`, así que esas ramas nunca se cumplían: por ejemplo, la bandeja de conversaciones no se volvía a cargar cuando el servidor lo pedía.
+
+**Comportamiento:**
+- Todos los 409 de `mensajeria` llevan su código: `emergencia_cerrada`, `conflicto_version_reclamo`, `transicion_invalida` (emergencias); `conversacion_solo_lectura`, `conflicto_version_reclamo` (conversación y atención); `stream_resync_required` (bandeja). El status sigue siendo 409.
+- `boundary.WriteError` escribe `platformerrors.CodigoDe(err)`: el código de máquina si lo trae, y si no, la categoría como antes.
+
+**Cambios:**
+- `NewConflicto(x)` → `NewConflictoCodigo(x, ...)` en `emergencias_api.go`, `conversaciones_api.go`, `errores.go`, `adapters/http/conversacion/conversacion.go`, `adapters/http/conversacion/atencion.go` y `adapters/http/bandejas/bandejas.go`.
+- `adapters/http/boundary/boundary.go`: `WriteError` usa `CodigoDe`.
+- Pruebas: `TestWriteError` gana el caso con código; las que esperaban `"conflicto"` ahora esperan `conflicto_version_reclamo`; `TestOperacionesPorIdHTTP` comprueba `emergencia_cerrada` al anotar sobre un caso cerrado, por HTTP y en proceso.
+
+**Migración:** ninguna.
+
+**Archivos modificados:**
+- `emergencias_api.go`, `conversaciones_api.go`, `errores.go`
+- `adapters/http/boundary/boundary.go`, `adapters/http/boundary/boundary_test.go`
+- `adapters/http/conversacion/conversacion.go`, `adapters/http/conversacion/atencion.go`, `adapters/http/bandejas/bandejas.go`
+- `adapters/http/conversacion/reclamar_pool_integration_test.go`, `adapters/http/conversacion/reclamo_perdido_integration_test.go`
+- `adapters/http/emergencias/emergencias_integration_test.go`, `adapters/http/emergencias/por_id_integration_test.go`
+
 ## 2026-11-04 13:51 — Emergencias del monitoreo por rol (DEC-135), bandeja con 403 para internos (DEC-132) y activación con el caso completo
 
 **Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno. Cambia lo que observan: activar, anotar y listar los casos de un viaje ahora revisan el rol del interno, y la activación devuelve el caso completo en lugar de solo su id.

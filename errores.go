@@ -15,6 +15,6 @@ func errNoImplementado(op string) error {
 // (Addendum §4 punto 5): el perdedor de dos reclamos concurrentes recibe este
 // error. Se mapea a conflicto en la taxonomía de la plataforma (409 en HTTP).
 func errConflictoVersion(esperada, actual VersionReclamo) error {
-	return platformerrors.NewConflicto(
+	return platformerrors.NewConflictoCodigo("conflicto_version_reclamo",
 		"mensajeria: conflicto de versión del reclamo: esperada %d, actual %d", esperada, actual)
 }
