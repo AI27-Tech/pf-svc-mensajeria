@@ -416,20 +416,16 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 		MotivoOverride:         motivoOverride,
 	})
 	if err != nil {
-		// Conversación no `abierta` (solo_lectura/cerrada): 409, como el conflicto
-		// de versión de reclamo. El contrato lo marca con `codigo`
-		// conversacion_solo_lectura; la taxonomía de la plataforma solo expone el
-		// código de categoría (`conflicto`), limitación transversal igual que en
-		// conflicto_version_reclamo (no se resuelve en esta historia).
+		// Conversación no `abierta` (solo_lectura/cerrada): 409 con `codigo`
+		// conversacion_solo_lectura, como pide el contrato.
 		if errors.Is(err, conversacion.ErrConversacionSoloLectura) {
-			escribirError(w, platformerrors.NewConflicto("conversacion_solo_lectura"))
+			escribirError(w, platformerrors.NewConflictoCodigo("conversacion_solo_lectura", "mensajeria: conversacion_solo_lectura"))
 			return
 		}
 		// Envío interno sin reclamo activo en la versión esperada: 409
-		// conflicto_version_reclamo (Addendum §7). Misma limitación del código de
-		// máquina que arriba: se emite la categoría conflicto.
+		// conflicto_version_reclamo (Addendum §7).
 		if errors.Is(err, conversacion.ErrSinReclamoActivo) {
-			escribirError(w, platformerrors.NewConflicto("conflicto_version_reclamo"))
+			escribirError(w, platformerrors.NewConflictoCodigo("conflicto_version_reclamo", "mensajeria: conflicto_version_reclamo"))
 			return
 		}
 		// Override de supervisor no implementado en V1 (cerrado hasta que exista la
@@ -488,7 +484,7 @@ func TraducirReclamo(err error) error {
 	var conflicto reclamos.ErrConflictoVersion
 	switch {
 	case errors.As(err, &conflicto):
-		return platformerrors.NewConflicto("conflicto de versión del reclamo")
+		return platformerrors.NewConflictoCodigo("conflicto_version_reclamo", "mensajeria: conflicto de versión del reclamo")
 	case errors.Is(err, reclamos.ErrSinReclamo):
 		return platformerrors.NewNoEncontrado("reclamo no encontrado")
 	case errors.Is(err, reclamos.ErrNoEsResponsable):

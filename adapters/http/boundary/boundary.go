@@ -32,15 +32,17 @@ func Claims(ctx context.Context) *auth.Claims {
 }
 
 // WriteError emite el error con la forma Error del contrato y el status de su
-// categoría (invariante I3). El cuerpo lleva solo el mensaje público del
-// PlatformError, nunca la causa envuelta (Err): esa causa puede traer texto de
-// Postgres u otro detalle interno.
+// categoría (invariante I3). `codigo` es el código de máquina del
+// PlatformError si lo trae (p. ej. emergencia_cerrada) y si no el de su
+// categoría. El cuerpo lleva solo el mensaje público del PlatformError, nunca
+// la causa envuelta (Err): esa causa puede traer texto de Postgres u otro
+// detalle interno.
 func WriteError(w http.ResponseWriter, err error) {
 	cat := platformerrors.AsCategory(err)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(cat.HTTPStatus())
 	_ = json.NewEncoder(w).Encode(msgclient.Error{
-		Codigo:  cat.String(),
+		Codigo:  platformerrors.CodigoDe(err),
 		Mensaje: publicMessage(err),
 	})
 }

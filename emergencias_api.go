@@ -555,11 +555,11 @@ func traducirEmergencia(err error) error {
 	case err == nil:
 		return nil
 	case errors.As(err, &conflicto):
-		return platformerrors.NewConflicto("conflicto_version_reclamo")
+		return platformerrors.NewConflictoCodigo("conflicto_version_reclamo", "mensajeria: conflicto_version_reclamo")
 	case errors.Is(err, emergencias.ErrTransicionInvalida):
-		return platformerrors.NewConflicto("transicion_invalida")
+		return platformerrors.NewConflictoCodigo("transicion_invalida", "mensajeria: transicion_invalida")
 	case errors.Is(err, emergencias.ErrCerrada):
-		return platformerrors.NewConflicto("emergencia_cerrada")
+		return platformerrors.NewConflictoCodigo("emergencia_cerrada", "mensajeria: emergencia_cerrada")
 	case errors.Is(err, emergencias.ErrSinReclamo):
 		return platformerrors.NewNoEncontrado("reclamo no encontrado")
 	case errors.Is(err, emergencias.ErrNoEncontrada):
