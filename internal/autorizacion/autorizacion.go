@@ -77,6 +77,14 @@ const (
 	// CerrarCaso: monitoreo o Administrador (ADR 21 §5, E8-T18); nunca Reacción
 	// ni Ejecutivo.
 	CerrarCaso
+	// ActivarCaso: activar un caso sobre el viaje; solo monitoreo (DEC-045 #9).
+	ActivarCaso
+	// AnotarCaso: agregar una nota; monitoreo o Administrador. Reacción lee y no
+	// escribe (DEC-121 #4, DEC-135).
+	AnotarCaso
+	// VerCasosViaje: listar los casos de un viaje; monitoreo o Administrador
+	// (DEC-135). Reacción trabaja desde la bandeja.
+	VerCasosViaje
 )
 
 // rolesConversacion y rolesEmergencia son la tabla de quién hace qué. La rama
@@ -87,14 +95,22 @@ var (
 		Escribir: {roles.RolEjecutivo},
 	}
 	rolesEmergencia = map[Permiso][]roles.Rol{
-		VerCaso:     {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
-		AtenderCaso: {roles.RolReaccion},
-		MoverCaso:   {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
-		CerrarCaso:  {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
+		VerCaso:       {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
+		AtenderCaso:   {roles.RolReaccion},
+		MoverCaso:     {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
+		CerrarCaso:    {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
+		ActivarCaso:   {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador},
+		AnotarCaso:    {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
+		VerCasosViaje: {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
 	}
 )
 
 func tiene(rs []roles.Rol, rol string) bool { return slices.Contains(rs, roles.Rol(rol)) }
+
+// PuedeEnEmergencias dice si el rol interno tiene el permiso. Sirve a las
+// acciones que no nombran un caso existente (activar, listar por viaje); las que
+// sí lo nombran usan Emergencia, que además resuelve el tenant.
+func PuedeEnEmergencias(rol string, p Permiso) bool { return tiene(rolesEmergencia[p], rol) }
 
 // LeeBandejaChat dice si el rol ve la bandeja única de conversaciones: el
 // Ejecutivo por ser miembro (DEC-127) y Supervisor/Coordinador en lectura

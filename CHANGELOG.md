@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## 2026-11-04 — Emergencias del monitoreo por rol (DEC-135), bandeja con 403 para internos (DEC-132) y activación con el caso completo
+
+**Para quién:** el `bff`, `pf-svc-core` en proceso y el panel interno. Cambia lo que observan: activar, anotar y listar los casos de un viaje ahora revisan el rol del interno, y la activación devuelve el caso completo en lugar de solo su id.
+
+**Resumen:** E8-T18 abre al monitoreo el carril de emergencias por viaje. Antes cualquier interno activaba, anotaba y listaba los casos de un viaje, incluido Reacción, que según DEC-121 #4 lee notas pero no las escribe. Ahora esas tres acciones pasan por la misma tabla de permisos que el resto de la familia.
+
+**Comportamiento:**
+- Activar (por viaje): solo `monitorista`, `supervisor` y `coordinador` (DEC-045 #9). Otro rol interno recibe `403` y no se crea caso. El Cliente sigue igual.
+- Anotar (por viaje): `monitorista`, `supervisor`, `coordinador` y `administrador` (DEC-135). `reaccion` y `ejecutivo` reciben `403` y la nota no se guarda. El Cliente sigue anotando sobre los casos de su empresa.
+- Listar los casos de un viaje: `monitorista`, `supervisor`, `coordinador` y `administrador`. `reaccion` y `ejecutivo` reciben `403`; Reacción trabaja desde la bandeja y el detalle por id. El Cliente sigue igual.
+- La activación (HTTP y en proceso) devuelve el `CasoEmergencia` completo proyectado por audiencia (`viaje_id`, `estado`, `activada_en`, y para Interno `origen` y `actor_real`), como pide el contrato. Antes solo traía `id`.
+- `listarBandejaEmergencias`: un interno sin el rol recibe `403` (antes `404`), como fija DEC-132. El Cliente sigue recibiendo `404`.
+
+**Cambios:**
+- `internal/autorizacion`: permisos `ActivarCaso`, `AnotarCaso` y `VerCasosViaje` en `rolesEmergencia`, y `PuedeEnEmergencias` para las acciones que no nombran un caso existente.
+- `emergencias_api.go`: `ListarEmergencias`, `ActivarEmergencia` y `AgregarNotaEmergencia` revisan el rol del interno; `ActivarEmergencia` lee el caso creado; `ListarBandejaEmergencias` separa el `403` interno del `404` del Cliente.
+- Pruebas: `TestEmergencias_RolesDelMonitoreo` (listar y activar por rol, sin tocar el dominio al denegar); `TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP` comprueba la respuesta completa de activar, `403` al activar como Reacción, Ejecutivo, Administrador y Jefe Operativo, listar como Supervisor y Administrador y `403` a Reacción y Ejecutivo, y notas `201` de Monitorista y Administrador y `403` de Reacción y Ejecutivo sin escribir; `TestOperacionesPorIdHTTP` espera `403` para la bandeja como Ejecutivo.
+
+**Migración:** ninguna.
+
+**Archivos modificados:**
+- `internal/autorizacion/autorizacion.go`
+- `emergencias_api.go`, `emergencias_api_test.go`
+- `adapters/http/emergencias/emergencias_integration_test.go`, `adapters/http/emergencias/por_id_integration_test.go`
+
 ## 2026-11-03 17:11 — Internos sin tenant (DEC-129), bandeja única de emergencias (DEC-130), Supervisor y Coordinador (DEC-131), 403/404 (DEC-132), operaciones por id (tracer.34) y caso de emergencia bajo la empresa del viaje (DEC-133)
 
 _Ampliada a las 17:25 con DEC-133._

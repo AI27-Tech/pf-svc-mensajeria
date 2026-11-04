@@ -111,18 +111,22 @@ func claimsDe(ctx context.Context) (*auth.Claims, error) {
 }
 
 // ListarEmergencias devuelve los casos del viaje. Al interno, todos y completos,
-// de cualquier tenant (DEC-129). Al Cliente, solo los de su empresa y no
-// cerrados, en la vista mínima (ADR 21 §6).
+// de cualquier tenant (DEC-129), si su rol ve los casos del viaje (DEC-135); si
+// no, 403. Al Cliente, solo los de su empresa y no cerrados, en la vista mínima
+// (ADR 21 §6).
 func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclient.Id) (*msgclient.PaginaEmergencias, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
 	}
+	esCliente := claims.Audiencia == auth.AudienciaCliente
+	if !esCliente && !autorizacion.PuedeEnEmergencias(claims.Rol, autorizacion.VerCasosViaje) {
+		return nil, platformerrors.NewProhibido("el rol no ve los casos de emergencia del viaje")
+	}
 	casos, err := a.emergencias.ListarPorViaje(ctx, viajeID.String())
 	if err != nil {
 		return nil, traducir(err)
 	}
-	esCliente := claims.Audiencia == auth.AudienciaCliente
 	items := make([]msgclient.CasoEmergencia, 0, len(casos))
 	for _, c := range casos {
 		if esCliente && (c.TenantID != claims.TenantID || c.Estado == string(msgclient.EstadoEmergenciaCerrada)) {
@@ -134,16 +138,22 @@ func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclien
 }
 
 // ActivarEmergencia crea el caso bajo la empresa del viaje, lo active el cliente
-// o Monitoreo (DEC-133). Viaje que mensajeria no conoce, o de otra empresa que la
-// del cliente que activa: 404 (DEC-132 #2).
+// o Monitoreo (DEC-133). Un interno necesita rol de monitoreo (DEC-045 #9); si
+// no, 403. Viaje que mensajeria no conoce, o de otra empresa que la del cliente
+// que activa: 404 (DEC-132 #2). Devuelve el caso tal como quedó, proyectado por
+// audiencia, como pide el contrato.
 func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (*msgclient.CasoEmergencia, bool, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, false, err
 	}
+	esCliente := claims.Audiencia == auth.AudienciaCliente
+	if !esCliente && !autorizacion.PuedeEnEmergencias(claims.Rol, autorizacion.ActivarCaso) {
+		return nil, false, platformerrors.NewProhibido("el rol no activa emergencias")
+	}
 	origen := msgclient.OrigenActivacionOperacion
 	clienteActor := ""
-	if claims.Audiencia == auth.AudienciaCliente {
+	if esCliente {
 		origen, clienteActor = msgclient.OrigenActivacionCliente, claims.TenantID
 	}
 	res, err := a.emergencias.Activar(ctx, emergencias.EntradaActivacion{
@@ -156,15 +166,21 @@ func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclien
 	if err != nil {
 		return nil, false, traducirEmergencia(err)
 	}
-	id, err := uuid.Parse(res.EmergenciaID)
+	tenant, err := a.autz.TenantDeEmergencia(ctx, res.EmergenciaID, claims)
 	if err != nil {
-		return nil, false, traducir(err)
+		return nil, false, err
 	}
-	return &msgclient.CasoEmergencia{Id: id}, res.Idempotente, nil
+	caso, err := a.emergencias.Obtener(ctx, tenant, res.EmergenciaID)
+	if err != nil {
+		return nil, false, traducirEmergencia(err)
+	}
+	out := proyectar(caso, esCliente)
+	return &out, res.Idempotente, nil
 }
 
-// AgregarNotaEmergencia: el Cliente sobre un caso de su empresa o cualquier
-// interno (ADR 21 §4), sin acotar por tenant al interno (DEC-129).
+// AgregarNotaEmergencia: el Cliente sobre un caso de su empresa, o un interno
+// con rol de monitoreo o Administrador (DEC-135), sin acotar por tenant al
+// interno (DEC-129). Reacción y Ejecutivo reciben 403 (DEC-121 #4).
 func (a *emergenciasAPI) AgregarNotaEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.NotaEmergenciaEntrada) error {
 	claims, err := claimsDe(ctx)
 	if err != nil {
@@ -175,7 +191,12 @@ func (a *emergenciasAPI) AgregarNotaEmergencia(ctx context.Context, _ msgclient.
 		return err
 	}
 	eid := emergenciaID.String()
-	tenant, err := a.autz.TenantDeEmergencia(ctx, eid, claims)
+	var tenant string
+	if claims.Audiencia == auth.AudienciaCliente {
+		tenant, err = a.autz.TenantDeEmergencia(ctx, eid, claims)
+	} else {
+		tenant, err = a.autz.Emergencia(ctx, eid, claims, autorizacion.AnotarCaso)
+	}
 	if err != nil {
 		return err
 	}
@@ -213,15 +234,18 @@ func (a *emergenciasAPI) CerrarEmergencia(ctx context.Context, _ msgclient.Id, e
 }
 
 // ListarBandejaEmergencias es la bandeja única de emergencias (DEC-130): la ven
-// Reacción, Supervisor y Coordinador (DEC-131); otro rol y el Cliente reciben 404
-// (no tienen bandeja). Excluye cerrados; del más antiguo al más reciente.
+// Reacción, Supervisor y Coordinador (DEC-131). Otro rol interno recibe 403 y el
+// Cliente 404 (DEC-132). Excluye cerrados; del más antiguo al más reciente.
 func (a *emergenciasAPI) ListarBandejaEmergencias(ctx context.Context, _ msgclient.ListarBandejaEmergenciasParams) (*msgclient.PaginaBandejaEmergencias, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if claims.Audiencia == auth.AudienciaCliente || !autorizacion.VeBandejaEmergencias(claims.Rol) {
+	if claims.Audiencia == auth.AudienciaCliente {
 		return nil, platformerrors.NewNoEncontrado("el sujeto no tiene bandeja de emergencias")
+	}
+	if !autorizacion.VeBandejaEmergencias(claims.Rol) {
+		return nil, platformerrors.NewProhibido("el rol no ve la bandeja de emergencias")
 	}
 	casos, err := a.emergencias.Bandeja(ctx)
 	if err != nil {
