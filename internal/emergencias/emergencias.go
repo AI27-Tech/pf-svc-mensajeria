@@ -87,16 +87,22 @@ var ErrCerrada = errors.New("emergencias: el caso está cerrado")
 // irreversibles). El llamador la mapea a 409.
 var ErrTransicionInvalida = errors.New("emergencias: transición de estado inválida")
 
+// ErrViajeNoEncontrado la devuelve Activar cuando mensajeria no conoce la empresa
+// del viaje (no hay conversación proyectada de viaje.mensajeria_habilitada) o el
+// viaje es de otra empresa que la del cliente que activa. El llamador la mapea a
+// 404, sin revelar cuál de las dos (DEC-132 #2).
+var ErrViajeNoEncontrado = errors.New("emergencias: viaje no encontrado")
+
 // EntradaActivacion es lo mínimo para activar un caso. ActivacionID es la clave
 // de idempotencia generada por el llamante (contrato ActivarEmergenciaEntrada).
-// Origen distingue cliente de operacion (ADR 21 §3). ClienteID puede ir vacío:
-// mensajeria no siempre conoce el cliente del viaje (lo proyecta de viaje.*); se
-// persiste NULL y la vista mínima del cliente se resuelve por el alcance del
-// token. La bandeja de Reacción NO se recibe: la resuelve el dominio (es su dato).
+// Origen distingue cliente de operacion (ADR 21 §3). El tenant y el cliente_id
+// del caso NO se reciben: son los del viaje (DEC-133) y los resuelve el dominio,
+// igual que la bandeja de Reacción (DEC-130). ClienteActor es la empresa del
+// cliente que activa (tenant de su token); solo cuenta con Origen cliente y debe
+// ser la empresa del viaje.
 type EntradaActivacion struct {
-	TenantID     string
 	ViajeID      string
-	ClienteID    string
+	ClienteActor string
 	ActorReal    string
 	Origen       msgclient.OrigenActivacion
 	ActivacionID string
@@ -112,7 +118,9 @@ type ResultadoActivacion struct {
 // Activar crea un caso de emergencia, o devuelve el existente si se reentrega la
 // misma ActivacionID (idempotente, ADR 21 §2). Escribe el caso y
 // emergencia.activada en una sola tx. Una pulsación nueva con otra ActivacionID
-// crea otro caso aunque ya exista uno abierto: no se deduplica por viaje.
+// crea otro caso aunque ya exista uno abierto: no se deduplica por viaje. El caso
+// queda bajo la empresa del viaje (DEC-133); si mensajeria no la conoce, o el
+// cliente que activa es de otra empresa, ErrViajeNoEncontrado y no se crea nada.
 func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (ResultadoActivacion, error) {
 	if in.ViajeID == "" || in.ActorReal == "" || in.ActivacionID == "" {
 		return ResultadoActivacion{}, fmt.Errorf("emergencias: activación inválida: faltan campos obligatorios")
@@ -124,16 +132,25 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// El caso vive bajo la empresa del viaje, lo active quien lo active (DEC-133).
+	tenantID, clienteID, err := empresaDelViaje(ctx, tx, in.ViajeID)
+	if err != nil {
+		return ResultadoActivacion{}, err
+	}
+	if in.Origen == msgclient.OrigenActivacionCliente && (in.ClienteActor != clienteID || in.ClienteActor != tenantID) {
+		return ResultadoActivacion{}, ErrViajeNoEncontrado
+	}
+
 	// Idempotencia: si la activación ya existe, devolver el caso original.
-	if id, ok, err := s.buscarPorActivacion(ctx, tx, in); err != nil {
+	if id, ok, err := s.buscarPorActivacion(ctx, tx, tenantID, in); err != nil {
 		return ResultadoActivacion{}, err
 	} else if ok {
 		return ResultadoActivacion{EmergenciaID: id, Idempotente: true}, nil
 	}
 
-	// La bandeja de Reacción del tenant es dato de mensajeria: se resuelve aquí,
-	// no la trae el llamante.
-	bandejaID, err := bandejaReaccion(ctx, tx, in.TenantID)
+	// La bandeja única de emergencias es dato de mensajeria: se resuelve (o se
+	// crea) aquí, en la tx de la activación, no la trae el llamante (DEC-130).
+	bandejaID, err := bandejaEmergencias(ctx, tx, tenantID)
 	if err != nil {
 		return ResultadoActivacion{}, err
 	}
@@ -142,15 +159,15 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 	err = tx.QueryRow(ctx,
 		`INSERT INTO mensajeria.emergencia
 		    (tenant_id, viaje_id, cliente_id, bandeja_id, origen, actor_real, activacion_id)
-		  VALUES ($1, $2, NULLIF($3, '')::uuid, $4, $5, $6, $7)
+		  VALUES ($1, $2, $3::uuid, $4, $5, $6, $7)
 		  RETURNING id`,
-		in.TenantID, in.ViajeID, in.ClienteID, bandejaID, string(in.Origen), in.ActorReal, in.ActivacionID,
+		tenantID, in.ViajeID, clienteID, bandejaID, string(in.Origen), in.ActorReal, in.ActivacionID,
 	).Scan(&emergenciaID)
 	if err != nil {
 		// Carrera por la misma activación: el índice único la rechaza; releer el
 		// original en vez de crear un segundo caso.
 		if esViolacionUnica(err) {
-			if id, ok, e := s.buscarPorActivacion(ctx, tx, in); e == nil && ok {
+			if id, ok, e := s.buscarPorActivacion(ctx, tx, tenantID, in); e == nil && ok {
 				return ResultadoActivacion{EmergenciaID: id, Idempotente: true}, nil
 			}
 		}
@@ -164,7 +181,7 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 		Payload: map[string]any{
 			"caso_emergencia_id": emergenciaID,
 			"viaje_id":           in.ViajeID,
-			"cliente_id":         in.ClienteID,
+			"cliente_id":         clienteID,
 			"origen":             string(in.Origen),
 		},
 	}
@@ -178,13 +195,39 @@ func (s *Servicio) Activar(ctx context.Context, in EntradaActivacion) (Resultado
 	return ResultadoActivacion{EmergenciaID: emergenciaID}, nil
 }
 
+// empresaDelViaje devuelve el tenant y el cliente_id del viaje. La única
+// proyección del viaje en mensajeria es su conversación, que nace de
+// viaje.mensajeria_habilitada (operacion la publica al crear el viaje, en la tx
+// de viaje.creado) con tenant_id = cliente_id (DEC-049/112). Si hay varias (una
+// cerrada y otra activa), todas son del mismo viaje; se toma la más reciente.
+// Sin conversación, ErrViajeNoEncontrado: no se inventa la empresa.
+//
+// shortcut: filtra solo por viaje_id, sin índice propio (el único es (tenant_id,
+// viaje_id)); se indexa viaje_id si la activación se vuelve camino caliente.
+func empresaDelViaje(ctx context.Context, tx pgx.Tx, viajeID string) (string, string, error) {
+	var tenant, cliente string
+	err := tx.QueryRow(ctx,
+		`SELECT tenant_id, cliente_id::text FROM mensajeria.conversacion
+		  WHERE viaje_id = $1 AND cliente_id IS NOT NULL
+		  ORDER BY creado_en DESC, id DESC LIMIT 1`,
+		viajeID,
+	).Scan(&tenant, &cliente)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrViajeNoEncontrado
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("emergencias: leer la empresa del viaje: %w", err)
+	}
+	return tenant, cliente, nil
+}
+
 // buscarPorActivacion devuelve el caso ya existente para la clave de idempotencia.
-func (s *Servicio) buscarPorActivacion(ctx context.Context, tx pgx.Tx, in EntradaActivacion) (string, bool, error) {
+func (s *Servicio) buscarPorActivacion(ctx context.Context, tx pgx.Tx, tenantID string, in EntradaActivacion) (string, bool, error) {
 	var id string
 	err := tx.QueryRow(ctx,
 		`SELECT id FROM mensajeria.emergencia
 		  WHERE tenant_id = $1 AND viaje_id = $2 AND activacion_id = $3`,
-		in.TenantID, in.ViajeID, in.ActivacionID,
+		tenantID, in.ViajeID, in.ActivacionID,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
@@ -502,7 +545,8 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, actor
 // Resolver pasa el caso de en_atencion a resuelta (irreversible, ADR 21 §5),
 // exigiendo la versión esperada del reclamo y una nota de resolución (que el
 // handler agrega aparte con AgregarNota es_resolucion=true). Conflicto →
-// ErrConflictoVersion; si el caso no está en en_atencion → ErrTransicionInvalida.
+// ErrConflictoVersion; si el caso no está en en_atencion → ErrTransicionInvalida;
+// actor que no es el responsable vigente → ErrNoEsResponsable (ADR 21 §5).
 func (s *Servicio) Resolver(ctx context.Context, tenantID, emergenciaID, actorReal string, esperada msgtipos.VersionReclamo) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -518,17 +562,10 @@ func (s *Servicio) Resolver(ctx context.Context, tenantID, emergenciaID, actorRe
 		return ErrTransicionInvalida
 	}
 
-	// El reclamo activo debe estar en la versión esperada (solo el responsable
-	// vigente resuelve).
-	actual, hay, err := versionActiva(ctx, tx, tenantID, emergenciaID)
-	if err != nil {
+	// Solo el responsable vigente resuelve, con la versión vigente (sin mando:
+	// Supervisor y Coordinador no resuelven, DEC-131).
+	if _, err := tomarActivo(ctx, tx, tenantID, emergenciaID, actorReal, esperada, false); err != nil {
 		return err
-	}
-	if !hay {
-		return ErrSinReclamo
-	}
-	if actual != esperada {
-		return ErrConflictoVersion{Esperada: esperada, Actual: actual}
 	}
 
 	if err := fijarEstado(ctx, tx, tenantID, emergenciaID, esperada,
@@ -604,12 +641,12 @@ func (s *Servicio) Cerrar(ctx context.Context, tenantID, emergenciaID, actorReal
 	return nil
 }
 
-// CasoProyectado es un caso leído, con los campos que su audiencia puede ver. La
-// frontera lo mapea al CasoEmergencia del contrato. Para audiencia Cliente, los
-// campos internos (Origen, ActorReal, ReclamoActivo) van en cero y las cerradas
-// se excluyen (ADR 21 §6).
+// CasoProyectado es un caso leído, con todo lo que el caso registra. La frontera
+// lo proyecta por audiencia al CasoEmergencia o EmergenciaReaccion del contrato:
+// el Cliente ve solo los suyos y no cerrados, sin campos internos (ADR 21 §6).
 type CasoProyectado struct {
 	ID             string
+	TenantID       string
 	ViajeID        string
 	ClienteID      string
 	Estado         string
@@ -619,43 +656,104 @@ type CasoProyectado struct {
 	ActivadaEn     time.Time
 	ResueltaEn     *time.Time
 	CerradaEn      *time.Time
+	// Reclamo es el reclamo activo; nil si el caso está en el pool.
+	Reclamo *ReclamoProyectado
 }
 
-// ListarPorViaje devuelve los casos de emergencia de un viaje. Para la vista
-// mínima del cliente (soloActivos=true, ADR 21 §6) excluye las cerradas; la
-// frontera además oculta los campos internos. El orden es por activación.
-func (s *Servicio) ListarPorViaje(ctx context.Context, tenantID, viajeID string, soloActivos bool) ([]CasoProyectado, error) {
+// ReclamoProyectado es el reclamo activo de un caso: quién lo tiene y en qué
+// versión, lo que Supervisor y Coordinador necesitan para liberarlo o
+// transferirlo (DEC-131).
+type ReclamoProyectado struct {
+	ID          string
+	Responsable string
+	Version     msgtipos.VersionReclamo
+	AbiertoEn   time.Time
+}
+
+// NotaProyectada es una nota del caso tal como se guardó.
+type NotaProyectada struct {
+	ID             string
+	EmergenciaID   string
+	AudienciaAutor string
+	ActorReal      string
+	Cuerpo         string
+	EsResolucion   bool
+	CreadoEn       time.Time
+}
+
+// sqlCaso lee el caso con su reclamo activo; cada lectura añade su WHERE.
+const sqlCaso = `SELECT e.id, e.tenant_id, e.viaje_id, COALESCE(e.cliente_id::text, ''), e.estado, e.origen,
+	        e.actor_real::text, e.version_reclamo, e.activada_en, e.resuelta_en, e.cerrada_en,
+	        r.id::text, r.actor_real::text, r.version, r.abierto_en
+	   FROM mensajeria.emergencia e
+	   LEFT JOIN mensajeria.reclamo_emergencia r
+	     ON r.emergencia_id = e.id AND r.tenant_id = e.tenant_id AND r.cerrado_en IS NULL `
+
+// ListarPorViaje devuelve todos los casos de emergencia de un viaje, de cualquier
+// tenant y estado, por orden de activación. No acota por audiencia: la frontera
+// deja al Cliente solo los de su empresa y no cerrados (ADR 21 §6, DEC-129).
+func (s *Servicio) ListarPorViaje(ctx context.Context, viajeID string) ([]CasoProyectado, error) {
+	return s.leerCasos(ctx, `WHERE e.viaje_id = $1 ORDER BY e.activada_en, e.id`, viajeID)
+}
+
+// Bandeja devuelve los casos de la bandeja única de emergencias (DEC-130), sin
+// acotar por tenant (DEC-129): todos menos los cerrados, del más antiguo al más
+// reciente por activada_en y, a igual activada_en, por id (DEC-121 #3). Todo caso
+// está en la bandeja única, así que no se filtra por bandeja_id: los casos
+// activados antes de DEC-130 en una bandeja de Reacción por tenant también salen.
+//
+// shortcut: devuelve todos los casos abiertos sin paginar (cursor_siguiente null);
+// paginar cuando la bandeja pase de unos cientos de casos abiertos.
+func (s *Servicio) Bandeja(ctx context.Context) ([]CasoProyectado, error) {
+	return s.leerCasos(ctx, `WHERE e.estado <> 'cerrada' ORDER BY e.activada_en, e.id`)
+}
+
+// Obtener devuelve un caso por su id. ErrNoEncontrada si no existe en el tenant.
+func (s *Servicio) Obtener(ctx context.Context, tenantID, emergenciaID string) (CasoProyectado, error) {
+	casos, err := s.leerCasos(ctx, `WHERE e.id = $1 AND e.tenant_id = $2`, emergenciaID, tenantID)
+	if err != nil {
+		return CasoProyectado{}, err
+	}
+	if len(casos) == 0 {
+		return CasoProyectado{}, ErrNoEncontrada
+	}
+	return casos[0], nil
+}
+
+func (s *Servicio) leerCasos(ctx context.Context, donde string, args ...any) ([]CasoProyectado, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("emergencias: abrir transacción de lectura: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	filtro := ""
-	if soloActivos {
-		filtro = ` AND estado <> 'cerrada'`
-	}
-	rows, err := tx.Query(ctx,
-		`SELECT id, viaje_id, COALESCE(cliente_id::text, ''), estado, origen,
-		        actor_real::text, version_reclamo, activada_en, resuelta_en, cerrada_en
-		   FROM mensajeria.emergencia
-		  WHERE tenant_id = $1 AND viaje_id = $2`+filtro+`
-		  ORDER BY activada_en`,
-		tenantID, viajeID)
+	rows, err := tx.Query(ctx, sqlCaso+donde, args...)
 	if err != nil {
 		return nil, fmt.Errorf("emergencias: listar casos: %w", err)
 	}
 	defer rows.Close()
 
-	var casos []CasoProyectado
+	casos := []CasoProyectado{}
 	for rows.Next() {
-		var c CasoProyectado
-		var version int64
-		if err := rows.Scan(&c.ID, &c.ViajeID, &c.ClienteID, &c.Estado, &c.Origen,
-			&c.ActorReal, &version, &c.ActivadaEn, &c.ResueltaEn, &c.CerradaEn); err != nil {
+		var (
+			c                      CasoProyectado
+			version                int64
+			reclamoID, responsable *string
+			reclamoVersion         *int64
+			abiertoEn              *time.Time
+		)
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.ViajeID, &c.ClienteID, &c.Estado, &c.Origen,
+			&c.ActorReal, &version, &c.ActivadaEn, &c.ResueltaEn, &c.CerradaEn,
+			&reclamoID, &responsable, &reclamoVersion, &abiertoEn); err != nil {
 			return nil, fmt.Errorf("emergencias: escanear caso: %w", err)
 		}
 		c.VersionReclamo = msgtipos.VersionReclamo(version)
+		if reclamoID != nil {
+			c.Reclamo = &ReclamoProyectado{
+				ID: *reclamoID, Responsable: *responsable,
+				Version: msgtipos.VersionReclamo(*reclamoVersion), AbiertoEn: *abiertoEn,
+			}
+		}
 		casos = append(casos, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -664,23 +762,72 @@ func (s *Servicio) ListarPorViaje(ctx context.Context, tenantID, viajeID string,
 	return casos, nil
 }
 
-// bandejaReaccion resuelve la bandeja de Reacción del tenant (la de tipo
-// 'emergencias'). ErrNoEncontrada si el tenant no tiene una aprovisionada: en V1
-// la bandeja de Reacción se siembra como parte del alta del tenant, igual que la
-// bandeja de chat.
-func bandejaReaccion(ctx context.Context, tx pgx.Tx, tenantID string) (string, error) {
+// ListarNotas devuelve las notas del caso de la más antigua a la más reciente
+// (creado_en, desempate por id), incluida la de resolución. El llamador ya
+// verificó que el caso existe.
+//
+// shortcut: sin paginar (cursor_siguiente null); un caso lleva pocas notas, se
+// pagina si alguna vez pasa de unos cientos.
+func (s *Servicio) ListarNotas(ctx context.Context, tenantID, emergenciaID string) ([]NotaProyectada, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("emergencias: abrir transacción de lectura: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx,
+		`SELECT id, emergencia_id, audiencia_autor, actor_real::text, cuerpo, es_resolucion, creado_en
+		   FROM mensajeria.nota_emergencia
+		  WHERE emergencia_id = $1 AND tenant_id = $2
+		  ORDER BY creado_en, id`,
+		emergenciaID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("emergencias: listar notas: %w", err)
+	}
+	defer rows.Close()
+
+	notas := []NotaProyectada{}
+	for rows.Next() {
+		var n NotaProyectada
+		if err := rows.Scan(&n.ID, &n.EmergenciaID, &n.AudienciaAutor, &n.ActorReal,
+			&n.Cuerpo, &n.EsResolucion, &n.CreadoEn); err != nil {
+			return nil, fmt.Errorf("emergencias: escanear nota: %w", err)
+		}
+		notas = append(notas, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("emergencias: iterar notas: %w", err)
+	}
+	return notas, nil
+}
+
+// bandejaEmergencias resuelve la bandeja única de emergencias (DEC-130 #1), sin
+// acotar por tenant (DEC-129), y la crea si todavía no existe, dentro de la tx de
+// la activación. La bandeja nace con el tenant del primer caso solo porque la
+// columna lo exige; nadie la busca por él. Si hay varias (sembradas por tenant
+// antes de DEC-130), la única es la más antigua, el mismo criterio que la de
+// conversaciones. Un lock transaccional serializa la creación: dos primeras
+// activaciones concurrentes no crean dos bandejas.
+func bandejaEmergencias(ctx context.Context, tx pgx.Tx, tenantID string) (string, error) {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('mensajeria.bandeja_emergencias'))`); err != nil {
+		return "", fmt.Errorf("emergencias: bloquear bandeja de emergencias: %w", err)
+	}
 	var id string
 	err := tx.QueryRow(ctx,
 		`SELECT id FROM mensajeria.bandeja
-		  WHERE tenant_id = $1 AND tipo = 'emergencias'
-		  ORDER BY creado_en LIMIT 1`,
-		tenantID,
+		  WHERE tipo = 'emergencias'
+		  ORDER BY creado_en, id LIMIT 1`,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNoEncontrada
+		err = tx.QueryRow(ctx,
+			`INSERT INTO mensajeria.bandeja (tenant_id, tipo, nombre)
+			 VALUES ($1, 'emergencias', 'Emergencias') RETURNING id`,
+			tenantID,
+		).Scan(&id)
 	}
 	if err != nil {
-		return "", fmt.Errorf("emergencias: resolver bandeja de Reacción: %w", err)
+		return "", fmt.Errorf("emergencias: resolver o crear la bandeja de emergencias: %w", err)
 	}
 	return id, nil
 }

@@ -11,23 +11,19 @@ import (
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/dbtest"
 )
 
-// TestPuedeEscribir es la prueba de comportamiento de la guarda de autorización
-// (DEC-124, DEC-127). Afirma, contra Postgres real, las dos ramas por audiencia:
-//   - Cliente: autoriza a cualquier usuario cuyo tenant sea el cliente_id de la
-//     conversación, aunque su sub sea otro (la conversación es de la empresa). Un
-//     cliente de otro tenant no la encuentra (no_encontrado: la consulta se acota
-//     por tenant). Una fila con tenant del cliente pero cliente_id de otra
-//     empresa no autoriza (addendum §7: poseer el UUID no autoriza).
-//   - Interno: autoriza al rol `ejecutivo` sin filas en pool_membresia si la
-//     conversación está enrutada a la bandeja de chat; otro rol interno
-//     (monitorista, supervisor) no_autorizado, aunque tenga una fila sembrada;
-//     una conversación sin ruta a chat (o enrutada a Reacción) no_autorizado.
-//
-// Una conversación inexistente es no_encontrado, no no_autorizado: el servidor
-// no revela existencia por el código de error.
+// TestConversacion es la prueba de comportamiento de la guarda de conversación
+// (DEC-124, DEC-127, DEC-129, DEC-131, DEC-132), contra Postgres real:
+//   - Cliente: cualquier usuario cuyo tenant sea el cliente_id lee y escribe; un
+//     cliente de otra empresa recibe no_encontrado, también ante una fila con
+//     cliente_id de otra empresa.
+//   - Interno con el tenant de AI27 (no el del cliente): el Ejecutivo lee y
+//     escribe sin filas de membresía; Supervisor y Coordinador solo leen; otro
+//     rol, o una conversación sin ruta a chat, es prohibido. La guarda devuelve
+//     el tenant de la conversación, no el del token.
+//   - Inexistente: no_encontrado para todos.
 //
 // Se salta si MENSAJERIA_TEST_DB no está definido.
-func TestPuedeEscribir(t *testing.T) {
+func TestConversacion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -55,6 +51,8 @@ func TestPuedeEscribir(t *testing.T) {
 		ejecutivo   = "dddddddd-dddd-dddd-dddd-dddddddddddd"
 		monitorista = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
 		supervisor  = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+		// tenantAI27 es el tenant con que llega un usuario interno (DEC-129).
+		tenantAI27 = "ai27"
 	)
 
 	// convCli: de la empresa A, enrutada a la bandeja de chat.
@@ -75,11 +73,11 @@ func TestPuedeEscribir(t *testing.T) {
 		`INSERT INTO mensajeria.ruta_conversacion (conversacion_id, tenant_id, bandeja_id, activa) VALUES
 		 ('`+convCli+`', '`+clienteA+`', '`+bandeja+`', true),
 		 ('`+convReacc+`', '`+clienteA+`', '`+bandejaEmer+`', true)`)
-	// Fila sembrada al estilo DEC-097 para un supervisor: ya no es fuente de
+	// Fila sembrada al estilo DEC-097 para un monitorista: ya no es fuente de
 	// membresía (DEC-127 #3) y no debe conceder acceso.
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, version, activa)
-		 VALUES ('`+bandeja+`', '`+supervisor+`', '`+clienteA+`', 'supervisor', 1, true)`)
+		 VALUES ('`+bandeja+`', '`+monitorista+`', '`+clienteA+`', 'monitorista', 1, true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
@@ -90,42 +88,57 @@ func TestPuedeEscribir(t *testing.T) {
 		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: "cliente", Audiencia: auth.AudienciaCliente}
 	}
 	interno := func(sub, rol string) *auth.Claims {
-		return &auth.Claims{Subject: sub, TenantID: clienteA, Rol: rol, Audiencia: auth.AudienciaInterno}
+		return &auth.Claims{Subject: sub, TenantID: tenantAI27, Rol: rol, Audiencia: auth.AudienciaInterno}
 	}
+	const (
+		ok          = platformerrors.CategoryUnknown // autoriza
+		noExiste    = platformerrors.CategoryNoEncontrado
+		prohibido   = platformerrors.CategoryProhibido
+		inexistente = "99999999-9999-9999-9999-999999999999"
+	)
 
 	casos := []struct {
 		nombre string
 		conv   string
 		claims *auth.Claims
-		quiere platformerrors.Category // CategoryUnknown ⇒ autoriza (nil)
+		accion autorizacion.Accion
+		quiere platformerrors.Category
 	}{
-		{"usuario 1 de la empresa autoriza (sub ≠ cliente_id)", convCli, cliente(usuarioA1, clienteA), platformerrors.CategoryUnknown},
-		{"usuario 2 de la misma empresa autoriza", convCli, cliente(usuarioA2, clienteA), platformerrors.CategoryUnknown},
-		{"cliente de otro tenant no la encuentra", convCli, cliente(usuarioB1, clienteB), platformerrors.CategoryNoEncontrado},
-		{"fila del tenant con cliente_id de otra empresa no autoriza", convAjena, cliente(usuarioA1, clienteA), platformerrors.CategoryNoAutorizado},
-		{"ejecutivo sin filas de membresía autoriza", convCli, interno(ejecutivo, "ejecutivo"), platformerrors.CategoryUnknown},
-		{"monitorista no autoriza", convCli, interno(monitorista, "monitorista"), platformerrors.CategoryNoAutorizado},
-		{"supervisor con fila sembrada no autoriza", convCli, interno(supervisor, "supervisor"), platformerrors.CategoryNoAutorizado},
-		{"ejecutivo sobre conversación sin ruta no autoriza", convSinRuta, interno(ejecutivo, "ejecutivo"), platformerrors.CategoryNoAutorizado},
-		{"ejecutivo sobre conversación enrutada a Reacción no autoriza", convReacc, interno(ejecutivo, "ejecutivo"), platformerrors.CategoryNoAutorizado},
-		{"conversación inexistente es no_encontrado", "99999999-9999-9999-9999-999999999999", interno(ejecutivo, "ejecutivo"), platformerrors.CategoryNoEncontrado},
+		{"usuario 1 de la empresa escribe (sub ≠ cliente_id)", convCli, cliente(usuarioA1, clienteA), autorizacion.Escribir, ok},
+		{"usuario 2 de la misma empresa lee", convCli, cliente(usuarioA2, clienteA), autorizacion.Leer, ok},
+		{"cliente de otra empresa no la encuentra", convCli, cliente(usuarioB1, clienteB), autorizacion.Leer, noExiste},
+		{"fila del tenant con cliente_id de otra empresa no la encuentra", convAjena, cliente(usuarioA1, clienteA), autorizacion.Leer, noExiste},
+		{"ejecutivo con tenant de AI27 escribe sin filas de membresía", convCli, interno(ejecutivo, "ejecutivo"), autorizacion.Escribir, ok},
+		{"supervisor lee", convCli, interno(supervisor, "supervisor"), autorizacion.Leer, ok},
+		{"coordinador lee", convCli, interno(supervisor, "coordinador"), autorizacion.Leer, ok},
+		{"supervisor no escribe", convCli, interno(supervisor, "supervisor"), autorizacion.Escribir, prohibido},
+		{"coordinador no escribe", convCli, interno(supervisor, "coordinador"), autorizacion.Escribir, prohibido},
+		{"monitorista con fila sembrada no lee", convCli, interno(monitorista, "monitorista"), autorizacion.Leer, prohibido},
+		{"ejecutivo sobre conversación sin ruta", convSinRuta, interno(ejecutivo, "ejecutivo"), autorizacion.Leer, prohibido},
+		{"ejecutivo sobre conversación enrutada a Reacción", convReacc, interno(ejecutivo, "ejecutivo"), autorizacion.Leer, prohibido},
+		{"inexistente para el interno", inexistente, interno(ejecutivo, "ejecutivo"), autorizacion.Leer, noExiste},
+		{"inexistente para el cliente", inexistente, cliente(usuarioA1, clienteA), autorizacion.Leer, noExiste},
 	}
 
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			err := svc.PuedeEscribir(ctx, c.claims.TenantID, c.conv, c.claims)
-			got := platformerrors.AsCategory(err)
-			if got != c.quiere {
-				t.Fatalf("PuedeEscribir = %v (err %v), quiere categoría %v", got, err, c.quiere)
+			tenant, err := svc.Conversacion(ctx, c.conv, c.claims, c.accion)
+			if got := platformerrors.AsCategory(err); got != c.quiere {
+				t.Fatalf("Conversacion = %v (err %v), quiere categoría %v", got, err, c.quiere)
+			}
+			if c.quiere == ok && tenant != clienteA {
+				t.Fatalf("tenant devuelto = %q, quiere el de la conversación %q", tenant, clienteA)
 			}
 		})
 	}
 }
 
-// TestPuedeVerBandeja fija la guarda de la bandeja por id (DEC-127): la de chat
-// la ve todo Ejecutivo sin filas de membresía y ningún otro rol; la de Reacción
-// sigue exigiendo membresía en su pool (DEC-028, sin cambio).
-func TestPuedeVerBandeja(t *testing.T) {
+// TestBandeja fija la guarda de la bandeja por id (DEC-127, DEC-129, DEC-130,
+// DEC-131, DEC-132): la de chat la leen Ejecutivo, Supervisor y Coordinador; la
+// de emergencias Reacción por su rol (sin filas), Supervisor y Coordinador. El
+// interno llega con el tenant de AI27 y recibe el tenant de la bandeja. Otro rol
+// es prohibido; el cliente no la encuentra.
+func TestBandeja(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -138,28 +151,25 @@ func TestPuedeVerBandeja(t *testing.T) {
 	dbtest.AplicarMigraciones(t, ctx, admin)
 
 	const (
-		tenant      = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-		chat        = "cccccccc-cccc-cccc-cccc-cccccccccccc"
-		emer        = "c0000000-0000-0000-0000-00000000000e"
-		ejecutivo   = "dddddddd-dddd-dddd-dddd-dddddddddddd"
-		monitorista = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
-		reaccion    = "11111111-1111-1111-1111-111111111111"
-		reaccionNo  = "22222222-2222-2222-2222-222222222222"
+		tenant   = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+		chat     = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		emer     = "c0000000-0000-0000-0000-00000000000e"
+		sujeto   = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		ok       = platformerrors.CategoryUnknown
+		noExiste = platformerrors.CategoryNoEncontrado
+		prohib   = platformerrors.CategoryProhibido
 	)
 	dbtest.Exec(t, ctx, admin,
 		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre) VALUES
 		 ('`+chat+`', '`+tenant+`', 'chat', 'Conversaciones'),
 		 ('`+emer+`', '`+tenant+`', 'emergencias', 'Reacción')`)
-	dbtest.Exec(t, ctx, admin,
-		`INSERT INTO mensajeria.pool_membresia (bandeja_id, usuario_id, tenant_id, rol, activa)
-		 VALUES ('`+emer+`', '`+reaccion+`', '`+tenant+`', 'reaccion', true)`)
 
 	pool, closePool := dbtest.PoolComoRol(t, ctx)
 	defer closePool()
 	svc := autorizacion.NewServicio(pool)
 
-	interno := func(sub, rol string) *auth.Claims {
-		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: auth.AudienciaInterno}
+	interno := func(rol string) *auth.Claims {
+		return &auth.Claims{Subject: sujeto, TenantID: "ai27", Rol: rol, Audiencia: auth.AudienciaInterno}
 	}
 	casos := []struct {
 		nombre  string
@@ -167,20 +177,110 @@ func TestPuedeVerBandeja(t *testing.T) {
 		claims  *auth.Claims
 		quiere  platformerrors.Category
 	}{
-		{"ejecutivo ve la de chat", chat, interno(ejecutivo, "ejecutivo"), platformerrors.CategoryUnknown},
-		{"monitorista no ve la de chat", chat, interno(monitorista, "monitorista"), platformerrors.CategoryNoAutorizado},
-		{"cliente no lista bandejas", chat, &auth.Claims{Subject: ejecutivo, TenantID: tenant, Rol: "cliente", Audiencia: auth.AudienciaCliente}, platformerrors.CategoryNoAutorizado},
-		{"miembro de Reacción ve la de emergencias", emer, interno(reaccion, "reaccion"), platformerrors.CategoryUnknown},
-		{"Reacción sin membresía no ve la de emergencias", emer, interno(reaccionNo, "reaccion"), platformerrors.CategoryNoAutorizado},
-		{"ejecutivo no ve la de emergencias", emer, interno(ejecutivo, "ejecutivo"), platformerrors.CategoryNoAutorizado},
-		{"bandeja inexistente es no_encontrado", "99999999-9999-9999-9999-999999999999", interno(ejecutivo, "ejecutivo"), platformerrors.CategoryNoEncontrado},
+		{"ejecutivo ve la de chat", chat, interno("ejecutivo"), ok},
+		{"supervisor ve la de chat", chat, interno("supervisor"), ok},
+		{"coordinador ve la de chat", chat, interno("coordinador"), ok},
+		{"monitorista no ve la de chat", chat, interno("monitorista"), prohib},
+		{"reaccion no ve la de chat", chat, interno("reaccion"), prohib},
+		{"cliente no encuentra bandejas", chat, &auth.Claims{Subject: sujeto, TenantID: tenant, Rol: "cliente", Audiencia: auth.AudienciaCliente}, noExiste},
+		{"reaccion ve la de emergencias sin filas de membresía", emer, interno("reaccion"), ok},
+		{"supervisor ve la de emergencias", emer, interno("supervisor"), ok},
+		{"ejecutivo no ve la de emergencias", emer, interno("ejecutivo"), prohib},
+		{"bandeja inexistente es no_encontrado", "99999999-9999-9999-9999-999999999999", interno("ejecutivo"), noExiste},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			got := platformerrors.AsCategory(svc.PuedeVerBandeja(ctx, tenant, c.bandeja, c.claims))
-			if got != c.quiere {
-				t.Fatalf("PuedeVerBandeja = %v, quiere %v", got, c.quiere)
+			got, err := svc.Bandeja(ctx, c.bandeja, c.claims)
+			if cat := platformerrors.AsCategory(err); cat != c.quiere {
+				t.Fatalf("Bandeja = %v (err %v), quiere %v", cat, err, c.quiere)
+			}
+			if c.quiere == ok && got != tenant {
+				t.Fatalf("tenant devuelto = %q, quiere %q", got, tenant)
 			}
 		})
+	}
+}
+
+// TestEmergencia fija la guarda del caso de emergencia por permiso (DEC-129 a
+// DEC-132): Reacción es miembro por su rol sin filas en pool_membresia;
+// Supervisor y Coordinador ven y mueven pero no atienden; cierra monitoreo o
+// Administrador. Interno sin permiso → prohibido; Cliente sobre un caso de otra
+// empresa → no_encontrado; Cliente sobre uno suyo → prohibido; inexistente →
+// no_encontrado.
+func TestEmergencia(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dbtest.Serializar(t, ctx)
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	dbtest.Reiniciar(t, ctx, admin)
+	defer dbtest.Reiniciar(t, ctx, admin)
+	dbtest.AplicarMigraciones(t, ctx, admin)
+
+	const (
+		clienteA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+		clienteB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+		emer     = "c0000000-0000-0000-0000-00000000000e"
+		caso     = "e0000000-0000-0000-0000-000000000001"
+		sujeto   = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		ok       = platformerrors.CategoryUnknown
+		noExiste = platformerrors.CategoryNoEncontrado
+		prohib   = platformerrors.CategoryProhibido
+	)
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.bandeja (id, tenant_id, tipo, nombre)
+		 VALUES ('`+emer+`', '`+clienteA+`', 'emergencias', 'Emergencias')`)
+	dbtest.Exec(t, ctx, admin,
+		`INSERT INTO mensajeria.emergencia (id, tenant_id, viaje_id, bandeja_id, origen, actor_real, activacion_id)
+		 VALUES ('`+caso+`', '`+clienteA+`', gen_random_uuid(), '`+emer+`', 'cliente', '`+sujeto+`', gen_random_uuid())`)
+
+	pool, closePool := dbtest.PoolComoRol(t, ctx)
+	defer closePool()
+	svc := autorizacion.NewServicio(pool)
+
+	interno := func(rol string) *auth.Claims {
+		return &auth.Claims{Subject: sujeto, TenantID: "ai27", Rol: rol, Audiencia: auth.AudienciaInterno}
+	}
+	cliente := func(tenant string) *auth.Claims {
+		return &auth.Claims{Subject: sujeto, TenantID: tenant, Rol: "cliente", Audiencia: auth.AudienciaCliente}
+	}
+	type fila struct {
+		claims *auth.Claims
+		quiere [4]platformerrors.Category // VerCaso, AtenderCaso, MoverCaso, CerrarCaso
+	}
+	matriz := map[string]fila{
+		"reaccion":                {interno("reaccion"), [4]platformerrors.Category{ok, ok, ok, prohib}},
+		"supervisor":              {interno("supervisor"), [4]platformerrors.Category{ok, prohib, ok, ok}},
+		"coordinador":             {interno("coordinador"), [4]platformerrors.Category{ok, prohib, ok, ok}},
+		"monitorista":             {interno("monitorista"), [4]platformerrors.Category{prohib, prohib, prohib, ok}},
+		"administrador":           {interno("administrador"), [4]platformerrors.Category{prohib, prohib, prohib, ok}},
+		"ejecutivo":               {interno("ejecutivo"), [4]platformerrors.Category{prohib, prohib, prohib, prohib}},
+		"cliente de la empresa":   {cliente(clienteA), [4]platformerrors.Category{prohib, prohib, prohib, prohib}},
+		"cliente de otra empresa": {cliente(clienteB), [4]platformerrors.Category{noExiste, noExiste, noExiste, noExiste}},
+	}
+	permisos := []autorizacion.Permiso{autorizacion.VerCaso, autorizacion.AtenderCaso, autorizacion.MoverCaso, autorizacion.CerrarCaso}
+	for nombre, f := range matriz {
+		t.Run(nombre, func(t *testing.T) {
+			var got [4]platformerrors.Category
+			for i, p := range permisos {
+				tenant, err := svc.Emergencia(ctx, caso, f.claims, p)
+				got[i] = platformerrors.AsCategory(err)
+				if err == nil && tenant != clienteA {
+					t.Fatalf("permiso %d: tenant %q, quiere %q", i, tenant, clienteA)
+				}
+			}
+			if got != f.quiere {
+				t.Fatalf("categorías [ver atender mover cerrar] = %v, quiere %v", got, f.quiere)
+			}
+		})
+	}
+
+	if _, err := svc.Emergencia(ctx, "99999999-9999-9999-9999-999999999999", interno("reaccion"), autorizacion.VerCaso); platformerrors.AsCategory(err) != noExiste {
+		t.Fatalf("caso inexistente: %v, quiere no_encontrado", err)
+	}
+	if tenant, err := svc.TenantDeEmergencia(ctx, caso, cliente(clienteA)); err != nil || tenant != clienteA {
+		t.Fatalf("TenantDeEmergencia del cliente dueño = %q, %v; quiere %q", tenant, err, clienteA)
 	}
 }

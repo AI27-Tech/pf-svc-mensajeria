@@ -70,7 +70,7 @@ func rpServidor(t *testing.T) func(method, path, sub string, body any) *httptest
 		}
 		req := httptest.NewRequest(method, path, bytes.NewReader(b))
 		req = req.WithContext(auth.ContextWithClaims(ctx, &auth.Claims{
-			Subject: sub, TenantID: rpTenant, Rol: "ejecutivo", Audiencia: auth.AudienciaInterno,
+			Subject: sub, TenantID: "ai27", Rol: "ejecutivo", Audiencia: auth.AudienciaInterno,
 		}))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)

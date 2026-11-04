@@ -417,7 +417,7 @@ func mapearMensaje(id, convID, actorReal, clientMsgID, cuerpo string, secuencia 
 // mayor); son mutuamente excluyentes y sin ninguno devuelve los más recientes.
 // `hayMas` indica si quedan mensajes en la dirección pedida: se pide un elemento
 // extra (limite+1) y se recorta. No decide ACCESO: eso lo hace la frontera con
-// autorizacion.PuedeEscribir antes de llamar aquí (addendum §7).
+// autorizacion.Conversacion antes de llamar aquí (addendum §7).
 func (s *Servicio) ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error) {
 	if limite <= 0 {
 		limite = 50
@@ -494,7 +494,7 @@ func (s *Servicio) ListarMensajes(ctx context.Context, tenantID, conversacionID 
 // es 0 si nunca se reclamó (contrato). Devuelve el agregado COMPLETO, incluidos
 // los campos solo-interno (bandeja_id, reclamo_activo); el recorte por audiencia
 // lo hace el consumidor (el `bff` arma su propio schema de cliente). No decide
-// ACCESO: lo hace la frontera con autorizacion.PuedeEscribir.
+// ACCESO: lo hace la frontera con autorizacion.Conversacion.
 func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -634,13 +634,14 @@ func (s *Servicio) ClienteDeConversacion(ctx context.Context, tenantID, conversa
 	return *clienteID, nil
 }
 
-// ConversacionDeViaje devuelve el id de la conversación del viaje para el tenant
-// (contrato obtenerConversacionDeViaje): la no cerrada si existe (a lo más una,
+// ConversacionDeViaje devuelve el id de la conversación del viaje (contrato
+// obtenerConversacionDeViaje): la no cerrada si existe (a lo más una por tenant,
 // índice una_conversacion_activa_por_viaje); si todas están cerradas, la más
 // reciente por creado_en (la tabla no guarda la hora de cierre).
-// ErrConversacionNoEncontrada si el viaje no tiene conversación en el tenant. No
-// decide ACCESO: lo hace la frontera con autorizacion.PuedeEscribir.
-func (s *Servicio) ConversacionDeViaje(ctx context.Context, tenantID, viajeID string) (string, error) {
+// ErrConversacionNoEncontrada si el viaje no tiene conversación. No acota por
+// tenant ni decide ACCESO: lo hace la frontera con autorizacion.Conversacion
+// (DEC-129), igual que CerrarVentana busca solo por viaje.
+func (s *Servicio) ConversacionDeViaje(ctx context.Context, viajeID string) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
@@ -650,10 +651,10 @@ func (s *Servicio) ConversacionDeViaje(ctx context.Context, tenantID, viajeID st
 	var id string
 	err = tx.QueryRow(ctx,
 		`SELECT id FROM mensajeria.conversacion
-		  WHERE tenant_id = $1 AND viaje_id = $2
+		  WHERE viaje_id = $1
 		  ORDER BY estado = 'cerrada', creado_en DESC, id DESC
 		  LIMIT 1`,
-		tenantID, viajeID,
+		viajeID,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrConversacionNoEncontrada

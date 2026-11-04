@@ -75,7 +75,7 @@ func TestReclamarConversacionHTTP(t *testing.T) {
 		if sub == otro {
 			rol = "monitorista"
 		}
-		return &auth.Claims{Subject: sub, TenantID: tenant, Rol: rol, Audiencia: auth.AudienciaInterno}
+		return &auth.Claims{Subject: sub, TenantID: "ai27", Rol: rol, Audiencia: auth.AudienciaInterno}
 	}
 
 	// Llama al handler con los claims ya en contexto (como auth.Middleware).
@@ -88,9 +88,9 @@ func TestReclamarConversacionHTTP(t *testing.T) {
 		return rec
 	}
 
-	// Monitorista (no Ejecutivo): 401 como antes sin membresía; no toca el reclamo.
-	if rec := reclamar(otro, 0); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("reclamar como monitorista: status %d, quiere 401; cuerpo %s", rec.Code, rec.Body.String())
+	// Monitorista (no Ejecutivo): 403 (DEC-132); no toca el reclamo.
+	if rec := reclamar(otro, 0); rec.Code != http.StatusForbidden {
+		t.Fatalf("reclamar como monitorista: status %d, quiere 403; cuerpo %s", rec.Code, rec.Body.String())
 	}
 
 	// Ejecutivo sin filas de membresía, primer reclamo (versión esperada 0): 201 con el Reclamo.
@@ -182,7 +182,7 @@ func TestTransferirConversacionHTTP(t *testing.T) {
 	mux := http.NewServeMux()
 	mod.Routes(mux)
 
-	claims := &auth.Claims{Subject: origen, TenantID: tenant, Rol: "ejecutivo", Audiencia: auth.AudienciaInterno}
+	claims := &auth.Claims{Subject: origen, TenantID: "ai27", Rol: "ejecutivo", Audiencia: auth.AudienciaInterno}
 	destinoID := uuid.MustParse(destino)
 	body, _ := json.Marshal(msgclient.TransferenciaEntrada{ResponsableDestinoId: destinoID, VersionEsperada: 1})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/conversaciones/"+conv+"/transferencias", bytes.NewReader(body))

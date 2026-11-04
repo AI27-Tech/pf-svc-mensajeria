@@ -5,11 +5,11 @@ import (
 	"errors"
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
+	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	bandejashttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/bandejas"
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
-	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
@@ -72,10 +72,11 @@ func (a *conversacionesAPI) ObtenerConversacion(ctx context.Context, conversacio
 		return nil, err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Leer)
+	if err != nil {
 		return nil, err
 	}
-	conv, err := a.conv.Conversacion.ObtenerConversacion(ctx, claims.TenantID, id)
+	conv, err := a.conv.Conversacion.ObtenerConversacion(ctx, tenant, id)
 	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
 		return nil, platformerrors.NewNoEncontrado("conversacion no encontrada")
 	}
@@ -101,7 +102,8 @@ func (a *conversacionesAPI) ListarMensajes(ctx context.Context, conversacionID m
 		return nil, err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Leer)
+	if err != nil {
 		return nil, err
 	}
 	if params.AntesDe != nil && params.DespuesDe != nil {
@@ -111,7 +113,7 @@ func (a *conversacionesAPI) ListarMensajes(ctx context.Context, conversacionID m
 	if params.Limite != nil {
 		lim = *params.Limite
 	}
-	items, hayMas, err := a.conv.Conversacion.ListarMensajes(ctx, claims.TenantID, id, params.AntesDe, params.DespuesDe, lim)
+	items, hayMas, err := a.conv.Conversacion.ListarMensajes(ctx, tenant, id, params.AntesDe, params.DespuesDe, lim)
 	if err != nil {
 		return nil, traducir(err)
 	}
@@ -124,10 +126,11 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 		return nil, err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	if err != nil {
 		return nil, err
 	}
-	alias, err := a.conv.ResolverAlias(ctx, claims.TenantID, id)
+	alias, err := a.conv.ResolverAlias(ctx, tenant, id)
 	if err != nil {
 		return nil, traducir(err)
 	}
@@ -136,7 +139,7 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 		motivoOverride = *body.MotivoOverride
 	}
 	res, err := a.conv.Conversacion.Enviar(ctx, conversacion.EntradaEnvio{
-		TenantID:               claims.TenantID,
+		TenantID:               tenant,
 		ConversacionID:         id,
 		ActorReal:              claims.Subject,
 		ClientMessageID:        body.ClientMessageId.String(),
@@ -156,30 +159,23 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 	case err != nil:
 		return nil, traducir(err)
 	}
-	mensaje, err := a.conv.Conversacion.MensajePorID(ctx, claims.TenantID, res.MensajeID)
+	mensaje, err := a.conv.Conversacion.MensajePorID(ctx, tenant, res.MensajeID)
 	if err != nil {
 		return nil, traducir(err)
 	}
 	return mensaje, nil
 }
 
-// ListarTrabajoBandeja es la ruta sin {id} (listarTrabajoMiBandeja, DEC-127):
-// ser Ejecutivo y resolver la bandeja única del tenant ES la autorización, igual
-// que en HTTP. Cursor se ignora, igual que en HTTP.
+// ListarTrabajoBandeja es la ruta sin {id} (listarTrabajoMiBandeja): la unión de
+// las bandejas de chat de todos los tenants (DEC-127, DEC-129), para quien la lee
+// por su rol (DEC-131). Cursor se ignora, igual que en HTTP.
 func (a *conversacionesAPI) ListarTrabajoBandeja(ctx context.Context, params msgclient.ListarTrabajoMiBandejaParams) (*msgclient.TrabajoBandeja, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !autorizacion.EsMiembroBandejaChat(claims.Rol) {
+	if claims.Audiencia == auth.AudienciaCliente || !autorizacion.LeeBandejaChat(claims.Rol) {
 		return nil, platformerrors.NewNoEncontrado(bandejashttp.SinBandejaChat)
-	}
-	bandejaID, err := a.bandeja.Bandeja.ResolverMiBandeja(ctx, claims.TenantID)
-	if errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-		return nil, platformerrors.NewNoEncontrado(bandejashttp.SinBandejaChat)
-	}
-	if err != nil {
-		return nil, traducir(err)
 	}
 
 	var (
@@ -188,12 +184,9 @@ func (a *conversacionesAPI) ListarTrabajoBandeja(ctx context.Context, params msg
 		fuera bool
 	)
 	if params.DesdeRevision == nil {
-		items, rev, err = a.bandeja.Bandeja.Trabajo(ctx, claims.TenantID, bandejaID)
+		items, rev, err = a.bandeja.Bandeja.TrabajoChat(ctx)
 	} else {
-		items, rev, fuera, err = a.bandeja.Bandeja.CambiosDesde(ctx, claims.TenantID, bandejaID, *params.DesdeRevision)
-	}
-	if errors.Is(err, bandejas.ErrBandejaNoEncontrada) {
-		return nil, platformerrors.NewNoEncontrado("bandeja no encontrada")
+		items, rev, fuera, err = a.bandeja.Bandeja.CambiosChatDesde(ctx, *params.DesdeRevision)
 	}
 	if err != nil {
 		return nil, traducir(err)
@@ -213,14 +206,15 @@ func (a *conversacionesAPI) ReclamarConversacion(ctx context.Context, conversaci
 		return nil, err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := a.conv.Reclamos.Reclamar(ctx, claims.TenantID, id, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
+	if _, err := a.conv.Reclamos.Reclamar(ctx, tenant, id, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
 		return nil, convhttp.TraducirReclamo(err)
 	}
 	// Misma hidratación en lectura aparte que el handler (ver su shortcut).
-	reclamo, err := a.conv.Reclamo.ReclamoActivo(ctx, claims.TenantID, id)
+	reclamo, err := a.conv.Reclamo.ReclamoActivo(ctx, tenant, id)
 	if err != nil {
 		return nil, traducir(err)
 	}
@@ -233,10 +227,11 @@ func (a *conversacionesAPI) LiberarReclamo(ctx context.Context, conversacionID, 
 		return err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	if err != nil {
 		return err
 	}
-	if err := a.conv.Reclamos.Liberar(ctx, claims.TenantID, id, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(params.VersionEsperada)); err != nil {
+	if err := a.conv.Reclamos.Liberar(ctx, tenant, id, reclamoID.String(), claims.Subject, msgtipos.VersionReclamo(params.VersionEsperada)); err != nil {
 		return convhttp.TraducirReclamo(err)
 	}
 	return nil
@@ -248,19 +243,20 @@ func (a *conversacionesAPI) TransferirConversacion(ctx context.Context, conversa
 		return nil, err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	if err != nil {
 		return nil, err
 	}
 	motivo := ""
 	if body.Motivo != nil {
 		motivo = *body.Motivo
 	}
-	err = a.conv.Reclamos.Transferir(ctx, claims.TenantID, id, claims.Subject,
+	err = a.conv.Reclamos.Transferir(ctx, tenant, id, claims.Subject,
 		body.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(body.VersionEsperada))
 	if err != nil {
 		return nil, convhttp.TraducirReclamo(err)
 	}
-	reclamo, err := a.conv.Reclamo.ReclamoActivo(ctx, claims.TenantID, id)
+	reclamo, err := a.conv.Reclamo.ReclamoActivo(ctx, tenant, id)
 	if err != nil {
 		return nil, traducir(err)
 	}
@@ -274,10 +270,11 @@ func (a *conversacionesAPI) MarcarAtendida(ctx context.Context, conversacionID m
 		return err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	if err != nil {
 		return err
 	}
-	if err := a.conv.Atencion.MarcarAtendida(ctx, claims.TenantID, id, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
+	if err := a.conv.Atencion.MarcarAtendida(ctx, tenant, id, claims.Subject, msgtipos.VersionReclamo(body.VersionEsperada)); err != nil {
 		return convhttp.TraducirAtencion(err)
 	}
 	return nil
@@ -297,10 +294,11 @@ func (a *conversacionesAPI) registrarRecibo(ctx context.Context, conversacionID 
 		return err
 	}
 	id := conversacionID.String()
-	if err := a.conv.Autz.PuedeEscribir(ctx, claims.TenantID, id, claims); err != nil {
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	if err != nil {
 		return err
 	}
-	if err := a.conv.Atencion.RegistrarRecibo(ctx, claims.TenantID, id, claims.Subject, tipo, msgtipos.SecuenciaMensaje(body.HastaSecuencia)); err != nil {
+	if err := a.conv.Atencion.RegistrarRecibo(ctx, tenant, id, claims.Subject, tipo, msgtipos.SecuenciaMensaje(body.HastaSecuencia)); err != nil {
 		return convhttp.TraducirAtencion(err)
 	}
 	return nil
@@ -320,7 +318,11 @@ func (a *conversacionesAPI) ListarAuditoriaConversacion(ctx context.Context, con
 	if params.Cursor != nil {
 		cursor = *params.Cursor
 	}
-	pagina, err := a.conv.Auditoria.Listar(ctx, claims.TenantID, conversacionID.String(), cursor)
+	tenant, err := a.conv.Autz.TenantDeConversacion(ctx, conversacionID.String(), claims)
+	if err != nil {
+		return nil, err
+	}
+	pagina, err := a.conv.Auditoria.Listar(ctx, tenant, conversacionID.String(), cursor)
 	if err != nil {
 		return nil, convhttp.TraducirAtencion(err)
 	}
