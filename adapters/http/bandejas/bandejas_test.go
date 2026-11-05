@@ -16,17 +16,17 @@ import (
 // handler llega a llamarlo, el texto de la causa queda disponible para filtrarse.
 type trabajadorPG struct{ llamado bool }
 
-func (f *trabajadorPG) TrabajoChat(context.Context) ([]msgclient.Conversacion, int64, error) {
+func (f *trabajadorPG) TrabajoChat(context.Context, string) ([]msgclient.Conversacion, int64, error) {
 	f.llamado = true
 	return nil, 0, errors.New(`ERROR: invalid input syntax for type uuid: "no-es-uuid" (SQLSTATE 22P02)`)
 }
-func (f *trabajadorPG) CambiosChatDesde(context.Context, int64) ([]msgclient.Conversacion, int64, bool, error) {
+func (f *trabajadorPG) CambiosChatDesde(context.Context, string, int64) ([]msgclient.Conversacion, int64, bool, error) {
 	panic("no se invoca")
 }
-func (f *trabajadorPG) Trabajo(context.Context, string, string) ([]msgclient.Conversacion, int64, error) {
+func (f *trabajadorPG) Trabajo(context.Context, string, string, string) ([]msgclient.Conversacion, int64, error) {
 	panic("no se invoca")
 }
-func (f *trabajadorPG) CambiosDesde(context.Context, string, string, int64) ([]msgclient.Conversacion, int64, bool, error) {
+func (f *trabajadorPG) CambiosDesde(context.Context, string, string, string, int64) ([]msgclient.Conversacion, int64, bool, error) {
 	panic("no se invoca")
 }
 

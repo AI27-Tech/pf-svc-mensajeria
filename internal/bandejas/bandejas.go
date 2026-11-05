@@ -22,6 +22,7 @@ import (
 	"time"
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -37,6 +38,10 @@ type Consultor interface {
 // Servicio sirve el trabajo de una bandeja desde la proyección local.
 type Servicio struct {
 	db Consultor
+	// Ventana es N, la disponibilidad del dueño del cliente: decide si una
+	// conversación sigue dirigida a él (DEC-128). Cero vale
+	// vinculo.VentanaPorDefecto.
+	Ventana vinculo.Ventana
 }
 
 // NewServicio construye el servicio de bandejas sobre el pool de chat.
@@ -117,13 +122,17 @@ const NombreBandejaUnica = "Conversaciones"
 // ruta ACTIVA en la bandeja y la revisión actual de la colección, que el cliente
 // usa como desde_revision en el siguiente catch-up. El orden es por revisión de
 // ruta (el orden en que entraron a la colección).
-func (s *Servicio) Trabajo(ctx context.Context, tenantID, bandejaID string) ([]msgclient.Conversacion, int64, error) {
+//
+// lector es el Ejecutivo que lee: no ve las conversaciones dirigidas a otro
+// Ejecutivo (DEC-128). Vacío para Supervisor y Coordinador, que ven todo
+// (DEC-131). Igual en los cuatro métodos de lectura.
+func (s *Servicio) Trabajo(ctx context.Context, tenantID, bandejaID, lector string) ([]msgclient.Conversacion, int64, error) {
 	rev, err := s.revisionColeccion(ctx, tenantID, bandejaID)
 	if err != nil {
 		return nil, 0, err
 	}
-	items, err := s.consultar(ctx,
-		`WHERE r.bandeja_id = $1 AND r.tenant_id = $2 AND r.activa ORDER BY r.revision`, bandejaID, tenantID)
+	items, err := s.consultar(ctx, lector,
+		`r.bandeja_id = $1 AND r.tenant_id = $2 AND r.activa`, bandejaID, tenantID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -139,13 +148,13 @@ func (s *Servicio) Trabajo(ctx context.Context, tenantID, bandejaID string) ([]m
 // siempre puede reconstruir desde cualquier revisión: fueraDeVentana es false.
 // El 409 stream_resync_required del contrato queda como capacidad para cuando se
 // introduzca una ventana de retención con purga (ADR 28 §5, ventana configurable).
-func (s *Servicio) CambiosDesde(ctx context.Context, tenantID, bandejaID string, desde int64) ([]msgclient.Conversacion, int64, bool, error) {
+func (s *Servicio) CambiosDesde(ctx context.Context, tenantID, bandejaID, lector string, desde int64) ([]msgclient.Conversacion, int64, bool, error) {
 	rev, err := s.revisionColeccion(ctx, tenantID, bandejaID)
 	if err != nil {
 		return nil, 0, false, err
 	}
-	items, err := s.consultar(ctx,
-		`WHERE r.bandeja_id = $1 AND r.tenant_id = $2 AND r.revision > $3 ORDER BY r.revision`, bandejaID, tenantID, desde)
+	items, err := s.consultar(ctx, lector,
+		`r.bandeja_id = $1 AND r.tenant_id = $2 AND r.revision > $3`, bandejaID, tenantID, desde)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -160,13 +169,12 @@ func (s *Servicio) CambiosDesde(ctx context.Context, tenantID, bandejaID string,
 // revisión se lee ANTES que las filas, como en Trabajo: una alta concurrente
 // queda en las filas con una revisión que el catch-up vuelve a entregar, nunca al
 // revés.
-func (s *Servicio) TrabajoChat(ctx context.Context) ([]msgclient.Conversacion, int64, error) {
+func (s *Servicio) TrabajoChat(ctx context.Context, lector string) ([]msgclient.Conversacion, int64, error) {
 	rev, err := s.revisionChat(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	items, err := s.consultar(ctx,
-		`WHERE b.tipo = 'chat' AND r.activa ORDER BY r.revision, r.id`)
+	items, err := s.consultar(ctx, lector, `b.tipo = 'chat' AND r.activa`)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -176,13 +184,18 @@ func (s *Servicio) TrabajoChat(ctx context.Context) ([]msgclient.Conversacion, i
 // CambiosChatDesde es el CATCH-UP de la unión de TrabajoChat: las rutas de
 // cualquier bandeja de chat con revisión mayor a `desde`, incluidas las
 // inactivas. Igual que CambiosDesde, sin purga no hay fuera de ventana.
-func (s *Servicio) CambiosChatDesde(ctx context.Context, desde int64) ([]msgclient.Conversacion, int64, bool, error) {
+//
+// shortcut: cuando una dirección vence (el dueño pasa N sin actividad, DEC-128),
+// la revisión no avanza, así que el catch-up de los demás Ejecutivos no la
+// reporta; la ven en su siguiente bootstrap. Lo mismo cuando el dueño la
+// reclama. Upgrade: si el panel necesita verla antes, avanzar la revisión de la
+// ruta al vencer (exige un barrido) o al reclamarla.
+func (s *Servicio) CambiosChatDesde(ctx context.Context, lector string, desde int64) ([]msgclient.Conversacion, int64, bool, error) {
 	rev, err := s.revisionChat(ctx)
 	if err != nil {
 		return nil, 0, false, err
 	}
-	items, err := s.consultar(ctx,
-		`WHERE b.tipo = 'chat' AND r.revision > $1 ORDER BY r.revision, r.id`, desde)
+	items, err := s.consultar(ctx, lector, `b.tipo = 'chat' AND r.revision > $1`, desde)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -218,12 +231,19 @@ func (s *Servicio) revisionColeccion(ctx context.Context, tenantID, bandejaID st
 	return rev, nil
 }
 
-// consultar lee las conversaciones con el WHERE dado sobre la ruta (r). Une ruta_conversacion → conversacion y un LEFT JOIN al reclamo
-// activo para version_reclamo (required en el contrato); sin reclamo activo, la
-// versión más alta de la conversación (0 si nunca se reclamó), con la que se
-// reclama desde el pool. El filtro y sus args extra los pone el llamador
-// (bootstrap: activa; catch-up: revision > desde). b es la bandeja de la ruta.
-func (s *Servicio) consultar(ctx context.Context, donde string, args ...any) ([]msgclient.Conversacion, error) {
+// consultar lee las conversaciones con el filtro dado sobre la ruta (r), en
+// orden de revisión. Une ruta_conversacion → conversacion y un LEFT JOIN al
+// reclamo activo para version_reclamo (required en el contrato); sin reclamo
+// activo, la versión más alta de la conversación (0 si nunca se reclamó), con la
+// que se reclama desde el pool. El filtro y sus args los pone el llamador
+// (bootstrap: activa; catch-up: revision > desde); consultar le agrega la
+// visibilidad del lector (vinculo.CondicionVisible). b es la bandeja de la ruta.
+func (s *Servicio) consultar(ctx context.Context, lector, filtro string, args ...any) ([]msgclient.Conversacion, error) {
+	n := len(args)
+	donde := `WHERE ` + filtro + ` AND ` +
+		vinculo.CondicionVisible(fmt.Sprintf("$%d", n+1), fmt.Sprintf("$%d", n+2)) +
+		` ORDER BY r.revision, r.id`
+	args = append(args, lector, s.Ventana.Segundos())
 	rows, err := s.db.Query(ctx,
 		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
 		        c.escritura_hasta, c.creado_en, r.bandeja_id,

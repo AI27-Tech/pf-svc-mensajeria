@@ -26,12 +26,13 @@
 // mínima (envío idempotente + outbox en una tx; reclamo con conflicto de
 // versión). Varias superficies están bloqueadas por brechas de contrato o de
 // producto (ver README): emergencia (M9) y catch-up de bandeja (M3) esperan
-// tracer.9; el vínculo Ejecutivo↔cliente lo debe Producto.
+// tracer.9; el vínculo Ejecutivo↔cliente vive en internal/vinculo (DEC-128).
 package mensajeria
 
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/AI27-Tech/pf-pkg-platform-go/bus"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
@@ -48,6 +49,7 @@ import (
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 )
 
 // Pools agrupa los pools por rol que el módulo necesita. mensajeria usa UN solo
@@ -81,6 +83,10 @@ type Deps struct {
 	// sesion.revocada, eventos de identidad). Nil sin bus: Workers() no arranca
 	// consumidores.
 	Subscriber bus.Subscriber
+	// VentanaDisponible es N (DEC-128): un Ejecutivo sin actividad en mensajeria
+	// durante más de N deja de estar disponible y sus clientes vuelven al pool.
+	// Cero vale 30 minutos (vinculo.VentanaPorDefecto).
+	VentanaDisponible time.Duration
 }
 
 // Module es la instancia construida del módulo mensajeria.
@@ -120,6 +126,8 @@ func New(p Pools, d Deps) (*Module, error) {
 	m.bandejas = bandejas.NewServicio(p.Chat)
 	m.emergencias = emergencias.NewServicio(p.Chat, pub)
 	m.auditoria = auditoria.NewServicio(p.Chat)
+	ventana := vinculo.Ventana(d.VentanaDisponible)
+	m.conversacion.Ventana, m.reclamos.Ventana, m.bandejas.Ventana = ventana, ventana, ventana
 
 	if d.Publisher != nil {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el

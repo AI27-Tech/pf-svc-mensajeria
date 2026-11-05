@@ -76,10 +76,10 @@ Postgres local y pasaron.
 - **Catch-up de bandeja (M3)** — `internal/bandejas/doc.go`: sin rutas de
   bootstrap/catch-up ni `409 stream_resync_required`.
 
-Bloqueados por producto (no por `tracer.9`): `internal/pool` e
-`internal/autorizacion` (mecánica del vínculo `Ejecutivo`↔`cliente`, DEC-045 #8 /
-DEC-046 #2, sin definir); alcance de `adjuntos` (MSG-REC §13); política de
-visibilidad de recibos (Addendum §8). Despacho externo sin worker ni destinatario
+Bloqueados por producto (no por `tracer.9`): `internal/pool`; alcance de
+`adjuntos` (MSG-REC §13); política de visibilidad de recibos (Addendum §8).
+El vínculo `Ejecutivo`↔`cliente` ya está definido (DEC-103, DEC-128) y vive en
+`internal/vinculo`. Despacho externo sin worker ni destinatario
 cliente (DEC-023).
 
 ## Brechas y contradicciones encontradas (reportadas, no resueltas)
@@ -124,3 +124,6 @@ el relay de outbox corra de verdad; el relay es agnóstico al nombre de tema.
 
 Variables: `DB_MENSAJERIA_CHAT_URL`, `DB_MENSAJERIA_DESPACHO_URL`,
 `CATALOGOS_BASE_URL`, `HTTP_ADDR`, `SERVICE_NAME`.
+`MENSAJERIA_DISPONIBLE_MINUTOS` (opcional, 30 por defecto) es *N* de DEC-128:
+minutos sin actividad tras los que el dueño de un cliente deja de estar
+disponible.
