@@ -257,7 +257,7 @@ func (h Handlers) reclamar(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Reclamar)
 	if err != nil {
 		escribirError(w, err)
 		return
@@ -477,7 +477,8 @@ func (h Handlers) ResolverAlias(ctx context.Context, tenantID, conversacionID st
 }
 
 // TraducirReclamo mapea los errores de internal/reclamos a la taxonomía:
-// versión no vigente → conflicto (409), sin reclamo activo → no_encontrado
+// versión no vigente o conversación dirigida a otro Ejecutivo (DEC-128) →
+// conflicto (409), sin reclamo activo → no_encontrado
 // (404), no es el responsable activo → prohibido (403, DEC-118). Exportada para
 // que la superficie en proceso (mensajeria.ConversacionesAPI) traduzca IGUAL.
 func TraducirReclamo(err error) error {

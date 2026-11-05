@@ -13,6 +13,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/AI27-Tech/pf-pkg-platform-go/config"
 	"github.com/AI27-Tech/pf-pkg-platform-go/observability"
@@ -28,6 +29,8 @@ const (
 	envDBChat        = "DB_MENSAJERIA_CHAT_URL"
 	envDBDespacho    = "DB_MENSAJERIA_DESPACHO_URL"
 	envCatalogosBase = "CATALOGOS_BASE_URL"
+	// envDisponibleMinutos es N de DEC-128 en minutos; vacío o inválido, 30.
+	envDisponibleMinutos = "MENSAJERIA_DISPONIBLE_MINUTOS"
 )
 
 func main() {
@@ -87,7 +90,7 @@ func run() error {
 
 	mod, err := mensajeria.New(
 		mensajeria.Pools{Chat: poolChat, Despacho: poolDespacho},
-		mensajeria.Deps{Catalogos: cat}, // sin bus: standalone no arranca Workers()
+		mensajeria.Deps{Catalogos: cat, VentanaDisponible: ventanaDisponible()}, // sin bus: standalone no arranca Workers()
 	)
 	if err != nil {
 		return err
@@ -100,4 +103,9 @@ func run() error {
 
 	srv.MarkReady()
 	return srv.Start(ctx)
+}
+
+// ventanaDisponible lee N (DEC-128) del entorno, en minutos.
+func ventanaDisponible() time.Duration {
+	return time.Duration(config.GetEnvInt(envDisponibleMinutos, 30)) * time.Minute
 }
