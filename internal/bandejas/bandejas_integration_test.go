@@ -58,7 +58,7 @@ func TestTrabajoYCatchUp(t *testing.T) {
 	svc := bandejas.NewServicio(pool)
 
 	// Bootstrap: ambas conversaciones activas, revisión de colección = 2.
-	items, rev, err := svc.Trabajo(ctx, tenant, bandeja)
+	items, rev, err := svc.Trabajo(ctx, tenant, bandeja, "")
 	if err != nil {
 		t.Fatalf("Trabajo: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestTrabajoYCatchUp(t *testing.T) {
 	}
 
 	// Catch-up desde la revisión 1: solo lo posterior (convB, que entró en 2).
-	cambios, rev2, fuera, err := svc.CambiosDesde(ctx, tenant, bandeja, 1)
+	cambios, rev2, fuera, err := svc.CambiosDesde(ctx, tenant, bandeja, "", 1)
 	if err != nil {
 		t.Fatalf("CambiosDesde: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestTrabajoYCatchUp(t *testing.T) {
 		  WHERE conversacion_id = '`+convA+`' AND bandeja_id = '`+bandeja+`'`)
 
 	// Catch-up desde 2: trae convA como baja (ruta inactiva en revisión 3).
-	cambios2, rev3, _, err := svc.CambiosDesde(ctx, tenant, bandeja, 2)
+	cambios2, rev3, _, err := svc.CambiosDesde(ctx, tenant, bandeja, "", 2)
 	if err != nil {
 		t.Fatalf("CambiosDesde tras baja: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestTrabajoYCatchUp(t *testing.T) {
 		t.Fatalf("catch-up desde 2 debe traer la baja de convA, trajo %d items", len(cambios2))
 	}
 	// Tras la baja, el bootstrap ya no incluye convA (solo rutas activas).
-	activas, _, err := svc.Trabajo(ctx, tenant, bandeja)
+	activas, _, err := svc.Trabajo(ctx, tenant, bandeja, "")
 	if err != nil {
 		t.Fatalf("Trabajo tras baja: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestTrabajoChatUneTenants(t *testing.T) {
 		return out
 	}
 
-	items, rev, err := svc.TrabajoChat(ctx)
+	items, rev, err := svc.TrabajoChat(ctx, "")
 	if err != nil {
 		t.Fatalf("TrabajoChat: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestTrabajoChatUneTenants(t *testing.T) {
 		t.Fatalf("TrabajoChat = %v rev %d, quiere %v rev 3", got, rev, want)
 	}
 
-	items, rev, fuera, err := svc.CambiosChatDesde(ctx, 1)
+	items, rev, fuera, err := svc.CambiosChatDesde(ctx, "", 1)
 	if err != nil {
 		t.Fatalf("CambiosChatDesde: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestTrabajoChatUneTenants(t *testing.T) {
 		`SELECT id::text FROM mensajeria.bandeja WHERE tenant_id = $1 AND tipo = 'chat'`, tA).Scan(&bandejaA); err != nil {
 		t.Fatalf("leer bandeja de A: %v", err)
 	}
-	items, rev, _, err = svc.CambiosDesde(ctx, tA, bandejaA, 1)
+	items, rev, _, err = svc.CambiosDesde(ctx, tA, bandejaA, "", 1)
 	if err != nil {
 		t.Fatalf("CambiosDesde(A): %v", err)
 	}

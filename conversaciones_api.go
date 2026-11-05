@@ -168,7 +168,8 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 
 // ListarTrabajoBandeja es la ruta sin {id} (listarTrabajoMiBandeja): la unión de
 // las bandejas de chat de todos los tenants (DEC-127, DEC-129), para quien la lee
-// por su rol (DEC-131). Cursor se ignora, igual que en HTTP.
+// por su rol (DEC-131), sin las dirigidas a otro Ejecutivo (DEC-128). Cursor se
+// ignora, igual que en HTTP.
 func (a *conversacionesAPI) ListarTrabajoBandeja(ctx context.Context, params msgclient.ListarTrabajoMiBandejaParams) (*msgclient.TrabajoBandeja, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
@@ -184,9 +185,9 @@ func (a *conversacionesAPI) ListarTrabajoBandeja(ctx context.Context, params msg
 		fuera bool
 	)
 	if params.DesdeRevision == nil {
-		items, rev, err = a.bandeja.Bandeja.TrabajoChat(ctx)
+		items, rev, err = a.bandeja.Bandeja.TrabajoChat(ctx, autorizacion.LectorDirigidas(claims))
 	} else {
-		items, rev, fuera, err = a.bandeja.Bandeja.CambiosChatDesde(ctx, *params.DesdeRevision)
+		items, rev, fuera, err = a.bandeja.Bandeja.CambiosChatDesde(ctx, autorizacion.LectorDirigidas(claims), *params.DesdeRevision)
 	}
 	if err != nil {
 		return nil, traducir(err)
@@ -206,7 +207,7 @@ func (a *conversacionesAPI) ReclamarConversacion(ctx context.Context, conversaci
 		return nil, err
 	}
 	id := conversacionID.String()
-	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Reclamar)
 	if err != nil {
 		return nil, err
 	}

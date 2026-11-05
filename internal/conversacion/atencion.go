@@ -9,6 +9,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -79,6 +80,9 @@ func (s *Servicio) MarcarAtendida(ctx context.Context, tenantID, conversacionID,
 	).Scan(&atendidaEn)
 	if err != nil {
 		return fmt.Errorf("conversacion: marcar atendida: %w", err)
+	}
+	if err := vinculo.Actividad(ctx, tx, actorReal, s.Ventana); err != nil {
+		return fmt.Errorf("conversacion: %w", err)
 	}
 
 	if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
@@ -169,6 +173,10 @@ func (s *Servicio) RegistrarRecibo(ctx context.Context, tenantID, conversacionID
 	).Scan(&avanzo)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("conversacion: avanzar cursor de %s: %w", tipo, err)
+	}
+	// Un recibo es actividad del Ejecutivo (DEC-128 #3); para un cliente es no-op.
+	if err := vinculo.Actividad(ctx, tx, sujetoID, s.Ventana); err != nil {
+		return fmt.Errorf("conversacion: %w", err)
 	}
 
 	// "Leído por AI27" (P23): solo si el sujeto es el responsable activo. Va aparte

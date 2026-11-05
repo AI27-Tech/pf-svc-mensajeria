@@ -24,6 +24,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	msgmensajeria "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -45,6 +46,9 @@ type Publicador interface {
 type Servicio struct {
 	pool Begin
 	pub  Publicador
+	// Ventana es N, la disponibilidad del dueño del cliente (DEC-128). Cero vale
+	// vinculo.VentanaPorDefecto.
+	Ventana vinculo.Ventana
 }
 
 // NewServicio construye el servicio de conversación sobre el pool de chat y el
@@ -214,8 +218,13 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 	// Un mensaje nuevo del cliente desmarca atendida, en la tx del envío
 	// (DEC-122 #1). El envío interno no la toca: responder no marca ni desmarca
 	// (DEC-117). Sin evento propio: el registro del contrato no tiene uno para
-	// desmarcar (brecha reportada, no se inventa).
-	if !esInterno(in.RolAlEnviar) {
+	// desmarcar (brecha reportada, no se inventa). El envío interno es actividad
+	// del Ejecutivo (DEC-128 #3).
+	if esInterno(in.RolAlEnviar) {
+		if err := vinculo.Actividad(ctx, tx, in.ActorReal, s.Ventana); err != nil {
+			return ResultadoEnvio{}, fmt.Errorf("conversacion: %w", err)
+		}
+	} else {
 		if _, err := tx.Exec(ctx,
 			`UPDATE mensajeria.estado_atendido SET atendida = false
 			  WHERE conversacion_id = $1 AND tenant_id = $2 AND atendida`,
@@ -718,8 +727,12 @@ func (s *Servicio) CrearPorEvento(ctx context.Context, in EntradaCreacion) (bool
 	if err != nil {
 		return false, fmt.Errorf("conversacion: insertar conversación: %w", err)
 	}
-	// La conversación nace en la bandeja única, en la misma tx (DEC-127 #1).
+	// La conversación nace en la bandeja única, en la misma tx (DEC-127 #1), y
+	// dirigida al dueño del cliente si está disponible (DEC-128 #2).
 	if err := bandejas.EnrutarABandejaUnica(ctx, tx, in.ClienteID, id); err != nil {
+		return false, fmt.Errorf("conversacion: %w", err)
+	}
+	if err := vinculo.Dirigir(ctx, tx, in.ClienteID, id, s.Ventana); err != nil {
 		return false, fmt.Errorf("conversacion: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
