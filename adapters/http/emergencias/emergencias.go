@@ -34,6 +34,8 @@ type API interface {
 	ObtenerEmergencia(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error)
 	ListarNotasEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, params msgclient.ListarNotasEmergenciaPorIdParams) (*msgclient.PaginaNotasEmergencia, error)
 	ReclamarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error)
+	LiberarReclamoEmergencia(ctx context.Context, viajeID, emergenciaID, reclamoID msgclient.Id, versionEsperada msgclient.VersionReclamo) error
+	TransferirEmergencia(ctx context.Context, viajeID, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
 	LiberarReclamoEmergenciaPorId(ctx context.Context, emergenciaID, reclamoID msgclient.Id, params msgclient.LiberarReclamoEmergenciaPorIdParams) error
 	TransferirEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
 	ResolverEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) (*msgclient.EmergenciaReaccion, error)
@@ -46,7 +48,9 @@ type Handlers struct {
 }
 
 // Montar registra las rutas de emergencia en el mux. Cada acción por viaje y su
-// gemela por id comparten handler: solo cambia de dónde sale {eid}.
+// gemela por id comparten handler: solo cambia de dónde sale {eid}. Liberar y
+// transferir llaman a la gemela por viaje cuando la ruta trae {id}, porque solo
+// esa acota por alcance (DEC-149 #6).
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/viajes/{id}/emergencias", h.listar)
 	mux.HandleFunc("POST /api/v1/viajes/{id}/emergencias", h.activar)
@@ -164,8 +168,16 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 		boundary.WriteError(w, platformerrors.NewValidacion("version_esperada inválida o faltante"))
 		return
 	}
-	err = h.API.LiberarReclamoEmergenciaPorId(r.Context(), eid, rid,
-		msgclient.LiberarReclamoEmergenciaPorIdParams{VersionEsperada: ver})
+	if r.PathValue("id") == "" {
+		err = h.API.LiberarReclamoEmergenciaPorId(r.Context(), eid, rid,
+			msgclient.LiberarReclamoEmergenciaPorIdParams{VersionEsperada: ver})
+	} else {
+		viaje, ok := idRuta(w, r, "id")
+		if !ok {
+			return
+		}
+		err = h.API.LiberarReclamoEmergencia(r.Context(), viaje, eid, rid, ver)
+	}
 	responder[struct{}](w, http.StatusNoContent, nil, err)
 }
 
@@ -178,7 +190,16 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 	if !decodificar(w, r, &entrada) {
 		return
 	}
-	reclamo, err := h.API.TransferirEmergenciaPorId(r.Context(), eid, entrada)
+	if r.PathValue("id") == "" {
+		reclamo, err := h.API.TransferirEmergenciaPorId(r.Context(), eid, entrada)
+		responder(w, http.StatusCreated, reclamo, err)
+		return
+	}
+	viaje, ok := idRuta(w, r, "id")
+	if !ok {
+		return
+	}
+	reclamo, err := h.API.TransferirEmergencia(r.Context(), viaje, eid, entrada)
 	responder(w, http.StatusCreated, reclamo, err)
 }
 

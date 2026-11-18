@@ -71,6 +71,11 @@ func montar(t *testing.T) escenario {
 	e := escenario{ctx: ctx, admin: admin, mux: mux, mod: mod}
 	dbtest.Exec(t, ctx, admin, `INSERT INTO mensajeria.conversacion (tenant_id, viaje_id, cliente_id)
 		 VALUES ('`+emTenant+`', '`+emViaje+`', '`+emTenant+`')`)
+	// El monitoreo de las pruebas tiene a la empresa entre sus clientes
+	// efectivos (DEC-149 #6); alcance_integration_test.go cubre el fuera.
+	for _, sub := range []string{monit, superv, coord} {
+		darAlcance(t, ctx, admin, sub, emTenant)
+	}
 
 	rec := e.pedir(clienteU, "cliente", http.MethodPost, "/api/v1/viajes/"+emViaje+"/emergencias",
 		msgclient.ActivarEmergenciaEntrada{ActivacionId: uuid.New()})
@@ -80,6 +85,34 @@ func montar(t *testing.T) escenario {
 	}
 	e.caso = caso.Id.String()
 	return e
+}
+
+// darAlcance siembra la proyección de alcance.cambiado (DEC-149 #22: llave
+// idp_subject, el sub del token) con el conjunto completo del sujeto.
+func darAlcance(t *testing.T, ctx context.Context, admin *pgx.Conn, sub string, clientes ...string) {
+	t.Helper()
+	if clientes == nil {
+		clientes = []string{}
+	}
+	if _, err := admin.Exec(ctx, `INSERT INTO mensajeria.alcance_sujeto (idp_subject, clientes_ids, cambiado_en)
+		VALUES ($1, $2::uuid[], now())
+		ON CONFLICT (idp_subject) DO UPDATE SET clientes_ids = EXCLUDED.clientes_ids`, sub, clientes); err != nil {
+		t.Fatalf("sembrar alcance de %s: %v", sub, err)
+	}
+}
+
+// sujeto da a los roles de monitoreo el sujeto con alcance sembrado en montar
+// y a los demás uno cualquiera.
+func sujeto(rol string) string {
+	switch rol {
+	case "monitorista":
+		return monit
+	case "supervisor":
+		return superv
+	case "coordinador":
+		return coord
+	}
+	return uuid.NewString()
 }
 
 // claims arma el token: el cliente con el tenant de su empresa, el interno con
@@ -380,7 +413,7 @@ func TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP(t *testing.T) {
 	// El monitoreo y el Administrador ven los dos casos completos, sin acotar por
 	// tenant (DEC-129, DEC-135). Reacción y Ejecutivo no listan por viaje: 403.
 	for _, rol := range []string{"supervisor", "administrador"} {
-		items = listar(e.pedir(uuid.New().String(), rol, http.MethodGet, rutaViaje, nil))
+		items = listar(e.pedir(sujeto(rol), rol, http.MethodGet, rutaViaje, nil))
 		if len(items) != 2 || items[0].Origen != "cliente" || items[1].Origen != "operacion" ||
 			items[1].ActorReal == nil || items[1].ActorReal.String() != monit {
 			t.Fatalf("%s: %+v; quiere los dos casos con origen cliente/operacion y el actor de Monitoreo", rol, items)
@@ -400,7 +433,7 @@ func TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP(t *testing.T) {
 		"monitorista": http.StatusCreated, "administrador": http.StatusCreated,
 		"reaccion": http.StatusForbidden, "ejecutivo": http.StatusForbidden,
 	} {
-		if rec := e.pedir(uuid.New().String(), rol, http.MethodPost, rutaNotas, nota); rec.Code != want {
+		if rec := e.pedir(sujeto(rol), rol, http.MethodPost, rutaNotas, nota); rec.Code != want {
 			t.Fatalf("nota como %s: status %d, quiere %d; cuerpo %s", rol, rec.Code, want, rec.Body.String())
 		}
 	}
