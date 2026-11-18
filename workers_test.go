@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	catclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/catalogos"
+	identidad "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/identidad"
 	"github.com/AI27-Tech/pf-pkg-platform-go/bus"
 	"github.com/AI27-Tech/pf-pkg-platform-go/worker"
 )
@@ -177,4 +178,49 @@ func TestWorkersSinSubscriberNoArrancaConsumidorCatalogos(t *testing.T) {
 			t.Error("sin Subscriber no debe haber consumidor de catálogos")
 		}
 	}
+}
+
+// alcancesFake satisface mensajeria.Alcances; el test no corre la
+// reconstrucción, solo comprueba el cableado y la readiness inicial.
+type alcancesFake struct{}
+
+func (alcancesFake) ListarAlcances(context.Context, identidad.ListarAlcancesParams) (*identidad.PaginaAlcances, error) {
+	return &identidad.PaginaAlcances{}, nil
+}
+
+// TestWorkersAlcance fija el cableado de alcance.cambiado (DEC-149 #20): con
+// Subscriber se abre la suscripción durable sobre la superficie amplia; sin
+// Alcances va desnuda, y con Alcances la envuelve la reconstrucción, que es
+// not-ready hasta converger (patrón ADR 26 §4).
+func TestWorkersAlcance(t *testing.T) {
+	sub := &suscriptorFake{}
+	m, err := New(Pools{}, Deps{Subscriber: sub})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := sub.por("mensajeria-alcance")
+	if s == nil || s.superficie != bus.SensibilidadAmplia || len(s.filtro) != 1 || s.filtro[0] != "alcance.cambiado" {
+		t.Fatalf("suscripción de alcance: %+v; abiertas: %v", s, sub.subs)
+	}
+	nombres := map[string]bool{}
+	for _, w := range m.Workers() {
+		nombres[w.Name()] = true
+	}
+	if !nombres["bus-durable:mensajeria-alcance"] {
+		t.Errorf("sin Alcances: falta el consumidor desnudo; workers: %v", nombres)
+	}
+
+	m, err = New(Pools{}, Deps{Subscriber: &suscriptorFake{}, Alcances: alcancesFake{}})
+	if err != nil {
+		t.Fatalf("New con Alcances: %v", err)
+	}
+	for _, w := range m.Workers() {
+		if w.Name() == "mensajeria-alcance" {
+			if w.Ready(context.Background()) == nil {
+				t.Error("reconstrucción sin correr: Ready nil; quiere not-ready")
+			}
+			return
+		}
+	}
+	t.Error("con Alcances: falta el worker mensajeria-alcance")
 }
