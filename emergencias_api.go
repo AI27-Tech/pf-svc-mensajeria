@@ -9,6 +9,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
 	"github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/boundary"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/alcance"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
@@ -34,6 +35,12 @@ import (
 // (DEC-129); Reacción por rol, sin filas de membresía (DEC-130); Supervisor y
 // Coordinador ven, liberan y transfieren pero no reclaman ni resuelven (DEC-131);
 // interno sin permiso → 403, Cliente sobre otra empresa → 404 (DEC-132).
+//
+// Alcance de monitoreo por cliente (DEC-149 #6 y #18; mensajeria.yaml de
+// tracer.41/42): en la familia /api/v1/viajes/{id}/emergencias... y en
+// cerrarEmergenciaPorId, monitorista, supervisor y coordinador solo operan
+// sobre casos de viajes de sus clientes efectivos; fuera de alcance, 404. Se
+// evalúa DESPUÉS del rol (403 primero) con exigirAlcance.
 //
 // Autorización e identidad: lee los claims del ctx (auth.ClaimsFromContext), no
 // de un bearer. El bff antepone su middleware, así que los claims ya viajan en el
@@ -62,7 +69,7 @@ type EmergenciasAPI interface {
 // uso que el Module ya tiene (m.emergencias y m.autz). No toca New ni abre
 // recursos: es una fachada sobre lo ya construido.
 func (m *Module) Emergencias() EmergenciasAPI {
-	return &emergenciasAPI{emergencias: m.emergencias, autz: m.autz}
+	return &emergenciasAPI{emergencias: m.emergencias, autz: m.autz, alcance: m.alcance}
 }
 
 // autorizador es la parte de autorizacion.Servicio que el carril de emergencia
@@ -70,6 +77,14 @@ func (m *Module) Emergencias() EmergenciasAPI {
 type autorizador interface {
 	TenantDeEmergencia(ctx context.Context, emergenciaID string, c *auth.Claims) (string, error)
 	Emergencia(ctx context.Context, emergenciaID string, c *auth.Claims, p autorizacion.Permiso) (string, error)
+	ClienteDelViaje(ctx context.Context, viajeID string) (string, error)
+	ClienteDeEmergencia(ctx context.Context, emergenciaID string) (string, error)
+}
+
+// clientesEfectivos es la proyección de alcance.cambiado que lee la guarda
+// (internal/alcance), indexada por el `sub` del token (DEC-149 #22).
+type clientesEfectivos interface {
+	Clientes(ctx context.Context, idpSubject string) ([]uuid.UUID, error)
 }
 
 // casoDeEmergencia es la parte de emergencias.Servicio que la fachada usa.
@@ -90,13 +105,15 @@ type casoDeEmergencia interface {
 type emergenciasAPI struct {
 	emergencias casoDeEmergencia
 	autz        autorizador
+	alcance     clientesEfectivos
 }
 
 // Las implementaciones reales satisfacen las interfaces de consumidor de la
 // fachada (comprobación en compilación).
 var (
-	_ casoDeEmergencia = (*emergencias.Servicio)(nil)
-	_ autorizador      = (*autorizacion.Servicio)(nil)
+	_ casoDeEmergencia  = (*emergencias.Servicio)(nil)
+	_ autorizador       = (*autorizacion.Servicio)(nil)
+	_ clientesEfectivos = (*alcance.Proyeccion)(nil)
 )
 
 // claimsDe lee los claims del ctx y rechaza su ausencia o un sujeto que no es
@@ -110,10 +127,49 @@ func claimsDe(ctx context.Context) (*auth.Claims, error) {
 	return c, nil
 }
 
+// exigirAlcance es la guarda única del alcance de monitoreo por cliente
+// (DEC-149 #6, #18). Corre cuando el rol ya tiene la acción. Solo acota a
+// monitorista, supervisor y coordinador (alcance.Acota); el Cliente, el
+// administrador y Reacción pasan sin cambio. cliente lee el cliente del viaje
+// solo si hace falta. Sin cliente conocido, sin proyección o fuera de los
+// clientes efectivos del sujeto (buscados por claims.Subject): 404 igual que
+// si no existiera. Un error de base se propaga; nunca se lee como "todos".
+//
+// No exige que el viaje haya pasado por APROBADO, aunque el contrato lo diga:
+// mensajeria no conoce el estado del viaje (DT-16). Decisión técnica a revisar.
+func (a *emergenciasAPI) exigirAlcance(ctx context.Context, c *auth.Claims, cliente func() (string, error)) error {
+	if c.Audiencia == auth.AudienciaCliente || !alcance.Acota(c.Rol) {
+		return nil
+	}
+	clienteID, err := cliente()
+	if err != nil {
+		return err
+	}
+	clientes, err := a.alcance.Clientes(ctx, c.Subject)
+	if err != nil {
+		return traducir(err)
+	}
+	if !alcance.Visible(clientes, clienteID) {
+		return platformerrors.NewNoEncontrado("mensajeria: viaje fuera de alcance")
+	}
+	return nil
+}
+
+// delViaje y delCaso dan a exigirAlcance el cliente de un viaje (por su
+// conversación) o el de un caso (el que guardó al activarse, DEC-133).
+func (a *emergenciasAPI) delViaje(ctx context.Context, viajeID msgclient.Id) func() (string, error) {
+	return func() (string, error) { return a.autz.ClienteDelViaje(ctx, viajeID.String()) }
+}
+
+func (a *emergenciasAPI) delCaso(ctx context.Context, emergenciaID string) func() (string, error) {
+	return func() (string, error) { return a.autz.ClienteDeEmergencia(ctx, emergenciaID) }
+}
+
 // ListarEmergencias devuelve los casos del viaje. Al interno, todos y completos,
 // de cualquier tenant (DEC-129), si su rol ve los casos del viaje (DEC-135); si
-// no, 403. Al Cliente, solo los de su empresa y no cerrados, en la vista mínima
-// (ADR 21 §6).
+// no, 403. El monitoreo, solo si el viaje es de sus clientes (exigirAlcance);
+// si no, 404. Al Cliente, solo los de su empresa y no cerrados, en la vista
+// mínima (ADR 21 §6).
 func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclient.Id) (*msgclient.PaginaEmergencias, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
@@ -122,6 +178,9 @@ func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclien
 	esCliente := claims.Audiencia == auth.AudienciaCliente
 	if !esCliente && !autorizacion.PuedeEnEmergencias(claims.Rol, autorizacion.VerCasosViaje) {
 		return nil, platformerrors.NewProhibido("el rol no ve los casos de emergencia del viaje")
+	}
+	if err := a.exigirAlcance(ctx, claims, a.delViaje(ctx, viajeID)); err != nil {
+		return nil, err
 	}
 	casos, err := a.emergencias.ListarPorViaje(ctx, viajeID.String())
 	if err != nil {
@@ -139,8 +198,9 @@ func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclien
 
 // ActivarEmergencia crea el caso bajo la empresa del viaje, lo active el cliente
 // o Monitoreo (DEC-133). Un interno necesita rol de monitoreo (DEC-045 #9); si
-// no, 403. Viaje que mensajeria no conoce, o de otra empresa que la del cliente
-// que activa: 404 (DEC-132 #2). Devuelve el caso tal como quedó, proyectado por
+// no, 403. Monitoreo sobre un viaje fuera de sus clientes: 404 (DEC-149 #6).
+// Viaje que mensajeria no conoce, o de otra empresa que la del cliente que
+// activa: 404 (DEC-132 #2). Devuelve el caso tal como quedó, proyectado por
 // audiencia, como pide el contrato.
 func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (*msgclient.CasoEmergencia, bool, error) {
 	claims, err := claimsDe(ctx)
@@ -150,6 +210,9 @@ func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclien
 	esCliente := claims.Audiencia == auth.AudienciaCliente
 	if !esCliente && !autorizacion.PuedeEnEmergencias(claims.Rol, autorizacion.ActivarCaso) {
 		return nil, false, platformerrors.NewProhibido("el rol no activa emergencias")
+	}
+	if err := a.exigirAlcance(ctx, claims, a.delViaje(ctx, viajeID)); err != nil {
+		return nil, false, err
 	}
 	origen := msgclient.OrigenActivacionOperacion
 	clienteActor := ""
@@ -180,7 +243,8 @@ func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclien
 
 // AgregarNotaEmergencia: el Cliente sobre un caso de su empresa, o un interno
 // con rol de monitoreo o Administrador (DEC-135), sin acotar por tenant al
-// interno (DEC-129). Reacción y Ejecutivo reciben 403 (DEC-121 #4).
+// interno (DEC-129). Reacción y Ejecutivo reciben 403 (DEC-121 #4). El
+// monitoreo, solo sobre casos de sus clientes; si no, 404 (DEC-149 #6).
 func (a *emergenciasAPI) AgregarNotaEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.NotaEmergenciaEntrada) error {
 	claims, err := claimsDe(ctx)
 	if err != nil {
@@ -200,6 +264,9 @@ func (a *emergenciasAPI) AgregarNotaEmergencia(ctx context.Context, _ msgclient.
 	if err != nil {
 		return err
 	}
+	if err := a.exigirAlcance(ctx, claims, a.delCaso(ctx, eid)); err != nil {
+		return err
+	}
 	_, err = a.emergencias.AgregarNota(ctx, emergencias.EntradaNota{
 		TenantID:       tenant,
 		EmergenciaID:   eid,
@@ -214,13 +281,16 @@ func (a *emergenciasAPI) ReclamarEmergencia(ctx context.Context, _ msgclient.Id,
 	return a.ReclamarEmergenciaPorId(ctx, emergenciaID, body)
 }
 
+// LiberarReclamoEmergencia y TransferirEmergencia son las gemelas por viaje:
+// a diferencia de las por id (la bandeja de Reacción no cambia), acotan a
+// Supervisor y Coordinador por alcance, porque mensajeria.yaml acota toda la
+// familia /api/v1/viajes/{id}/emergencias... (DEC-149 #6).
 func (a *emergenciasAPI) LiberarReclamoEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID, reclamoID msgclient.Id, versionEsperada msgclient.VersionReclamo) error {
-	return a.LiberarReclamoEmergenciaPorId(ctx, emergenciaID, reclamoID,
-		msgclient.LiberarReclamoEmergenciaPorIdParams{VersionEsperada: versionEsperada})
+	return a.liberar(ctx, emergenciaID, reclamoID, versionEsperada, true)
 }
 
 func (a *emergenciasAPI) TransferirEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error) {
-	return a.TransferirEmergenciaPorId(ctx, emergenciaID, body)
+	return a.transferir(ctx, emergenciaID, body, true)
 }
 
 func (a *emergenciasAPI) ResolverEmergencia(ctx context.Context, _ msgclient.Id, emergenciaID msgclient.Id, body msgclient.ResolucionEmergenciaEntrada) error {
@@ -327,6 +397,11 @@ func (a *emergenciasAPI) ReclamarEmergenciaPorId(ctx context.Context, emergencia
 // Supervisor/Coordinador (DEC-126). Un miembro de Reacción que no es el
 // responsable recibe 403 desde el dominio.
 func (a *emergenciasAPI) LiberarReclamoEmergenciaPorId(ctx context.Context, emergenciaID, reclamoID msgclient.Id, params msgclient.LiberarReclamoEmergenciaPorIdParams) error {
+	return a.liberar(ctx, emergenciaID, reclamoID, params.VersionEsperada, false)
+}
+
+// liberar es el caso de uso de las dos gemelas; porViaje aplica el alcance.
+func (a *emergenciasAPI) liberar(ctx context.Context, emergenciaID, reclamoID msgclient.Id, version msgclient.VersionReclamo, porViaje bool) error {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return err
@@ -336,14 +411,24 @@ func (a *emergenciasAPI) LiberarReclamoEmergenciaPorId(ctx context.Context, emer
 	if err != nil {
 		return err
 	}
+	if porViaje {
+		if err := a.exigirAlcance(ctx, claims, a.delCaso(ctx, eid)); err != nil {
+			return err
+		}
+	}
 	err = a.emergencias.Liberar(ctx, tenant, eid, reclamoID.String(), claims.Subject,
-		msgtipos.VersionReclamo(params.VersionEsperada), conMando(claims))
+		msgtipos.VersionReclamo(version), conMando(claims))
 	return traducirEmergencia(err)
 }
 
 // TransferirEmergenciaPorId: mismo permiso que liberar (DEC-126). Devuelve el
 // reclamo nuevo del destino.
 func (a *emergenciasAPI) TransferirEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error) {
+	return a.transferir(ctx, emergenciaID, body, false)
+}
+
+// transferir es el caso de uso de las dos gemelas; porViaje aplica el alcance.
+func (a *emergenciasAPI) transferir(ctx context.Context, emergenciaID msgclient.Id, body msgclient.TransferenciaEntrada, porViaje bool) (*msgclient.Reclamo, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
 		return nil, err
@@ -352,6 +437,11 @@ func (a *emergenciasAPI) TransferirEmergenciaPorId(ctx context.Context, emergenc
 	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.MoverCaso)
 	if err != nil {
 		return nil, err
+	}
+	if porViaje {
+		if err := a.exigirAlcance(ctx, claims, a.delCaso(ctx, eid)); err != nil {
+			return nil, err
+		}
 	}
 	// shortcut: no se verifica que el destino tenga rol `reaccion` (contrato,
 	// DEC-130): mensajeria no conoce los roles de otros usuarios; se verifica
@@ -405,8 +495,9 @@ func (a *emergenciasAPI) ResolverEmergenciaPorId(ctx context.Context, emergencia
 }
 
 // CerrarEmergenciaPorId: monitoreo o Administrador (ADR 21 §5, E8-T18); nunca
-// Reacción ni Ejecutivo (403). El alcance por viaje del monitoreo lo compone el
-// bff (mensajeria no conoce la asignación de unidades).
+// Reacción ni Ejecutivo (403). El monitoreo, solo sobre casos de viajes de sus
+// clientes efectivos (DEC-149 #6); fuera de alcance, 404. Cubre también
+// cerrarEmergencia, la gemela por viaje.
 func (a *emergenciasAPI) CerrarEmergenciaPorId(ctx context.Context, emergenciaID msgclient.Id) (*msgclient.CasoEmergencia, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
@@ -415,6 +506,9 @@ func (a *emergenciasAPI) CerrarEmergenciaPorId(ctx context.Context, emergenciaID
 	eid := emergenciaID.String()
 	tenant, err := a.autz.Emergencia(ctx, eid, claims, autorizacion.CerrarCaso)
 	if err != nil {
+		return nil, err
+	}
+	if err := a.exigirAlcance(ctx, claims, a.delCaso(ctx, eid)); err != nil {
 		return nil, err
 	}
 	if err := a.emergencias.Cerrar(ctx, tenant, eid, claims.Subject); err != nil {

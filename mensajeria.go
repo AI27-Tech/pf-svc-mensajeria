@@ -13,9 +13,9 @@
 //
 // Aristas síncronas salientes, ambas HTTP (00, tabla de servicios): a catalogos
 // (lectura por lote de clientes, mensajeria.md (f)) y la restringida a identidad
-// para revocación (DEC-051). NO llama a operacion, identidad ni realtime en la
-// ruta caliente: el ciclo de vida llega por evento y los sobres salen por
-// outbox. Arista entrante: solo bff, siempre HTTP (su adaptador vive en pf-svc-bff).
+// para revocación (DEC-051) y el snapshot de alcances (DEC-149 #20). NO llama a
+// operacion, identidad ni realtime en la ruta caliente: el ciclo de vida llega
+// por evento y los sobres salen por outbox. Arista entrante: solo bff, siempre HTTP (su adaptador vive en pf-svc-bff).
 //
 // Dos pools del MISMO rol svc_mensajeria (mensajeria.md (d), (k); MSG-REC §6.2):
 // uno para la ruta de chat y otro, con presupuesto propio, para el despacho
@@ -41,6 +41,7 @@ import (
 	bandejashttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/bandejas"
 	convhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/conversacion"
 	emerhttp "github.com/AI27-Tech/pf-svc-mensajeria/adapters/http/emergencias"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/alcance"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
@@ -76,6 +77,12 @@ type Deps struct {
 	// Revocacion es la arista restringida a identidad (DEC-051). Opcional en el
 	// esqueleto.
 	Revocacion RevocacionPort
+	// Alcances es listarAlcances de identidad (DEC-149 #20): reconstruye al
+	// arrancar la proyección de alcance.cambiado. Solo se usa con Subscriber.
+	// Sin ella el consumidor arranca sin snapshot; sin Subscriber no hay
+	// proyección viva y monitorista, supervisor y coordinador no operan sobre
+	// ninguna emergencia del viaje (falla cerrado, 404).
+	Alcances Alcances
 	// Publisher es el transporte del bus para el relay de outbox. Nil en arranque
 	// standalone sin bus: en ese caso Workers() no arranca el relay.
 	Publisher bus.Publisher
@@ -109,6 +116,14 @@ type Module struct {
 	// sin Subscriber.
 	consumidorHabilitada worker.Worker
 	consumidorCerrado    worker.Worker
+	// alcance es la proyección de alcance.cambiado (sujeto → clientes efectivos,
+	// DEC-149) en mensajeria.alcance_sujeto. La lee la guarda de alcance de las
+	// emergencias del viaje; la escribe consumidorAlcance. Siempre existe: sin
+	// consumidor queda vacía.
+	alcance *alcance.Proyeccion
+	// consumidorAlcance es el worker durable de alcance.cambiado, envuelto por la
+	// reconstrucción con listarAlcances si hay Deps.Alcances. nil sin Subscriber.
+	consumidorAlcance worker.Worker
 }
 
 // New recibe los dos pools de svc_mensajeria y los puertos ya resueltos. No lee
@@ -126,6 +141,7 @@ func New(p Pools, d Deps) (*Module, error) {
 	m.bandejas = bandejas.NewServicio(p.Chat)
 	m.emergencias = emergencias.NewServicio(p.Chat, pub)
 	m.auditoria = auditoria.NewServicio(p.Chat)
+	m.alcance = alcance.NuevaProyeccion(p.Chat)
 	ventana := vinculo.Ventana(d.VentanaDisponible)
 	m.conversacion.Ventana, m.reclamos.Ventana, m.bandejas.Ventana = ventana, ventana, ventana
 
@@ -190,6 +206,25 @@ func New(p Pools, d Deps) (*Module, error) {
 			return nil, err
 		}
 		m.consumidorCerrado = wCer
+
+		// Consumidor durable de alcance.cambiado (DEC-149 #20): mantiene la
+		// proyección en Postgres, compartida por las réplicas. Con Alcances, la
+		// reconstrucción por snapshot + cursor lo envuelve y deja la réplica
+		// not-ready hasta converger (patrón ADR 26 §4).
+		consAlc := alcance.NuevoConsumidor(m.alcance)
+		wAlc, err := d.Subscriber.Subscribe(
+			"mensajeria-alcance",
+			bus.SensibilidadAmplia,
+			[]string{alcance.TipoAlcanceCambiado},
+			consAlc.Procesar,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if d.Alcances != nil {
+			wAlc = alcance.NuevoReconstructor(wAlc, d.Alcances, m.alcance)
+		}
+		m.consumidorAlcance = wAlc
 	}
 
 	return m, nil
@@ -224,7 +259,10 @@ func (m *Module) Routes(mux *http.ServeMux) {
 //   - el publicador de outbox (relay), presente si hay Deps.Publisher;
 //   - el consumidor durable de catalogo.actualizado (invalida caché de clientes);
 //   - los dos consumidores durables del ciclo de vida de la conversación por
-//     evento del viaje (E3-T1): viaje.mensajeria_habilitada y viaje.cerrado.
+//     evento del viaje (E3-T1): viaje.mensajeria_habilitada y viaje.cerrado;
+//   - el consumidor durable de alcance.cambiado (DEC-149 #20), envuelto por la
+//     reconstrucción con listarAlcances si hay Deps.Alcances: su Ready es
+//     not-ready hasta converger (worker alcance.NombreWorker).
 //
 // Pendiente de cableado: sesion.revocada y los eventos de identidad para la
 // proyección de membresía, y viaje.acceso_revocado (su productor no existe en
@@ -245,6 +283,9 @@ func (m *Module) Workers() []worker.Worker {
 	}
 	if m.consumidorCerrado != nil {
 		ws = append(ws, m.consumidorCerrado)
+	}
+	if m.consumidorAlcance != nil {
+		ws = append(ws, m.consumidorAlcance)
 	}
 	return ws
 }

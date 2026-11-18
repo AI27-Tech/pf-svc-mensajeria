@@ -25,6 +25,17 @@ inglés salvo sustantivos de dominio (`naming-conventions.md`, DEC-024).
   HTTP (00, 05, 09), no hay consumidor en proceso. Interpretación registrada para
   que `00` la precise.
 
+## Alcance del monitoreo por cliente (DEC-149)
+
+`monitorista`, `supervisor` y `coordinador` solo operan sobre las emergencias
+de viajes de sus clientes efectivos (`mensajeria.yaml`, tracer.42); fuera de
+alcance, `404`. Lo aplica la guarda `exigirAlcance` de `emergencias_api.go`
+sobre la proyección `mensajeria.alcance_sujeto` (`internal/alcance`), indexada
+por `idp_subject` (el `sub` del token). La alimenta el consumidor durable
+`mensajeria-alcance` de `alcance.cambiado` y, con `Deps.Alcances`, la
+reconstrucción por `identidad.listarAlcances` al arrancar (not-ready hasta
+converger). Sin proyección, el monitoreo no ve ningún caso (falla cerrado).
+
 ## Las cuatro contabilidades (la trampa del contrato)
 
 `internal/tipos` declara cuatro **tipos nombrados distintos** sobre `int64`,
