@@ -168,8 +168,8 @@ func (a *emergenciasAPI) delCaso(ctx context.Context, emergenciaID string) func(
 // ListarEmergencias devuelve los casos del viaje. Al interno, todos y completos,
 // de cualquier tenant (DEC-129), si su rol ve los casos del viaje (DEC-135); si
 // no, 403. El monitoreo, solo si el viaje es de sus clientes (exigirAlcance);
-// si no, 404. Al Cliente, solo los de su empresa y no cerrados, en la vista mínima
-// (ADR 21 §6).
+// si no, 404. Al Cliente, solo los de su empresa y no cerrados, en la vista
+// mínima (ADR 21 §6).
 func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclient.Id) (*msgclient.PaginaEmergencias, error) {
 	claims, err := claimsDe(ctx)
 	if err != nil {
@@ -198,8 +198,9 @@ func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclien
 
 // ActivarEmergencia crea el caso bajo la empresa del viaje, lo active el cliente
 // o Monitoreo (DEC-133). Un interno necesita rol de monitoreo (DEC-045 #9); si
-// no, 403. Monitoreo sobre un viaje fuera de sus clientes: 404 (DEC-149 #6). Viaje que mensajeria no conoce, o de otra empresa que la del cliente
-// que activa: 404 (DEC-132 #2). Devuelve el caso tal como quedó, proyectado por
+// no, 403. Monitoreo sobre un viaje fuera de sus clientes: 404 (DEC-149 #6).
+// Viaje que mensajeria no conoce, o de otra empresa que la del cliente que
+// activa: 404 (DEC-132 #2). Devuelve el caso tal como quedó, proyectado por
 // audiencia, como pide el contrato.
 func (a *emergenciasAPI) ActivarEmergencia(ctx context.Context, viajeID msgclient.Id, body msgclient.ActivarEmergenciaEntrada) (*msgclient.CasoEmergencia, bool, error) {
 	claims, err := claimsDe(ctx)
