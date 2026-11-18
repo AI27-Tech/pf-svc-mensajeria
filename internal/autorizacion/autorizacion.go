@@ -271,3 +271,43 @@ func (s *Servicio) Emergencia(ctx context.Context, emergenciaID string, c *auth.
 	}
 	return tenant, nil
 }
+
+// ClienteDelViaje devuelve el cliente del viaje para el alcance de monitoreo
+// (DEC-149 #6). La única proyección del viaje en mensajeria es su
+// conversación, nacida de viaje.mensajeria_habilitada (DEC-133); si hay varias
+// se toma la más reciente, como en la activación. "" si mensajeria no conoce el
+// viaje: la guarda lo trata como fuera de alcance.
+func (s *Servicio) ClienteDelViaje(ctx context.Context, viajeID string) (string, error) {
+	var cliente string
+	err := s.db.QueryRow(ctx,
+		`SELECT cliente_id::text FROM mensajeria.conversacion
+		  WHERE viaje_id = $1 AND cliente_id IS NOT NULL
+		  ORDER BY creado_en DESC, id DESC LIMIT 1`,
+		viajeID,
+	).Scan(&cliente)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", platformerrors.NewRotoErr(err, "autorizacion: leer el cliente del viaje")
+	}
+	return cliente, nil
+}
+
+// ClienteDeEmergencia devuelve el cliente del viaje del caso, que el caso
+// guarda al activarse (DEC-133). "" si el caso no lo tiene: la guarda lo trata
+// como fuera de alcance. El caso ya lo validó Emergencia o TenantDeEmergencia.
+func (s *Servicio) ClienteDeEmergencia(ctx context.Context, emergenciaID string) (string, error) {
+	var cliente string
+	err := s.db.QueryRow(ctx,
+		`SELECT COALESCE(cliente_id::text, '') FROM mensajeria.emergencia WHERE id = $1`,
+		emergenciaID,
+	).Scan(&cliente)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", platformerrors.NewNoEncontrado("emergencia no encontrada")
+	}
+	if err != nil {
+		return "", platformerrors.NewRotoErr(err, "autorizacion: leer el cliente del caso")
+	}
+	return cliente, nil
+}

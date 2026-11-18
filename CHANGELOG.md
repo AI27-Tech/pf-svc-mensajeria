@@ -1,5 +1,41 @@
 # CHANGELOG
 
+## 2026-11-18 13:05 — Alcance del monitoreo por cliente en las emergencias del viaje (DEC-149 #6, #18, #20 y #22; tracer.42)
+
+**Para quién:** el panel interno (emergencias del viaje del monitoreo), el `bff` y `pf-svc-core` en proceso. Cambia lo que observan `monitorista`, `supervisor` y `coordinador`: ya no operan sobre casos de viajes de clientes que no están en sus clientes efectivos; reciben `404`. `pf-svc-core` debe cablear el snapshot de alcances (ver abajo); sin él la proyección arranca vacía y el monitoreo no ve ningún caso.
+
+**Resumen:** `mensajeria` proyecta `alcance.cambiado` de `identidad` en `mensajeria.alcance_sujeto`, indexada por `idp_subject` (el `sub` del token), y la reconstruye al arrancar con `identidad.listarAlcances` (snapshot y continuación por cursor, patrón ADR 26). La fachada de emergencias usa esa proyección para acotar al monitoreo por el cliente del viaje, como pide `mensajeria.yaml` de `tracer.42`.
+
+**Comportamiento:**
+- `listarEmergencias`, `activarEmergencia` y `agregarNotaEmergencia`: `monitorista`, `supervisor` y `coordinador` solo sobre viajes cuyo cliente está en sus clientes efectivos; fuera, `404` (la activación no crea caso). La nota se evalúa con el cliente del caso, no con el `{id}` de la ruta.
+- `cerrarEmergencia` y `cerrarEmergenciaPorId`: igual, con el cliente del caso.
+- `liberarReclamoEmergencia` y `transferirEmergencia` (ruta del viaje): Supervisor y Coordinador acotados por alcance. Sus gemelas por id (bandeja de Reacción) no cambian.
+- El rol se evalúa antes: un rol sin la acción sigue con `403`. `administrador`, Reacción, la bandeja, el detalle y las notas por id, y las conversaciones no cambian.
+- Falla cerrado: sujeto sin fila en la proyección, conjunto vacío, viaje sin conversación o caso sin `cliente_id`: `404`. Un error de base es `5xx`, nunca "todos".
+- No se exige que el viaje haya pasado por `APROBADO`: `mensajeria` no conoce el estado del viaje (DT-16).
+
+**Cambios:**
+- Pin `api-client-go` de `v0.1.0-tracer.34` a `v0.1.0-tracer.42`; sin constantes renombradas.
+- `internal/alcance` (nuevo): regla (`Acota`, `Visible`), consumidor de `alcance.cambiado` (descarta payloads sin `idp_subject` o `cambiado_en`), proyección con orden por `cambiado_en` y reconstructor not-ready hasta converger (worker `mensajeria-alcance`).
+- `ports.go`: puerto `Alcances` (`listarAlcances`). `adapters/http/identidad`: su adaptador HTTP.
+- `mensajeria.go`: `Deps.Alcances`; con `Subscriber`, suscripción durable `mensajeria-alcance` en `Workers()`, envuelta por la reconstrucción si hay `Alcances`.
+- `internal/autorizacion`: `ClienteDelViaje` y `ClienteDeEmergencia`.
+- `emergencias_api.go`: guarda `exigirAlcance`. `adapters/http/emergencias`: liberar y transferir por la ruta del viaje llaman a la gemela por viaje.
+
+**Migración:** `0010_alcance.sql`: tabla `alcance_sujeto` (`idp_subject` TEXT, `clientes_ids` UUID[], `cambiado_en`), grants SELECT/INSERT/UPDATE a `svc_mensajeria`. Aditiva e idempotente.
+
+**Para `pf-svc-core`:** pasar `mensajeria.Deps{Alcances: <sub-fachada Alcances() de identidad>}`; el worker `mensajeria-alcance` ya sale en `Workers()` y su `Ready` entra en la readiness del proceso; `identidad` debe publicar `alcance.cambiado` hacia el durable `mensajeria-alcance`. La regla `restricted_edges` de `pf-pkg-platform-go` debe listar `listarAlcances`.
+
+**Archivos modificados:**
+- `go.mod`, `go.sum`
+- `migrations/mensajeria/0010_alcance.sql`
+- `internal/alcance/regla.go`, `internal/alcance/consumidor.go`, `internal/alcance/proyeccion.go`, `internal/alcance/reconstructor.go`
+- `internal/alcance/regla_test.go`, `internal/alcance/proyeccion_integration_test.go`
+- `ports.go`, `mensajeria.go`, `emergencias_api.go`, `internal/autorizacion/autorizacion.go`
+- `adapters/http/identidad/alcances.go`, `adapters/http/emergencias/emergencias.go`
+- `emergencias_api_test.go`, `workers_test.go`, `adapters/http/emergencias/emergencias_integration_test.go`, `adapters/http/emergencias/alcance_integration_test.go`
+- `README.md`, `CHANGELOG.md`
+
 ## 2026-11-04 16:50 — Vínculo pegajoso Ejecutivo↔cliente (DEC-128, DEC-103 #2 y #3)
 
 **Para quién:** el panel interno (bandeja de conversaciones y reclamo), el `bff` y `pf-svc-core` en proceso. Cambia lo que observan: un Ejecutivo ya no ve ni reclama la conversación nueva de un cliente cuyo dueño, otro Ejecutivo, está disponible; y el Cliente ya no puede reclamar.
