@@ -46,7 +46,7 @@
 **Comportamiento:**
 - `tipo` se expone en `Conversacion` (`viaje` o `solicitud`). Las existentes valen `viaje`.
 - `solicitud.creada` crea o reutiliza, de forma idempotente, la conversación `tipo=solicitud` (`tenant_id = cliente_id`), enrutada a la bandeja única del tenant y sin dirigirla a un dueño: no hay vínculo por cliente para `cotizacion`.
-- `solicitud.estado_cambiado`: en `APROBADO`, `RECHAZADO_POR_AI27`, `RECHAZADO_POR_CLIENTE`, `CANCELADO_POR_CLIENTE` y `VENCIDA` la ventana de escritura corre 3 días desde `cambiado_en`; en cualquier otro estado (por ejemplo `VENCIDA → PAGADO`) la conversación se reabre. Un evento más viejo que el último aplicado no lo pisa. Si llega antes que `solicitud.creada`, crea la conversación.
+- `solicitud.estado_cambiado`: en `APROBADO`, `RECHAZADO_POR_AI27`, `RECHAZADO_POR_CLIENTE`, `CANCELADO_POR_CLIENTE` y `VENCIDA` la ventana de escritura corre 3 días desde `cambiado_en`; en `SOLICITADO`, `COTIZADO` y `PAGADO` (por ejemplo `VENCIDA → PAGADO`) la conversación se reabre; un estado que el contrato no declara no toca la ventana y se registra en el log (falla cerrado). Un evento más viejo que el último aplicado no lo pisa. Si llega antes que `solicitud.creada`, crea la conversación.
 - Los dos eventos van en UNA suscripción durable (`mensajeria-conversacion-solicitud`) para conservar el orden por `solicitud_id`.
 - `obtenerConversacionDeSolicitud` (`GET /api/v1/solicitudes/{id}/conversacion`): el Cliente dueño, `cotizacion` y `administrador`; el cliente de otra empresa recibe `404`; `ejecutivo`, `supervisor`, `coordinador`, `jefe_operativo`, `monitorista` y `reaccion`, `403`.
 - `listarTrabajoMiBandejaSolicitudes` (`GET /api/v1/bandeja/solicitudes`): `cotizacion` y `administrador`; otro rol y el cliente reciben `404`. Mismo bootstrap y catch-up por revisión que la bandeja de chat.
@@ -57,7 +57,7 @@
 **Cambios:**
 - Pin `api-client-go` de `v0.1.0-tracer.42` a `v0.1.0-tracer.45`; compila sin cambios (sin constantes renombradas).
 - `migrations/mensajeria/0011_tipo_conversacion.sql`: columnas `tipo` (con `CHECK`) y `ventana_aplicada_en`; el índice único `una_conversacion_activa_por_viaje` pasa a `(tenant_id, viaje_id, tipo)` conservando su nombre, porque `0001` lo recrea con `IF NOT EXISTS` en cada `cmd/migrate`. Aditiva e idempotente; verificada dos veces con datos de los dos tipos.
-- `internal/consumidores/solicitud.go`: `ConsumidorSolicitud`. `mensajeria.go`: suscripción y worker.
+- `internal/consumidores/solicitud.go`: `ConsumidorSolicitud`; un `solicitud_id` o `cliente_id` que no es UUID se acusa sin efecto y se registra, en vez de reintentarse sin fin. `mensajeria.go`: suscripción y worker.
 - `internal/conversacion`: `CrearSolicitudPorEvento`, `AplicarEstadoSolicitud`, `ConversacionDeSolicitud`; `ObtenerConversacion` llena `tipo`; `CerrarVentana` (viaje.cerrado) filtra `tipo='viaje'`.
 - `internal/bandejas`: `consultar` filtra por tipo; `TrabajoSolicitudes` y `CambiosSolicitudesDesde`.
 - `internal/autorizacion`: la audiencia interna depende del tipo; `LeeBandejaSolicitudes`; `ClienteDelViaje` y la empresa del viaje de emergencias filtran `tipo='viaje'`.

@@ -20,10 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/AI27-Tech/pf-pkg-platform-go/bus"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
+	"github.com/google/uuid"
 )
 
 // Tipos de evento de la solicitud, productor operacion (registro.tipos.yaml).
@@ -66,14 +68,31 @@ func NuevoConsumidorSolicitud(conv ConversacionSolicitud) *ConsumidorSolicitud {
 	return &ConsumidorSolicitud{conv: conv}
 }
 
-// Procesar despacha por tipo. Un tipo ajeno, un payload ilegible o sin los datos
-// que el efecto necesita se acusa sin efecto (no reintentable). Un error de BD se
-// propaga para reintentar: ambos efectos son idempotentes.
+// idsValidos dice si todos los ids son UUID. Las columnas son uuid: uno que no lo
+// sea haría fallar a Postgres en cada entrega y el reintento nunca terminaría.
+func idsValidos(ids ...string) bool {
+	for _, id := range ids {
+		if _, err := uuid.Parse(id); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// Procesar despacha por tipo. Un tipo ajeno, un payload ilegible, sin los datos
+// que el efecto necesita o con ids que no son UUID se acusa sin efecto y se
+// registra (no reintentable). Un error de BD se propaga para reintentar: ambos
+// efectos son idempotentes.
 func (c *ConsumidorSolicitud) Procesar(ctx context.Context, s bus.Sobre) error {
 	switch s.Tipo {
 	case TipoSolicitudCreada:
 		var p payloadSolicitudCreada
 		if json.Unmarshal(s.Payload, &p) != nil || p.SolicitudID == "" || p.ClienteID == "" {
+			return nil
+		}
+		if !idsValidos(p.SolicitudID, p.ClienteID) {
+			slog.WarnContext(ctx, "mensajeria: solicitud.creada con ids que no son UUID, se descarta",
+				slog.String("evento_id", s.EventoID))
 			return nil
 		}
 		if _, err := c.conv.CrearSolicitudPorEvento(ctx, conversacion.EntradaCreacion{ViajeID: p.SolicitudID, ClienteID: p.ClienteID}); err != nil {
@@ -82,6 +101,11 @@ func (c *ConsumidorSolicitud) Procesar(ctx context.Context, s bus.Sobre) error {
 	case TipoSolicitudEstadoCambiado:
 		var p payloadSolicitudEstado
 		if json.Unmarshal(s.Payload, &p) != nil || p.SolicitudID == "" || p.ClienteID == "" || p.AEstado == "" || p.CambiadoEn.IsZero() {
+			return nil
+		}
+		if !idsValidos(p.SolicitudID, p.ClienteID) {
+			slog.WarnContext(ctx, "mensajeria: solicitud.estado_cambiado con ids que no son UUID, se descarta",
+				slog.String("evento_id", s.EventoID))
 			return nil
 		}
 		if err := c.conv.AplicarEstadoSolicitud(ctx, p.SolicitudID, p.ClienteID, p.AEstado, p.CambiadoEn); err != nil {

@@ -184,6 +184,30 @@ func TestPagadoReabreYLosEventosViejosNoPisan(t *testing.T) {
 	}
 }
 
+// Un estado que el contrato no declara no mueve la ventana, ni abierta ni cerrada
+// (falla cerrado: no reabre una conversación por un estado desconocido).
+func TestEstadoDesconocidoNoMueveLaVentana(t *testing.T) {
+	ctx, svc, pool, ahora := entornoSolicitud(t)
+	if _, err := svc.CrearSolicitudPorEvento(ctx, conversacion.EntradaCreacion{ViajeID: solID, ClienteID: solCliente}); err != nil {
+		t.Fatal(err)
+	}
+	conv, _ := svc.ConversacionDeSolicitud(ctx, solID)
+	t0 := *ahora
+	if err := svc.AplicarEstadoSolicitud(ctx, solID, solCliente, "APROBADO", t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AplicarEstadoSolicitud(ctx, solID, solCliente, "ESTADO_NUEVO", t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var hasta *time.Time
+	if err := pool.QueryRow(ctx, `SELECT escritura_hasta FROM mensajeria.conversacion WHERE id = $1`, conv).Scan(&hasta); err != nil {
+		t.Fatal(err)
+	}
+	if hasta == nil || !hasta.Equal(t0.Add(72*time.Hour)) {
+		t.Fatalf("escritura_hasta = %v tras un estado desconocido; quiere %v", hasta, t0.Add(72*time.Hour))
+	}
+}
+
 // Si solicitud.estado_cambiado llega antes que solicitud.creada, el efecto no se
 // pierde: crea la conversación, y la creación tardía la reutiliza sin reabrirla.
 func TestEstadoAntesDeLaCreacionNoSePierde(t *testing.T) {
