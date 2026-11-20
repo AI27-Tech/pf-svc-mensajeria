@@ -98,6 +98,18 @@ var (
 		Escribir: {roles.RolEjecutivo},
 		Reclamar: {roles.RolEjecutivo},
 	}
+	// rolesSolicitud es la audiencia interna de la conversación `tipo=solicitud`
+	// (contrato tracer.45, DEC-148 #1, #12, #20, #28): la leen `cotizacion` y el
+	// `administrador`; el resto de los roles internos recibe prohibido.
+	// Escribir vale los dos: `cotizacion` responde, libera y transfiere (DEC-148
+	// #31) y el administrador interviene por herencia (#20, auditado). Reclamar es
+	// solo de `cotizacion` (contrato reclamarConversacion); quien responde además
+	// necesita el reclamo activo (dominio).
+	rolesSolicitud = map[Accion][]roles.Rol{
+		Leer:     {roles.RolCotizacion, roles.RolAdministrador},
+		Escribir: {roles.RolCotizacion, roles.RolAdministrador},
+		Reclamar: {roles.RolCotizacion},
+	}
 	rolesEmergencia = map[Permiso][]roles.Rol{
 		VerCaso:       {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
 		AtenderCaso:   {roles.RolReaccion},
@@ -131,6 +143,11 @@ func LectorDirigidas(c *auth.Claims) string {
 	return ""
 }
 
+// LeeBandejaSolicitudes dice si el rol ve la bandeja de solicitudes
+// (listarTrabajoMiBandejaSolicitudes): `cotizacion` por ser miembro del pool
+// (DEC-148 #31) y el `administrador` por herencia (#20).
+func LeeBandejaSolicitudes(rol string) bool { return tiene(rolesSolicitud[Leer], rol) }
+
 // VeBandejaEmergencias dice si el rol ve la bandeja única de emergencias:
 // Reacción por ser miembro (DEC-130) y Supervisor/Coordinador (DEC-131).
 func VeBandejaEmergencias(rol string) bool { return tiene(rolesEmergencia[VerCaso], rol) }
@@ -140,26 +157,32 @@ func VeBandejaEmergencias(rol string) bool { return tiene(rolesEmergencia[VerCas
 // al tenant del token (DEC-124); si no, no_encontrado (DEC-132 #2). Al interno se
 // la resuelve sin acotar por su tenant (DEC-129). No decide el rol.
 func (s *Servicio) TenantDeConversacion(ctx context.Context, conversacionID string, c *auth.Claims) (string, error) {
+	tenant, _, err := s.tenantYTipo(ctx, conversacionID, c)
+	return tenant, err
+}
+
+// tenantYTipo es TenantDeConversacion más el tipo de la conversación (`viaje` o
+// `solicitud`), que decide la audiencia interna.
+func (s *Servicio) tenantYTipo(ctx context.Context, conversacionID string, c *auth.Claims) (tenant, tipo string, err error) {
 	if c == nil {
-		return "", platformerrors.NewNoAutorizado("autorizacion: sin claims")
+		return "", "", platformerrors.NewNoAutorizado("autorizacion: sin claims")
 	}
-	var tenant string
 	var clienteID *string
-	err := s.db.QueryRow(ctx,
-		`SELECT tenant_id, cliente_id::text FROM mensajeria.conversacion WHERE id = $1`,
+	err = s.db.QueryRow(ctx,
+		`SELECT tenant_id, cliente_id::text, tipo FROM mensajeria.conversacion WHERE id = $1`,
 		conversacionID,
-	).Scan(&tenant, &clienteID)
+	).Scan(&tenant, &clienteID, &tipo)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", platformerrors.NewNoEncontrado("conversacion no encontrada")
+		return "", "", platformerrors.NewNoEncontrado("conversacion no encontrada")
 	}
 	if err != nil {
-		return "", platformerrors.NewRotoErr(err, "autorizacion: leer conversacion")
+		return "", "", platformerrors.NewRotoErr(err, "autorizacion: leer conversacion")
 	}
 	if c.Audiencia == auth.AudienciaCliente &&
 		(tenant != c.TenantID || clienteID == nil || *clienteID != c.TenantID) {
-		return "", platformerrors.NewNoEncontrado("conversacion no encontrada")
+		return "", "", platformerrors.NewNoEncontrado("conversacion no encontrada")
 	}
-	return tenant, nil
+	return tenant, tipo, nil
 }
 
 // Conversacion autoriza la acción sobre la conversación y devuelve su tenant.
@@ -168,14 +191,18 @@ func (s *Servicio) TenantDeConversacion(ctx context.Context, conversacionID stri
 // interno necesita el rol de la acción (rolesConversacion) y que la conversación
 // esté enrutada a la bandeja de conversaciones (DEC-127); si no, prohibido.
 func (s *Servicio) Conversacion(ctx context.Context, conversacionID string, c *auth.Claims, a Accion) (string, error) {
-	tenant, err := s.TenantDeConversacion(ctx, conversacionID, c)
+	tenant, tipo, err := s.tenantYTipo(ctx, conversacionID, c)
 	if err == nil && c.Audiencia == auth.AudienciaCliente && a == Reclamar {
 		return "", platformerrors.NewProhibido("autorizacion: el cliente no reclama conversaciones")
 	}
 	if err != nil || c.Audiencia == auth.AudienciaCliente {
 		return tenant, err
 	}
-	if !tiene(rolesConversacion[a], c.Rol) {
+	permitidos := rolesConversacion[a]
+	if tipo == "solicitud" {
+		permitidos = rolesSolicitud[a]
+	}
+	if !tiene(permitidos, c.Rol) {
 		return "", platformerrors.NewProhibido("autorizacion: el rol no tiene esa acción sobre la conversación")
 	}
 
@@ -281,7 +308,7 @@ func (s *Servicio) ClienteDelViaje(ctx context.Context, viajeID string) (string,
 	var cliente string
 	err := s.db.QueryRow(ctx,
 		`SELECT cliente_id::text FROM mensajeria.conversacion
-		  WHERE viaje_id = $1 AND cliente_id IS NOT NULL
+		  WHERE viaje_id = $1 AND tipo = 'viaje' AND cliente_id IS NOT NULL
 		  ORDER BY creado_en DESC, id DESC LIMIT 1`,
 		viajeID,
 	).Scan(&cliente)

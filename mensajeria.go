@@ -49,6 +49,7 @@ import (
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/consumidores"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/conversacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/pool"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 )
@@ -116,6 +117,14 @@ type Module struct {
 	// sin Subscriber.
 	consumidorHabilitada worker.Worker
 	consumidorCerrado    worker.Worker
+	// consumidorSolicitud es el worker durable de la conversación de la solicitud
+	// (solicitud.creada y solicitud.estado_cambiado). nil sin Subscriber.
+	consumidorSolicitud worker.Worker
+	// consumidorRoles es el worker durable que proyecta el rol vigente de cada
+	// sujeto (rol.asignado, rol.revocado, sujeto.desactivado, sujeto.reactivado),
+	// con el que se valida el destino de una transferencia en la solicitud. nil sin
+	// Subscriber.
+	consumidorRoles worker.Worker
 	// alcance es la proyección de alcance.cambiado (sujeto → clientes efectivos,
 	// DEC-149) en mensajeria.alcance_sujeto. La lee la guarda de alcance de las
 	// emergencias del viaje; la escribe consumidorAlcance. Siempre existe: sin
@@ -207,6 +216,34 @@ func New(p Pools, d Deps) (*Module, error) {
 		}
 		m.consumidorCerrado = wCer
 
+		// Conversación de la solicitud (DEC-148 #5, #30, #48): los dos eventos en
+		// una sola suscripción para conservar el orden por solicitud_id.
+		consSol := consumidores.NuevoConsumidorSolicitud(m.conversacion)
+		wSol, err := d.Subscriber.Subscribe(
+			"mensajeria-conversacion-solicitud",
+			bus.SensibilidadAmplia,
+			consumidores.TiposSolicitud,
+			consSol.Procesar,
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.consumidorSolicitud = wSol
+
+		// Rol vigente de cada sujeto, para validar que el destino de una
+		// transferencia en la solicitud es `cotizacion` (DEC-148 #31).
+		consRol := pool.NuevoConsumidorRoles(p.Chat)
+		wRol, err := d.Subscriber.Subscribe(
+			"mensajeria-roles",
+			bus.SensibilidadAmplia,
+			pool.TiposRol,
+			consRol.Procesar,
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.consumidorRoles = wRol
+
 		// Consumidor durable de alcance.cambiado (DEC-149 #20): mantiene la
 		// proyección en Postgres, compartida por las réplicas. Con Alcances, la
 		// reconstrucción por snapshot + cursor lo envuelve y deja la réplica
@@ -260,6 +297,11 @@ func (m *Module) Routes(mux *http.ServeMux) {
 //   - el consumidor durable de catalogo.actualizado (invalida caché de clientes);
 //   - los dos consumidores durables del ciclo de vida de la conversación por
 //     evento del viaje (E3-T1): viaje.mensajeria_habilitada y viaje.cerrado;
+//   - el consumidor durable de la conversación de la solicitud
+//     (solicitud.creada y solicitud.estado_cambiado, DEC-148);
+//   - el consumidor durable del rol vigente de cada sujeto (rol.asignado,
+//     rol.revocado, sujeto.desactivado, sujeto.reactivado), para validar el
+//     destino de una transferencia de la solicitud (DEC-148 #31);
 //   - el consumidor durable de alcance.cambiado (DEC-149 #20), envuelto por la
 //     reconstrucción con listarAlcances si hay Deps.Alcances: su Ready es
 //     not-ready hasta converger (worker alcance.NombreWorker).
@@ -283,6 +325,12 @@ func (m *Module) Workers() []worker.Worker {
 	}
 	if m.consumidorCerrado != nil {
 		ws = append(ws, m.consumidorCerrado)
+	}
+	if m.consumidorSolicitud != nil {
+		ws = append(ws, m.consumidorSolicitud)
+	}
+	if m.consumidorRoles != nil {
+		ws = append(ws, m.consumidorRoles)
 	}
 	if m.consumidorAlcance != nil {
 		ws = append(ws, m.consumidorAlcance)
