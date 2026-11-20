@@ -189,6 +189,55 @@ func TestConversacionDeSolicitud(t *testing.T) {
 		}
 	})
 
+	// `sin_respuesta` es solo del lado interno (DEC-148 #54): ParaAudiencia lo
+	// quita al Cliente en cada camino de lectura, y las bandejas lo llevan al interno.
+	t.Run("sin_respuesta no llega al cliente y sí al interno", func(t *testing.T) {
+		sol, viaje := uuid.MustParse(compartido), uuid.MustParse(compartido)
+		idSol := uuid.MustParse(idDe(interno("cotizacion"), compartido))
+		lecturas := map[string]func(context.Context) (*msgclient.Conversacion, error){
+			"obtenerConversacion": func(c context.Context) (*msgclient.Conversacion, error) { return api.ObtenerConversacion(c, idSol) },
+			"obtenerConversacionDeSolicitud": func(c context.Context) (*msgclient.Conversacion, error) {
+				return api.ObtenerConversacionDeSolicitud(c, sol)
+			},
+			"obtenerConversacionDeViaje": func(c context.Context) (*msgclient.Conversacion, error) {
+				return api.ObtenerConversacionDeViaje(c, viaje)
+			},
+		}
+		for nombre, leer := range lecturas {
+			conv, err := leer(ctxCliente)
+			if err != nil || conv.SinRespuesta != nil {
+				t.Errorf("%s como cliente: err=%v sin_respuesta=%v; quiere nil", nombre, err, conv)
+			}
+		}
+		for nombre, leer := range lecturas {
+			ctxInterno := interno("cotizacion")
+			if nombre == "obtenerConversacionDeViaje" {
+				ctxInterno = interno("ejecutivo")
+			}
+			if conv, err := leer(ctxInterno); err != nil || conv.SinRespuesta == nil {
+				t.Errorf("%s como interno: err=%v; quiere sin_respuesta presente", nombre, err)
+			}
+		}
+		for rol, listar := range map[string]func() (*msgclient.TrabajoBandeja, error){
+			"ejecutivo": func() (*msgclient.TrabajoBandeja, error) {
+				return api.ListarTrabajoBandeja(interno("ejecutivo"), msgclient.ListarTrabajoMiBandejaParams{})
+			},
+			"cotizacion": func() (*msgclient.TrabajoBandeja, error) {
+				return api.ListarTrabajoMiBandejaSolicitudes(interno("cotizacion"), msgclient.ListarTrabajoMiBandejaSolicitudesParams{})
+			},
+		} {
+			tb, err := listar()
+			if err != nil || len(tb.Items) == 0 {
+				t.Fatalf("bandeja de %s: %v", rol, err)
+			}
+			for _, it := range tb.Items {
+				if it.SinRespuesta == nil {
+					t.Errorf("bandeja de %s: %s sin sin_respuesta", rol, it.Id)
+				}
+			}
+		}
+	})
+
 	t.Run("las bandejas de chat solo traen tipo viaje", func(t *testing.T) {
 		for _, rol := range []string{"ejecutivo", "supervisor", "coordinador"} {
 			tb, err := api.ListarTrabajoBandeja(interno(rol), msgclient.ListarTrabajoMiBandejaParams{})

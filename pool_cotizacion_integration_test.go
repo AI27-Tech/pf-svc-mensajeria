@@ -183,6 +183,62 @@ func TestPoolCotizacion(t *testing.T) {
 		}
 	})
 
+	// Escenario 7 de la HU: el administrador interviene (enviar, transferir) pero no
+	// reclama: en tipo=solicitud solo reclama `cotizacion` (contrato reclamarConversacion).
+	t.Run("el administrador no reclama la solicitud y cotizacion y administrador no operan el viaje", func(t *testing.T) {
+		if r := como(adm, "administrador")("POST", rutaSol+"/reclamos", version(0)); r.code != http.StatusForbidden {
+			t.Errorf("administrador reclama la solicitud: %d, quiere 403", r.code)
+		}
+		if n := func() (n int) {
+			_ = rp.QueryRow(ctx, `SELECT count(*) FROM mensajeria.reclamo WHERE conversacion_id = $1`, convSol).Scan(&n)
+			return
+		}(); n != 0 {
+			t.Errorf("reclamos tras el intento del administrador: %d, quiere 0", n)
+		}
+		rid := uuid.NewString()
+		sobreViaje := []struct {
+			metodo, ruta string
+			cuerpo       any
+		}{
+			{"GET", rutaViaje, nil},
+			{"GET", rutaViaje + "/mensajes", nil},
+			{"POST", rutaViaje + "/mensajes", enviar(nil, "x")},
+			{"POST", rutaViaje + "/reclamos", version(0)},
+			{"DELETE", rutaViaje + "/reclamos/" + rid + "?version_esperada=1", nil},
+			{"POST", rutaViaje + "/transferencias", map[string]any{"version_esperada": 1, "responsable_destino_id": cot1}},
+			{"POST", rutaViaje + "/atendida", version(1)},
+			{"POST", rutaViaje + "/recibos/entregado", map[string]any{"hasta_secuencia": 1}},
+			{"POST", rutaViaje + "/recibos/leido", map[string]any{"hasta_secuencia": 1}},
+		}
+		for _, rol := range []string{"administrador", "cotizacion"} {
+			for _, op := range sobreViaje {
+				if r := como(uuid.NewString(), rol)(op.metodo, op.ruta, op.cuerpo); r.code != http.StatusForbidden {
+					t.Errorf("%s %s %s: %d, quiere 403", rol, op.metodo, op.ruta, r.code)
+				}
+			}
+		}
+		// El cliente de OTRA empresa no se entera de que la conversación existe: 404.
+		otraEmpresa := func(metodo, ruta string, cuerpo any) int {
+			b, _ := json.Marshal(cuerpo)
+			req := httptest.NewRequest(metodo, ruta, bytes.NewReader(b)).WithContext(auth.ContextWithClaims(ctx,
+				&auth.Claims{Subject: uuid.NewString(), TenantID: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Rol: "cliente", Audiencia: auth.AudienciaCliente}))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		for _, ruta := range []string{rutaSol, rutaViaje} {
+			for _, op := range []struct{ metodo, sufijo string }{{"GET", ""}, {"GET", "/mensajes"}, {"POST", "/mensajes"}} {
+				var cuerpo any
+				if op.metodo == "POST" {
+					cuerpo = enviar(nil, "x")
+				}
+				if code := otraEmpresa(op.metodo, ruta+op.sufijo, cuerpo); code != http.StatusNotFound {
+					t.Errorf("cliente de otra empresa %s %s%s: %d, quiere 404", op.metodo, ruta, op.sufijo, code)
+				}
+			}
+		}
+	})
+
 	// --- Dos reclamos concurrentes: un ganador y un conflicto ------------------
 	var ganador, perdedor func(string, string, any) resp
 	var rec msgclient.Reclamo

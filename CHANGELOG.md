@@ -7,11 +7,11 @@
 **Resumen:** todos los usuarios con rol `cotizacion` forman un solo pool que reclama, responde, libera y transfiere con el mismo mecanismo del `ejecutivo`, sin vínculo por cliente. El `administrador` interviene por herencia y queda auditado. La audiencia de cada operación por `{id}` depende del tipo de la conversación.
 
 **Comportamiento:**
-- `tipo=solicitud`: leen, escriben y reclaman `cotizacion` y `administrador`; `ejecutivo`, `supervisor`, `coordinador`, `jefe_operativo`, `monitorista` y `reaccion` reciben `403` en obtener, mensajes, enviar, reclamar, liberar, transferir, atendida y recibos. `tipo=viaje` no cambia. No hay membresía por usuario: un usuario nuevo de `cotizacion` lee el historial previo.
+- `tipo=solicitud`: leen y escriben `cotizacion` y `administrador`; solo `cotizacion` reclama (contrato `reclamarConversacion`); `ejecutivo`, `supervisor`, `coordinador`, `jefe_operativo`, `monitorista` y `reaccion` reciben `403` en obtener, mensajes, enviar, reclamar, liberar, transferir, atendida y recibos. `tipo=viaje` no cambia. No hay membresía por usuario: un usuario nuevo de `cotizacion` lee el historial previo.
 - Reclamo: mismo mecanismo y versión que el `ejecutivo`. Dos reclamos concurrentes producen un ganador y un `409 conflicto_version_reclamo`. En la solicitud no se dirige la conversación a un dueño ni se toma dueño del cliente (`dueno_cliente` queda intacto).
 - Solo el reclamante responde; sin reclamo, `409 conflicto_version_reclamo`.
 - Transferir en `tipo=solicitud` solo admite destino con rol `cotizacion` vigente: otro destino (`ejecutivo`, `administrador`, desconocido o desactivado), `409` con `codigo` `destino_no_es_cotizacion` y el reclamo del llamante no cambia. El cierre del reclamo y la apertura del siguiente son una sola transacción.
-- Intervención del `administrador`: envía sin reclamo propio y transfiere el reclamo de otro; cada una queda en la auditoría como `override.administrador` (el override de Supervisor, DEC-148 #47) con el responsable desplazado. Liberar, marcar atendida y recibos siguen siendo del responsable.
+- Intervención del `administrador`: envía sin reclamo propio y transfiere el reclamo de otro (si él es el responsable de un reclamo, envía como cualquier responsable y una versión obsoleta da `409 conflicto_version_reclamo`, no un override; el envío en la solicitud no toca el vínculo pegajoso del Ejecutivo, ADR 36; el responsable desplazado se lee con `FOR UPDATE`); cada una queda en la auditoría como `override.administrador` (el override de Supervisor, DEC-148 #47) con el responsable desplazado. Liberar, marcar atendida y recibos siguen siendo del responsable.
 - `Conversacion.sin_respuesta`: verdadero si el último mensaje aceptado es del cliente. Se deriva del orden canónico de mensajes, así que se activa en la misma transacción que acepta el mensaje y se apaga en la que acepta la respuesta, sin estado aparte. Aparece en `obtenerConversacion` y en las bandejas de trabajo; se omite para el Cliente. En V1 no existía código de la alerta de E3-HU-016, no había nada que reutilizar.
 - Identidad "AI27 Operations": mensajeria sigue guardando `actor_real`, `rol_al_enviar` y `alias_mostrado` inmutables; el alias que ve el cliente lo presenta el `bff` (DEC-021), igual que con el `ejecutivo`.
 
@@ -21,7 +21,7 @@
 - `internal/reclamos`: `ErrDestinoNoEsCotizacion`, `TransferirComoAdministrador`; el vínculo (dirigir, tomar dueño) solo en `tipo=viaje`.
 - `internal/conversacion`: el administrador envía sin reclamo en la solicitud, con auditoría; `sin_respuesta` en `ObtenerConversacion`.
 - `internal/bandejas`: `CondicionSinRespuesta` y `sin_respuesta` en cada elemento.
-- `internal/autorizacion`: `cotizacion` y `administrador` escriben y reclaman en `tipo=solicitud`.
+- `internal/autorizacion`: `cotizacion` y `administrador` escriben en `tipo=solicitud`; solo `cotizacion` reclama.
 - `adapters/http/conversacion` y `conversaciones_api.go`: transferencia por rol, `409 destino_no_es_cotizacion`, `sin_respuesta` omitido para el Cliente.
 - `mensajeria.go`: suscripción `mensajeria-roles`.
 
