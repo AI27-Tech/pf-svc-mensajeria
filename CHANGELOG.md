@@ -1,5 +1,42 @@
 # CHANGELOG
 
+## 2026-11-20 15:30 — El pool de `cotizacion` atiende la conversación de la solicitud (DEC-148 #20, #28, #31, #45 a #47, #54; tracer.45)
+
+**Para quién:** `pf-svc-bff` y `pf-svc-core` (reclamo, liberación y transferencia ya valen para `tipo=solicitud`), el panel interno (bandeja de `cotizacion`, aviso de mensaje sin respuesta) y `pf-svc-identidad` (debe publicar los eventos de rol hacia el durable nuevo). Se apila sobre «La conversación de la solicitud».
+
+**Resumen:** todos los usuarios con rol `cotizacion` forman un solo pool que reclama, responde, libera y transfiere con el mismo mecanismo del `ejecutivo`, sin vínculo por cliente. El `administrador` interviene por herencia y queda auditado. La audiencia de cada operación por `{id}` depende del tipo de la conversación.
+
+**Comportamiento:**
+- `tipo=solicitud`: leen y escriben `cotizacion` y `administrador`; solo `cotizacion` reclama (contrato `reclamarConversacion`); `ejecutivo`, `supervisor`, `coordinador`, `jefe_operativo`, `monitorista` y `reaccion` reciben `403` en obtener, mensajes, enviar, reclamar, liberar, transferir, atendida y recibos. `tipo=viaje` no cambia. No hay membresía por usuario: un usuario nuevo de `cotizacion` lee el historial previo.
+- Reclamo: mismo mecanismo y versión que el `ejecutivo`. Dos reclamos concurrentes producen un ganador y un `409 conflicto_version_reclamo`. En la solicitud no se dirige la conversación a un dueño ni se toma dueño del cliente (`dueno_cliente` queda intacto).
+- Solo el reclamante responde; sin reclamo, `409 conflicto_version_reclamo`.
+- Transferir en `tipo=solicitud` solo admite destino con rol `cotizacion` vigente: otro destino (`ejecutivo`, `administrador`, desconocido o desactivado), `409` con `codigo` `destino_no_es_cotizacion` y el reclamo del llamante no cambia. El cierre del reclamo y la apertura del siguiente son una sola transacción.
+- Intervención del `administrador`: envía sin reclamo propio y transfiere el reclamo de otro (si él es el responsable de un reclamo, envía como cualquier responsable y una versión obsoleta da `409 conflicto_version_reclamo`, no un override; el envío en la solicitud no toca el vínculo pegajoso del Ejecutivo, ADR 36; el responsable desplazado se lee con `FOR UPDATE`); cada una queda en la auditoría como `override.administrador` (el override de Supervisor, DEC-148 #47) con el responsable desplazado. Liberar, marcar atendida y recibos siguen siendo del responsable.
+- `Conversacion.sin_respuesta`: verdadero si el último mensaje aceptado es del cliente. Se deriva del orden canónico de mensajes, así que se activa en la misma transacción que acepta el mensaje y se apaga en la que acepta la respuesta, sin estado aparte. Aparece en `obtenerConversacion` y en las bandejas de trabajo; se omite para el Cliente. En V1 no existía código de la alerta de E3-HU-016, no había nada que reutilizar.
+- Identidad "AI27 Operations": mensajeria sigue guardando `actor_real`, `rol_al_enviar` y `alias_mostrado` inmutables; el alias que ve el cliente lo presenta el `bff` (DEC-021), igual que con el `ejecutivo`.
+
+**Cambios:**
+- `migrations/mensajeria/0012_rol_sujeto.sql`: tabla `rol_sujeto`. Aditiva e idempotente.
+- `internal/pool/roles.go`: consumidor durable `mensajeria-roles` de `rol.asignado`, `rol.revocado`, `sujeto.desactivado` y `sujeto.reactivado`; un evento más viejo no pisa a uno más nuevo.
+- `internal/reclamos`: `ErrDestinoNoEsCotizacion`, `TransferirComoAdministrador`; el vínculo (dirigir, tomar dueño) solo en `tipo=viaje`.
+- `internal/conversacion`: el administrador envía sin reclamo en la solicitud, con auditoría; `sin_respuesta` en `ObtenerConversacion`.
+- `internal/bandejas`: `CondicionSinRespuesta` y `sin_respuesta` en cada elemento.
+- `internal/autorizacion`: `cotizacion` y `administrador` escriben en `tipo=solicitud`; solo `cotizacion` reclama.
+- `adapters/http/conversacion` y `conversaciones_api.go`: transferencia por rol, `409 destino_no_es_cotizacion`, `sin_respuesta` omitido para el Cliente.
+- `mensajeria.go`: suscripción `mensajeria-roles`.
+
+**Para `pf-svc-core` e `identidad`:** `identidad` debe publicar `rol.asignado`, `rol.revocado`, `sujeto.desactivado` y `sujeto.reactivado` hacia el durable `mensajeria-roles`. Sin esos eventos ningún destino es válido y toda transferencia de una solicitud responde `409` (falla cerrado).
+
+**Pregunta abierta (contrato):** `responsable_destino_id` se compara con el `sujeto_id` de esos eventos. Los eventos de rol no traen `idp_subject` y el reclamo guarda el `sub` del token (`actor_real`). Si `sub` y `sujeto_id` difieren en producción, el destino válido no coincidirá con quien luego responde: hace falta `idp_subject` en `rol.asignado` o aclarar qué id lleva `responsable_destino_id`.
+
+**Archivos modificados:**
+- `migrations/mensajeria/0012_rol_sujeto.sql` (nuevo)
+- `internal/pool/roles.go` (nuevo), `internal/pool/doc.go`
+- `internal/reclamos/reclamos.go`, `internal/auditoria/auditoria.go`
+- `internal/conversacion/conversacion.go`, `internal/bandejas/bandejas.go`, `internal/autorizacion/autorizacion.go`
+- `adapters/http/conversacion/conversacion.go`, `conversaciones_api.go`, `mensajeria.go`
+- `pool_cotizacion_integration_test.go` (nuevo), `workers_test.go`
+
 ## 2026-11-20 14:15 — La conversación de la solicitud: tipo de conversación, eventos y bandeja de solicitudes (DEC-148 #3, #5, #12, #28 a #31, #48; tracer.45)
 
 **Para quién:** `pf-svc-bff` y `pf-svc-core` (nuevas operaciones de `ConversacionesAPI`), el panel interno y el portal del cliente. Cambia lo que ve cada rol: `ejecutivo`, `supervisor` y `coordinador` siguen viendo solo conversaciones de viaje; `cotizacion` y `administrador` ven las de solicitud.

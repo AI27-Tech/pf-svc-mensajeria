@@ -85,7 +85,7 @@ func (a *conversacionesAPI) ObtenerConversacion(ctx context.Context, conversacio
 	if err != nil {
 		return nil, traducir(err)
 	}
-	return conv, nil
+	return convhttp.ParaAudiencia(conv, claims), nil
 }
 
 // ObtenerConversacionDeViaje recorre el MISMO camino que el handler
@@ -298,8 +298,7 @@ func (a *conversacionesAPI) TransferirConversacion(ctx context.Context, conversa
 	if body.Motivo != nil {
 		motivo = *body.Motivo
 	}
-	err = a.conv.Reclamos.Transferir(ctx, tenant, id, claims.Subject,
-		body.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(body.VersionEsperada))
+	err = a.conv.Transferir(ctx, claims, tenant, id, body, motivo)
 	if err != nil {
 		return nil, convhttp.TraducirReclamo(err)
 	}

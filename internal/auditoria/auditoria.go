@@ -33,6 +33,10 @@ const (
 	AccionReclamoLiberado      = "reclamo.liberado"
 	AccionReclamoTransferido   = "reclamo.transferido"
 	AccionConversacionAtendida = "conversacion.atendida"
+	// AccionOverrideAdministrador es la intervención del administrador sobre una
+	// conversación de la solicitud que atiende otro responsable (DEC-148 #20, #47):
+	// se audita como el override de Supervisor.
+	AccionOverrideAdministrador = "override.administrador"
 
 	// El reclamo de emergencia no tiene conversación: va con conversacion_id NULL
 	// y el caso en detalle.caso_emergencia_id (DEC-125).
