@@ -224,3 +224,26 @@ func TestWorkersAlcance(t *testing.T) {
 	}
 	t.Error("con Alcances: falta el worker mensajeria-alcance")
 }
+
+// TestWorkersConversacionSolicitud fija el cableado del consumidor de la
+// conversación de la solicitud: UNA suscripción durable con los dos eventos, para
+// conservar el orden por solicitud_id (DEC-148 #5, #30, #48).
+func TestWorkersConversacionSolicitud(t *testing.T) {
+	sub := &suscriptorFake{}
+	m, err := New(Pools{}, Deps{Subscriber: sub})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := sub.por("mensajeria-conversacion-solicitud")
+	if s == nil || s.superficie != bus.SensibilidadAmplia ||
+		len(s.filtro) != 2 || s.filtro[0] != "solicitud.creada" || s.filtro[1] != "solicitud.estado_cambiado" {
+		t.Fatalf("suscripción de la solicitud: %+v; abiertas: %v", s, sub.subs)
+	}
+	var tiene bool
+	for _, w := range m.Workers() {
+		tiene = tiene || w.Name() == "bus-durable:mensajeria-conversacion-solicitud"
+	}
+	if !tiene {
+		t.Error("falta el consumidor de la solicitud en Workers()")
+	}
+}

@@ -208,7 +208,7 @@ func empresaDelViaje(ctx context.Context, tx pgx.Tx, viajeID string) (string, st
 	var tenant, cliente string
 	err := tx.QueryRow(ctx,
 		`SELECT tenant_id, cliente_id::text FROM mensajeria.conversacion
-		  WHERE viaje_id = $1 AND cliente_id IS NOT NULL
+		  WHERE viaje_id = $1 AND tipo = 'viaje' AND cliente_id IS NOT NULL
 		  ORDER BY creado_en DESC, id DESC LIMIT 1`,
 		viajeID,
 	).Scan(&tenant, &cliente)

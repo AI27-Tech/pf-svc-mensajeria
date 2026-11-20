@@ -18,8 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"time"
 
+	"github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/estados"
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
@@ -49,6 +52,23 @@ type Servicio struct {
 	// Ventana es N, la disponibilidad del dueño del cliente (DEC-128). Cero vale
 	// vinculo.VentanaPorDefecto.
 	Ventana vinculo.Ventana
+	// Ahora es el reloj de la ventana de escritura. nil vale time.Now; las
+	// pruebas de frontera lo inyectan.
+	Ahora func() time.Time
+}
+
+// Tipos de conversación (contrato Conversacion.tipo, DEC-148 #29). El viaje
+// hereda el id de la solicitud, así que comparten viaje_id.
+const (
+	TipoViaje     = "viaje"
+	TipoSolicitud = "solicitud"
+)
+
+func (s *Servicio) ahora() time.Time {
+	if s.Ahora != nil {
+		return s.Ahora()
+	}
+	return time.Now()
 }
 
 // NewServicio construye el servicio de conversación sobre el pool de chat y el
@@ -165,9 +185,9 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		`UPDATE mensajeria.conversacion
 		    SET siguiente_secuencia = siguiente_secuencia + 1
 		  WHERE id = $1 AND tenant_id = $2 AND estado = 'abierta'
-		    AND (escritura_hasta IS NULL OR escritura_hasta > now())
+		    AND (escritura_hasta IS NULL OR escritura_hasta > $3)
 		  RETURNING siguiente_secuencia`,
-		in.ConversacionID, in.TenantID,
+		in.ConversacionID, in.TenantID, s.ahora(),
 	).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ResultadoEnvio{}, noAbiertaOInexistente(ctx, tx, in)
@@ -512,16 +532,16 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var (
-		id, viajeID, estado string
-		clienteID           *string
-		siguienteSecuencia  int64
-		escrituraHasta      *time.Time
-		creadoEn            time.Time
-		atendidaEn          *time.Time
-		bandejaID           *string
+		id, viajeID, estado, tipo string
+		clienteID                 *string
+		siguienteSecuencia        int64
+		escrituraHasta            *time.Time
+		creadoEn                  time.Time
+		atendidaEn                *time.Time
+		bandejaID                 *string
 	)
 	err = tx.QueryRow(ctx,
-		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
+		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.tipo, c.siguiente_secuencia,
 		        c.escritura_hasta, c.creado_en, a.atendida_en, r.bandeja_id
 		   FROM mensajeria.conversacion c
 		   LEFT JOIN mensajeria.estado_atendido a
@@ -530,7 +550,7 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 		          ON r.conversacion_id = c.id AND r.tenant_id = c.tenant_id AND r.activa
 		  WHERE c.id = $1 AND c.tenant_id = $2`,
 		conversacionID, tenantID,
-	).Scan(&id, &viajeID, &clienteID, &estado, &siguienteSecuencia, &escrituraHasta, &creadoEn, &atendidaEn, &bandejaID)
+	).Scan(&id, &viajeID, &clienteID, &estado, &tipo, &siguienteSecuencia, &escrituraHasta, &creadoEn, &atendidaEn, &bandejaID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrConversacionNoEncontrada
 	}
@@ -551,6 +571,7 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 	conv := &msgclient.Conversacion{
 		Id:              uuid.MustParse(id),
 		ViajeId:         uuid.MustParse(viajeID),
+		Tipo:            &tipo,
 		Estado:          msgclient.EstadoConversacion(estado),
 		UltimaSecuencia: ultimaSecuencia,
 		EscrituraHasta:  escrituraHasta,
@@ -643,14 +664,25 @@ func (s *Servicio) ClienteDeConversacion(ctx context.Context, tenantID, conversa
 	return *clienteID, nil
 }
 
-// ConversacionDeViaje devuelve el id de la conversación del viaje (contrato
-// obtenerConversacionDeViaje): la no cerrada si existe (a lo más una por tenant,
-// índice una_conversacion_activa_por_viaje); si todas están cerradas, la más
-// reciente por creado_en (la tabla no guarda la hora de cierre).
+// ConversacionDeViaje devuelve el id de la conversación `tipo=viaje` del viaje
+// (contrato obtenerConversacionDeViaje): la no cerrada si existe (a lo más una
+// por tenant, viaje y tipo, índice una_conversacion_activa_por_viaje); si todas
+// están cerradas, la más reciente por creado_en (la tabla no guarda la hora de
+// cierre). Nunca devuelve la de la solicitud, que comparte viaje_id (DEC-148 #3).
 // ErrConversacionNoEncontrada si el viaje no tiene conversación. No acota por
 // tenant ni decide ACCESO: lo hace la frontera con autorizacion.Conversacion
 // (DEC-129), igual que CerrarVentana busca solo por viaje.
 func (s *Servicio) ConversacionDeViaje(ctx context.Context, viajeID string) (string, error) {
+	return s.conversacionPorTipo(ctx, viajeID, TipoViaje)
+}
+
+// ConversacionDeSolicitud es ConversacionDeViaje para `tipo=solicitud`
+// (contrato obtenerConversacionDeSolicitud): solicitudID es el viaje_id.
+func (s *Servicio) ConversacionDeSolicitud(ctx context.Context, solicitudID string) (string, error) {
+	return s.conversacionPorTipo(ctx, solicitudID, TipoSolicitud)
+}
+
+func (s *Servicio) conversacionPorTipo(ctx context.Context, viajeID, tipo string) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("conversacion: abrir transacción de lectura: %w", err)
@@ -660,16 +692,16 @@ func (s *Servicio) ConversacionDeViaje(ctx context.Context, viajeID string) (str
 	var id string
 	err = tx.QueryRow(ctx,
 		`SELECT id FROM mensajeria.conversacion
-		  WHERE viaje_id = $1
+		  WHERE viaje_id = $1 AND tipo = $2
 		  ORDER BY estado = 'cerrada', creado_en DESC, id DESC
 		  LIMIT 1`,
-		viajeID,
+		viajeID, tipo,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrConversacionNoEncontrada
 	}
 	if err != nil {
-		return "", fmt.Errorf("conversacion: buscar conversación del viaje: %w", err)
+		return "", fmt.Errorf("conversacion: buscar conversación %s: %w", tipo, err)
 	}
 	return id, nil
 }
@@ -779,13 +811,142 @@ func (s *Servicio) CerrarVentana(ctx context.Context, viajeID, motivoCierre stri
 	if _, err := tx.Exec(ctx,
 		`UPDATE mensajeria.conversacion
 		    SET escritura_hasta = $2
-		  WHERE viaje_id = $1 AND estado <> 'cerrada'`,
+		  WHERE viaje_id = $1 AND tipo = 'viaje' AND estado <> 'cerrada'`,
 		viajeID, escrituraHasta,
 	); err != nil {
 		return fmt.Errorf("conversacion: fijar escritura_hasta: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("conversacion: commit de cierre de ventana: %w", err)
+	}
+	return nil
+}
+
+// ventanaSolicitud es la ventana de escritura de la conversación de la solicitud
+// desde que termina, por cualquier vía, incluido APROBADO (DEC-148 #30, #48).
+const ventanaSolicitud = 3 * 24 * time.Hour
+
+// estadosSolicitudAbiertos son los estados que reabren la ventana de escritura
+// (SOLICITADO, COTIZADO y, tras VENCIDA, PAGADO). Es lista explícita: un estado
+// que el contrato agregue y no figure aquí, ni como terminal ni como VENCIDA, no
+// mueve la ventana (falla cerrado) hasta que se decida qué hace; la prueba
+// TestEstadosSolicitudCubiertos obliga a decidirlo.
+var estadosSolicitudAbiertos = []estados.EstadoSolicitud{
+	estados.EstadoSolicitudSolicitado,
+	estados.EstadoSolicitudCotizado,
+	estados.EstadoSolicitudPagado,
+}
+
+// efectoVentana dice qué hace el estado con la ventana: cerrarla (terminal o
+// VENCIDA), abrirla, o nada si el estado no lo conoce el contrato vigente.
+func efectoVentana(aEstado string) (cierra, conocido bool) {
+	e := estados.EstadoSolicitud(aEstado)
+	switch {
+	case e.EsTerminal() || e == estados.EstadoSolicitudVencida:
+		return true, true
+	case slices.Contains(estadosSolicitudAbiertos, e):
+		return false, true
+	}
+	return false, false
+}
+
+// CrearSolicitudPorEvento crea la conversación `tipo=solicitud` al consumir
+// solicitud.creada (DEC-148 #5), idempotentemente: el índice único parcial por
+// (tenant, viaje, tipo) arbitra y ON CONFLICT DO NOTHING vuelve la reentrega un
+// no-op. tenant_id = cliente_id (DEC-049). Nace en la bandeja única del tenant,
+// pero sin dirigirla a un dueño: el pool de `cotizacion` es uno solo y no hay
+// vínculo por cliente (DEC-148 #31). Devuelve creada=true si insertó.
+func (s *Servicio) CrearSolicitudPorEvento(ctx context.Context, in EntradaCreacion) (bool, error) {
+	if in.ViajeID == "" || in.ClienteID == "" {
+		return false, fmt.Errorf("conversacion: creación inválida: faltan solicitud_id o cliente_id")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("conversacion: abrir transacción de creación: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	creada, err := crearSolicitud(ctx, tx, in)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("conversacion: commit de creación: %w", err)
+	}
+	return creada, nil
+}
+
+func crearSolicitud(ctx context.Context, tx pgx.Tx, in EntradaCreacion) (bool, error) {
+	var id string
+	err := tx.QueryRow(ctx,
+		`INSERT INTO mensajeria.conversacion (tenant_id, viaje_id, cliente_id, tipo, estado, siguiente_secuencia)
+		 VALUES ($1, $2, $3::uuid, 'solicitud', 'abierta', 0)
+		 ON CONFLICT DO NOTHING
+		 RETURNING id`,
+		in.ClienteID, in.ViajeID, in.ClienteID,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // ya existía: reentrega idempotente
+	}
+	if err != nil {
+		return false, fmt.Errorf("conversacion: insertar conversación de la solicitud: %w", err)
+	}
+	if err := bandejas.EnrutarABandejaUnica(ctx, tx, in.ClienteID, id); err != nil {
+		return false, fmt.Errorf("conversacion: %w", err)
+	}
+	return true, nil
+}
+
+// AplicarEstadoSolicitud fija la ventana de escritura de la conversación de la
+// solicitud al consumir solicitud.estado_cambiado (DEC-148 #30, #35, #48):
+//
+//   - estado terminal (APROBADO, RECHAZADO_*, CANCELADO_*) o VENCIDA: la
+//     ventana corre 3 días desde cambiadoEn;
+//   - SOLICITADO, COTIZADO o PAGADO (por ejemplo VENCIDA → PAGADO): la reabre,
+//     sin límite;
+//   - un estado que el contrato no declara o que esta lista no contempla: no
+//     toca la ventana y se registra en el log.
+//
+// Si la conversación aún no existe (el evento llegó antes que solicitud.creada)
+// la crea, así el efecto no se pierde. Convergente: ventana_aplicada_en guarda el
+// cambiado_en aplicado y un evento más viejo que él no lo pisa; reentregar el
+// mismo da el mismo resultado.
+func (s *Servicio) AplicarEstadoSolicitud(ctx context.Context, solicitudID, clienteID, aEstado string, cambiadoEn time.Time) error {
+	if solicitudID == "" || clienteID == "" || aEstado == "" || cambiadoEn.IsZero() {
+		return fmt.Errorf("conversacion: estado de solicitud inválido: faltan solicitud_id, cliente_id, a_estado o cambiado_en")
+	}
+	cierra, conocido := efectoVentana(aEstado)
+	if !conocido {
+		slog.WarnContext(ctx, "mensajeria: estado de solicitud desconocido, la ventana no cambia",
+			slog.String("solicitud_id", solicitudID), slog.String("a_estado", aEstado))
+		return nil
+	}
+	var hasta *time.Time
+	if cierra {
+		h := cambiadoEn.Add(ventanaSolicitud)
+		hasta = &h
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("conversacion: abrir transacción de ventana: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := crearSolicitud(ctx, tx, EntradaCreacion{ViajeID: solicitudID, ClienteID: clienteID}); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE mensajeria.conversacion
+		    SET escritura_hasta = $2, ventana_aplicada_en = $3
+		  WHERE tenant_id = $4 AND viaje_id = $1 AND tipo = 'solicitud' AND estado <> 'cerrada'
+		    AND (ventana_aplicada_en IS NULL OR ventana_aplicada_en <= $3)`,
+		solicitudID, hasta, cambiadoEn, clienteID,
+	); err != nil {
+		return fmt.Errorf("conversacion: fijar ventana de la solicitud: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("conversacion: commit de ventana de la solicitud: %w", err)
 	}
 	return nil
 }

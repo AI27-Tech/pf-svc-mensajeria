@@ -23,6 +23,12 @@ func (f *trabajadorPG) TrabajoChat(context.Context, string) ([]msgclient.Convers
 func (f *trabajadorPG) CambiosChatDesde(context.Context, string, int64) ([]msgclient.Conversacion, int64, bool, error) {
 	panic("no se invoca")
 }
+func (f *trabajadorPG) TrabajoSolicitudes(context.Context) ([]msgclient.Conversacion, int64, error) {
+	panic("no se invoca")
+}
+func (f *trabajadorPG) CambiosSolicitudesDesde(context.Context, int64) ([]msgclient.Conversacion, int64, bool, error) {
+	panic("no se invoca")
+}
 func (f *trabajadorPG) Trabajo(context.Context, string, string, string) ([]msgclient.Conversacion, int64, error) {
 	panic("no se invoca")
 }

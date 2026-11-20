@@ -60,6 +60,7 @@ type Enviador interface {
 	ClienteDeConversacion(ctx context.Context, tenantID, conversacionID string) (string, error)
 	ObtenerConversacion(ctx context.Context, tenantID, conversacionID string) (*msgclient.Conversacion, error)
 	ConversacionDeViaje(ctx context.Context, viajeID string) (string, error)
+	ConversacionDeSolicitud(ctx context.Context, solicitudID string) (string, error)
 	ListarMensajes(ctx context.Context, tenantID, conversacionID string, antesDe, despuesDe *int64, limite int) ([]msgclient.Mensaje, bool, error)
 }
 
@@ -86,6 +87,7 @@ type Handlers struct {
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/conversaciones/{id}", h.obtener)
 	mux.HandleFunc("GET /api/v1/viajes/{id}/conversacion", h.obtenerDeViaje)
+	mux.HandleFunc("GET /api/v1/solicitudes/{id}/conversacion", h.obtenerDeSolicitud)
 	mux.HandleFunc("GET /api/v1/conversaciones/{id}/mensajes", h.listarMensajes)
 	mux.HandleFunc("POST /api/v1/conversaciones/{id}/reclamos", h.reclamar)
 	mux.HandleFunc("DELETE /api/v1/conversaciones/{id}/reclamos/{rid}", h.liberar)
@@ -150,14 +152,44 @@ func (h Handlers) obtenerDeViaje(w http.ResponseWriter, r *http.Request) {
 // (contrato, DEC-132). Devuelve errores ya traducidos a la taxonomía. Exportada para que
 // la superficie en proceso (mensajeria.ConversacionesAPI) siga el MISMO camino.
 func (h Handlers) ObtenerDeViaje(ctx context.Context, claims *auth.Claims, viajeID string) (*msgclient.Conversacion, error) {
-	noEncontrada := platformerrors.NewNoEncontrado("conversacion no encontrada")
-	viaje, err := uuid.Parse(viajeID)
-	if err != nil {
-		return nil, noEncontrada // un id que no es UUID no nombra ningún viaje
+	return h.obtenerPorRecurso(ctx, claims, viajeID, h.Conversacion.ConversacionDeViaje)
+}
+
+// obtenerDeSolicitud atiende GET /api/v1/solicitudes/{id}/conversacion
+// (obtenerConversacionDeSolicitud): {id} es el id de la solicitud.
+func (h Handlers) obtenerDeSolicitud(w http.ResponseWriter, r *http.Request) {
+	claims := boundary.Claims(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
 	}
-	// Se busca por viaje sin acotar por tenant: la guarda decide después si el
+	conv, err := h.ObtenerDeSolicitud(r.Context(), claims, r.PathValue("id"))
+	if err != nil {
+		escribirError(w, err)
+		return
+	}
+	escribirJSON(w, http.StatusOK, conv)
+}
+
+// ObtenerDeSolicitud es ObtenerDeViaje para la conversación `tipo=solicitud`:
+// misma guarda, que por tipo deja pasar al Cliente dueño, a `cotizacion` y al
+// `administrador`, y responde 403 al resto de los roles internos (DEC-148 #12, #28).
+// Exportada para la superficie en proceso.
+func (h Handlers) ObtenerDeSolicitud(ctx context.Context, claims *auth.Claims, solicitudID string) (*msgclient.Conversacion, error) {
+	return h.obtenerPorRecurso(ctx, claims, solicitudID, h.Conversacion.ConversacionDeSolicitud)
+}
+
+func (h Handlers) obtenerPorRecurso(ctx context.Context, claims *auth.Claims, recursoID string,
+	resolver func(ctx context.Context, id string) (string, error),
+) (*msgclient.Conversacion, error) {
+	noEncontrada := platformerrors.NewNoEncontrado("conversacion no encontrada")
+	viaje, err := uuid.Parse(recursoID)
+	if err != nil {
+		return nil, noEncontrada // un id que no es UUID no nombra ningún viaje ni solicitud
+	}
+	// Se busca por viaje_id sin acotar por tenant: la guarda decide después si el
 	// llamante la ve (Cliente de otra empresa → 404; otro rol interno → 403).
-	convID, err := h.Conversacion.ConversacionDeViaje(ctx, viaje.String())
+	convID, err := resolver(ctx, viaje.String())
 	if errors.Is(err, conversacion.ErrConversacionNoEncontrada) {
 		return nil, noEncontrada
 	}
