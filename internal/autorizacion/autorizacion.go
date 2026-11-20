@@ -101,10 +101,13 @@ var (
 	// rolesSolicitud es la audiencia interna de la conversación `tipo=solicitud`
 	// (contrato tracer.45, DEC-148 #1, #12, #20, #28): la leen `cotizacion` y el
 	// `administrador`; el resto de los roles internos recibe prohibido.
-	// TODO(producto): Escribir y Reclamar quedan vacías hasta el PR del pool de
-	// `cotizacion`; mientras tanto nadie interno responde (falla cerrado).
+	// Escribir y Reclamar valen los mismos dos: el pool de `cotizacion` reclama,
+	// responde, libera y transfiere (DEC-148 #31) y el administrador interviene por
+	// herencia (#20); quien responde además necesita el reclamo activo (dominio).
 	rolesSolicitud = map[Accion][]roles.Rol{
-		Leer: {roles.RolCotizacion, roles.RolAdministrador},
+		Leer:     {roles.RolCotizacion, roles.RolAdministrador},
+		Escribir: {roles.RolCotizacion, roles.RolAdministrador},
+		Reclamar: {roles.RolCotizacion, roles.RolAdministrador},
 	}
 	rolesEmergencia = map[Permiso][]roles.Rol{
 		VerCaso:       {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},

@@ -22,6 +22,7 @@ import (
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
 	msgmensajeria "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
@@ -164,7 +165,14 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 	// no deje efecto (ni incremento ni mensaje). El cliente no pasa por aquí (no
 	// reclama). El override quedó rechazado antes de abrir la tx (V1 cerrado).
 	if esInterno(in.RolAlEnviar) {
-		if err := exigirReclamoActivo(ctx, tx, in); err != nil {
+		err := exigirReclamoActivo(ctx, tx, in)
+		// El administrador interviene por herencia en la conversación de la
+		// solicitud (DEC-148 #20) sin reclamo propio; se audita como el override
+		// de Supervisor (#47). Con reclamo propio vigente envía como cualquier otro.
+		if errors.Is(err, ErrSinReclamoActivo) && in.RolAlEnviar == rolAdministrador {
+			err = s.registrarIntervencion(ctx, tx, in)
+		}
+		if err != nil {
 			return ResultadoEnvio{}, err
 		}
 	}
@@ -259,6 +267,38 @@ func (s *Servicio) Enviar(ctx context.Context, in EntradaEnvio) (ResultadoEnvio,
 		MensajeID: mensajeID,
 		Secuencia: msgmensajeria.SecuenciaMensaje(seq),
 	}, nil
+}
+
+const rolAdministrador = "administrador"
+
+// registrarIntervencion audita el envío del administrador sin reclamo propio, solo
+// si la conversación es de la solicitud; en otra, devuelve ErrSinReclamoActivo.
+func (s *Servicio) registrarIntervencion(ctx context.Context, tx pgx.Tx, in EntradaEnvio) error {
+	var tipo string
+	if err := tx.QueryRow(ctx,
+		`SELECT tipo FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
+		in.ConversacionID, in.TenantID).Scan(&tipo); err != nil {
+		return fmt.Errorf("conversacion: leer el tipo para la intervención: %w", err)
+	}
+	if tipo != TipoSolicitud {
+		return ErrSinReclamoActivo
+	}
+	var responsable *string
+	err := tx.QueryRow(ctx,
+		`SELECT actor_real::text FROM mensajeria.reclamo
+		  WHERE conversacion_id = $1 AND tenant_id = $2 AND cerrado_en IS NULL`,
+		in.ConversacionID, in.TenantID).Scan(&responsable)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("conversacion: leer el responsable para la intervención: %w", err)
+	}
+	detalle := map[string]any{"intervencion": "envio", "client_message_id": in.ClientMessageID}
+	if responsable != nil {
+		detalle["responsable_desplazado"] = *responsable
+	}
+	return auditoria.Registrar(ctx, tx, auditoria.Registro{
+		TenantID: in.TenantID, ConversacionID: in.ConversacionID, ActorReal: in.ActorReal,
+		Accion: auditoria.AccionOverrideAdministrador, Detalle: detalle,
+	})
 }
 
 // buscarPorClave devuelve el mensaje ya existente para la clave de idempotencia,
@@ -536,10 +576,12 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 		creadoEn                  time.Time
 		atendidaEn                *time.Time
 		bandejaID                 *string
+		sinRespuesta              bool
 	)
 	err = tx.QueryRow(ctx,
 		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.tipo, c.siguiente_secuencia,
-		        c.escritura_hasta, c.creado_en, a.atendida_en, r.bandeja_id
+		        c.escritura_hasta, c.creado_en, a.atendida_en, r.bandeja_id,
+		        `+bandejas.CondicionSinRespuesta+`
 		   FROM mensajeria.conversacion c
 		   LEFT JOIN mensajeria.estado_atendido a
 		          ON a.conversacion_id = c.id AND a.tenant_id = c.tenant_id AND a.atendida
@@ -547,7 +589,7 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 		          ON r.conversacion_id = c.id AND r.tenant_id = c.tenant_id AND r.activa
 		  WHERE c.id = $1 AND c.tenant_id = $2`,
 		conversacionID, tenantID,
-	).Scan(&id, &viajeID, &clienteID, &estado, &tipo, &siguienteSecuencia, &escrituraHasta, &creadoEn, &atendidaEn, &bandejaID)
+	).Scan(&id, &viajeID, &clienteID, &estado, &tipo, &siguienteSecuencia, &escrituraHasta, &creadoEn, &atendidaEn, &bandejaID, &sinRespuesta)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrConversacionNoEncontrada
 	}
@@ -569,6 +611,7 @@ func (s *Servicio) ObtenerConversacion(ctx context.Context, tenantID, conversaci
 		Id:              uuid.MustParse(id),
 		ViajeId:         uuid.MustParse(viajeID),
 		Tipo:            &tipo,
+		SinRespuesta:    &sinRespuesta,
 		Estado:          msgclient.EstadoConversacion(estado),
 		UltimaSecuencia: ultimaSecuencia,
 		EscrituraHasta:  escrituraHasta,

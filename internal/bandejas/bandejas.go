@@ -234,6 +234,16 @@ func (s *Servicio) CambiosSolicitudesDesde(ctx context.Context, desde int64) ([]
 	return items, rev, false, nil
 }
 
+// CondicionSinRespuesta es la condición SQL, sobre la conversación `c`, del aviso
+// "mensaje sin respuesta" (DEC-148 #54; en V1 la alerta de E3-HU-016): el último
+// mensaje aceptado es del cliente, así que AI27 no ha respondido después. Se deriva
+// del orden canónico de mensajes: se activa en la misma tx que acepta el mensaje
+// del cliente y se apaga en la que acepta la respuesta, sin estado aparte.
+const CondicionSinRespuesta = `EXISTS (SELECT 1 FROM mensajeria.mensaje m
+	 WHERE m.conversacion_id = c.id AND m.tenant_id = c.tenant_id
+	   AND m.secuencia = c.siguiente_secuencia
+	   AND (m.rol_al_enviar IS NULL OR m.rol_al_enviar = 'cliente'))`
+
 // Tipos de conversación que cada bandeja de trabajo sirve.
 const (
 	TipoViaje     = "viaje"
@@ -293,7 +303,8 @@ func (s *Servicio) consultar(ctx context.Context, tipo, lector, filtro string, a
 		        COALESCE(rec.version,
 		                 (SELECT max(h.version) FROM mensajeria.reclamo h
 		                   WHERE h.conversacion_id = c.id AND h.tenant_id = c.tenant_id),
-		                 0) AS version_reclamo
+		                 0) AS version_reclamo,
+		        `+CondicionSinRespuesta+` AS sin_respuesta
 		   FROM mensajeria.ruta_conversacion r
 		   JOIN mensajeria.conversacion c
 		     ON c.id = r.conversacion_id AND c.tenant_id = r.tenant_id
@@ -313,11 +324,12 @@ func (s *Servicio) consultar(ctx context.Context, tipo, lector, filtro string, a
 		var (
 			id, viajeID, clienteID, estado, tipoCol, bandejaCol string
 			siguienteSeq, versionReclamo                        int64
+			sinRespuesta                                        bool
 			escrituraHasta                                      *time.Time
 			creadoEn                                            time.Time
 		)
 		if err := rows.Scan(&id, &viajeID, &clienteID, &estado, &tipoCol, &siguienteSeq,
-			&escrituraHasta, &creadoEn, &bandejaCol, &versionReclamo); err != nil {
+			&escrituraHasta, &creadoEn, &bandejaCol, &versionReclamo, &sinRespuesta); err != nil {
 			return nil, fmt.Errorf("bandejas: escanear conversación: %w", err)
 		}
 		bid := uuid.MustParse(bandejaCol)
@@ -330,6 +342,7 @@ func (s *Servicio) consultar(ctx context.Context, tipo, lector, filtro string, a
 			Estado:          msgclient.EstadoConversacion(estado),
 			UltimaSecuencia: siguienteSeq,
 			VersionReclamo:  versionReclamo,
+			SinRespuesta:    &sinRespuesta,
 			AbiertaEn:       creadoEn,
 		}
 		if escrituraHasta != nil {

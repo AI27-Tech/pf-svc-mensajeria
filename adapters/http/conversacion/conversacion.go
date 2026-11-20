@@ -41,6 +41,9 @@ type Reclamador interface {
 	Reclamar(ctx context.Context, tenantID, conversacionID, actorReal string, esperada msgtipos.VersionReclamo) (msgtipos.VersionReclamo, error)
 	Liberar(ctx context.Context, tenantID, conversacionID, reclamoID, actorReal string, esperada msgtipos.VersionReclamo) error
 	Transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo) error
+	// TransferirComoAdministrador es la intervención del administrador en la
+	// conversación de la solicitud (DEC-148 #20, #47).
+	TransferirComoAdministrador(ctx context.Context, tenantID, conversacionID, administrador, destino, motivo string, esperada msgtipos.VersionReclamo) error
 }
 
 // LectorReclamo hidrata el Reclamo del contrato desde la fila recién escrita. La
@@ -127,7 +130,17 @@ func (h Handlers) obtener(w http.ResponseWriter, r *http.Request) {
 		escribirError(w, traducir(err))
 		return
 	}
-	escribirJSON(w, http.StatusOK, conv)
+	escribirJSON(w, http.StatusOK, ParaAudiencia(conv, claims))
+}
+
+// ParaAudiencia quita de la conversación lo que su audiencia no ve:
+// `sin_respuesta` es solo del lado Interno (DEC-148 #54). El resto de los campos
+// solo-interno los recorta el consumidor (bff), como hasta ahora.
+func ParaAudiencia(conv *msgclient.Conversacion, claims *auth.Claims) *msgclient.Conversacion {
+	if claims.Audiencia == auth.AudienciaCliente {
+		conv.SinRespuesta = nil
+	}
+	return conv
 }
 
 // obtenerDeViaje atiende GET /api/v1/viajes/{id}/conversacion
@@ -207,7 +220,7 @@ func (h Handlers) obtenerPorRecurso(ctx context.Context, claims *auth.Claims, re
 	if err != nil {
 		return nil, traducir(err)
 	}
-	return conv, nil
+	return ParaAudiencia(conv, claims), nil
 }
 
 // listarMensajes atiende GET /api/v1/conversaciones/{id}/mensajes: historia por
@@ -380,8 +393,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 		motivo = *entrada.Motivo
 	}
 
-	err = h.Reclamos.Transferir(r.Context(), tenant, convID, claims.Subject,
-		entrada.ResponsableDestinoId.String(), motivo, msgtipos.VersionReclamo(entrada.VersionEsperada))
+	err = h.Transferir(r.Context(), claims, tenant, convID, entrada, motivo)
 	if err != nil {
 		escribirError(w, TraducirReclamo(err))
 		return
@@ -393,6 +405,18 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	escribirJSON(w, http.StatusCreated, reclamo)
+}
+
+// Transferir elige la transferencia según el rol: el administrador interviene
+// (solo la conversación de la solicitud, que la guarda ya le restringe), el resto
+// transfiere su propio reclamo. Exportada para que la superficie en proceso siga
+// el MISMO camino.
+func (h Handlers) Transferir(ctx context.Context, claims *auth.Claims, tenant, convID string, entrada msgclient.TransferenciaEntrada, motivo string) error {
+	destino, version := entrada.ResponsableDestinoId.String(), msgtipos.VersionReclamo(entrada.VersionEsperada)
+	if claims.Rol == RolAdministrador {
+		return h.Reclamos.TransferirComoAdministrador(ctx, tenant, convID, claims.Subject, destino, motivo, version)
+	}
+	return h.Reclamos.Transferir(ctx, tenant, convID, claims.Subject, destino, motivo, version)
 }
 
 // enviar escribe un mensaje en la conversación. Exige claims, autoriza (DEC-097),
@@ -522,6 +546,8 @@ func TraducirReclamo(err error) error {
 		return platformerrors.NewNoEncontrado("reclamo no encontrado")
 	case errors.Is(err, reclamos.ErrNoEsResponsable):
 		return platformerrors.NewProhibido("solo el responsable activo libera o transfiere")
+	case errors.Is(err, reclamos.ErrDestinoNoEsCotizacion):
+		return platformerrors.NewConflictoCodigo("destino_no_es_cotizacion", "mensajeria: destino_no_es_cotizacion")
 	}
 	return traducir(err)
 }
