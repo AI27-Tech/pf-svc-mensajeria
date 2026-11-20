@@ -18,8 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"time"
 
+	"github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/estados"
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/bandejas"
@@ -823,17 +826,28 @@ func (s *Servicio) CerrarVentana(ctx context.Context, viajeID, motivoCierre stri
 // desde que termina, por cualquier vía, incluido APROBADO (DEC-148 #30, #48).
 const ventanaSolicitud = 3 * 24 * time.Hour
 
-// Estados de la solicitud (contracts/estados/solicitud.estados.yaml) que
-// mensajeria distingue. Los terminales y VENCIDA cierran la ventana; cualquier
-// otro (SOLICITADO, COTIZADO, PAGADO) la reabre. Se comparan como tokens del
-// evento, no con el enum de operacion: mensajeria no importa ese cliente.
-const (
-	EstadoSolicitudVencida = "VENCIDA"
-)
+// estadosSolicitudAbiertos son los estados que reabren la ventana de escritura
+// (SOLICITADO, COTIZADO y, tras VENCIDA, PAGADO). Es lista explícita: un estado
+// que el contrato agregue y no figure aquí, ni como terminal ni como VENCIDA, no
+// mueve la ventana (falla cerrado) hasta que se decida qué hace; la prueba
+// TestEstadosSolicitudCubiertos obliga a decidirlo.
+var estadosSolicitudAbiertos = []estados.EstadoSolicitud{
+	estados.EstadoSolicitudSolicitado,
+	estados.EstadoSolicitudCotizado,
+	estados.EstadoSolicitudPagado,
+}
 
-var estadosSolicitudTerminales = map[string]bool{
-	"APROBADO": true, "RECHAZADO_POR_AI27": true,
-	"RECHAZADO_POR_CLIENTE": true, "CANCELADO_POR_CLIENTE": true,
+// efectoVentana dice qué hace el estado con la ventana: cerrarla (terminal o
+// VENCIDA), abrirla, o nada si el estado no lo conoce el contrato vigente.
+func efectoVentana(aEstado string) (cierra, conocido bool) {
+	e := estados.EstadoSolicitud(aEstado)
+	switch {
+	case e.EsTerminal() || e == estados.EstadoSolicitudVencida:
+		return true, true
+	case slices.Contains(estadosSolicitudAbiertos, e):
+		return false, true
+	}
+	return false, false
 }
 
 // CrearSolicitudPorEvento crea la conversación `tipo=solicitud` al consumir
@@ -888,7 +902,10 @@ func crearSolicitud(ctx context.Context, tx pgx.Tx, in EntradaCreacion) (bool, e
 //
 //   - estado terminal (APROBADO, RECHAZADO_*, CANCELADO_*) o VENCIDA: la
 //     ventana corre 3 días desde cambiadoEn;
-//   - cualquier otro estado (por ejemplo VENCIDA → PAGADO): la reabre, sin límite.
+//   - SOLICITADO, COTIZADO o PAGADO (por ejemplo VENCIDA → PAGADO): la reabre,
+//     sin límite;
+//   - un estado que el contrato no declara o que esta lista no contempla: no
+//     toca la ventana y se registra en el log.
 //
 // Si la conversación aún no existe (el evento llegó antes que solicitud.creada)
 // la crea, así el efecto no se pierde. Convergente: ventana_aplicada_en guarda el
@@ -898,8 +915,14 @@ func (s *Servicio) AplicarEstadoSolicitud(ctx context.Context, solicitudID, clie
 	if solicitudID == "" || clienteID == "" || aEstado == "" || cambiadoEn.IsZero() {
 		return fmt.Errorf("conversacion: estado de solicitud inválido: faltan solicitud_id, cliente_id, a_estado o cambiado_en")
 	}
+	cierra, conocido := efectoVentana(aEstado)
+	if !conocido {
+		slog.WarnContext(ctx, "mensajeria: estado de solicitud desconocido, la ventana no cambia",
+			slog.String("solicitud_id", solicitudID), slog.String("a_estado", aEstado))
+		return nil
+	}
 	var hasta *time.Time
-	if estadosSolicitudTerminales[aEstado] || aEstado == EstadoSolicitudVencida {
+	if cierra {
 		h := cambiadoEn.Add(ventanaSolicitud)
 		hasta = &h
 	}

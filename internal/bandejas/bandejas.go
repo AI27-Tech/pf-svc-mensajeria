@@ -241,7 +241,12 @@ const (
 )
 
 // revisionChat es la revisión de la unión de bandejas de chat: la máxima (0 si
-// no hay ninguna).
+// no hay ninguna). La comparten las rutas de viaje y las de solicitud, porque
+// ambas viven en la bandeja física de chat: la actividad de una solicitud sube
+// la revisión que ve el Ejecutivo, que verá saltos de revisión sin
+// conversaciones nuevas en su bandeja (el catch-up devuelve vacío; no se expone
+// contenido de la solicitud). No se separan las revisiones: hacerlo exige otro
+// cursor en el contrato.
 func (s *Servicio) revisionChat(ctx context.Context) (int64, error) {
 	var rev int64
 	if err := s.db.QueryRow(ctx,

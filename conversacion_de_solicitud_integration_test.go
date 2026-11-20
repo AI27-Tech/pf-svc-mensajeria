@@ -154,11 +154,38 @@ func TestConversacionDeSolicitud(t *testing.T) {
 				t.Errorf("%s mensajes: %v, quiere prohibido", rol, err)
 			}
 		}
+		// El cliente de OTRA empresa no se entera de que existe: 404, no 403.
+		if _, err := api.ObtenerConversacion(ctxOtro, id); categoria(err) != platformerrors.CategoryNoEncontrado {
+			t.Errorf("otro cliente obtener: %v, quiere no_encontrado", err)
+		}
+		if _, err := api.ListarMensajes(ctxOtro, id, msgclient.ListarMensajesParams{}); categoria(err) != platformerrors.CategoryNoEncontrado {
+			t.Errorf("otro cliente mensajes: %v, quiere no_encontrado", err)
+		}
+		if st := get(ctxOtro, "/api/v1/conversaciones/"+id.String()); st != http.StatusNotFound {
+			t.Errorf("otro cliente por HTTP: %d, quiere 404", st)
+		}
 		if _, err := api.ObtenerConversacion(interno("cotizacion"), id); err != nil {
 			t.Errorf("cotizacion obtener: %v", err)
 		}
 		if _, err := api.ObtenerConversacion(ctxCliente, id); err != nil {
 			t.Errorf("cliente obtener: %v", err)
+		}
+	})
+
+	// Al revés: la audiencia de la solicitud no se extiende a la conversación del viaje.
+	t.Run("cotizacion y administrador no leen el viaje por id", func(t *testing.T) {
+		viaje, err := api.ObtenerConversacionDeViaje(interno("ejecutivo"), uuid.MustParse(compartido))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := viaje.Id
+		for _, rol := range []string{"cotizacion", "administrador"} {
+			if _, err := api.ObtenerConversacion(interno(rol), id); categoria(err) != platformerrors.CategoryProhibido {
+				t.Errorf("%s obtener: %v, quiere prohibido", rol, err)
+			}
+			if st := get(interno(rol), "/api/v1/conversaciones/"+id.String()); st != http.StatusForbidden {
+				t.Errorf("%s por HTTP: %d, quiere 403", rol, st)
+			}
 		}
 	})
 
