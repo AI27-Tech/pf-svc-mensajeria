@@ -32,6 +32,7 @@ type Ejecutor interface {
 // el instante del hecho llega con un nombre distinto por evento.
 type payloadRol struct {
 	SujetoID      string    `json:"sujeto_id"`
+	IdpSubject    string    `json:"idp_subject"` // `sub` del token; vacío en eventos de antes de tracer.46
 	Rol           string    `json:"rol"`
 	AsignadoEn    time.Time `json:"asignado_en"`
 	RevocadoEn    time.Time `json:"revocado_en"`
@@ -47,6 +48,12 @@ type ConsumidorRoles struct{ db Ejecutor }
 func NuevoConsumidorRoles(db Ejecutor) *ConsumidorRoles { return &ConsumidorRoles{db: db} }
 
 const (
+	// El idp_subject se escribe aparte y sin guarda de tiempo: es un atributo fijo del
+	// sujeto, no un hecho que se reordene, y un evento viejo también puede traerlo.
+	// Vacío nunca se escribe, así que un evento viejo no borra uno ya conocido.
+	sqlIdp = `INSERT INTO mensajeria.rol_sujeto (sujeto_id, idp_subject) VALUES ($1, $2)
+		ON CONFLICT (sujeto_id) DO UPDATE SET idp_subject = EXCLUDED.idp_subject
+		 WHERE rol_sujeto.idp_subject IS DISTINCT FROM EXCLUDED.idp_subject`
 	sqlAsignado = `INSERT INTO mensajeria.rol_sujeto (sujeto_id, rol, rol_en) VALUES ($1, $2, $3)
 		ON CONFLICT (sujeto_id) DO UPDATE SET rol = EXCLUDED.rol, rol_en = EXCLUDED.rol_en
 		 WHERE rol_sujeto.rol_en IS NULL OR rol_sujeto.rol_en <= EXCLUDED.rol_en`
@@ -68,27 +75,43 @@ func (c *ConsumidorRoles) Procesar(ctx context.Context, s bus.Sobre) error {
 		return nil
 	}
 	var err error
+	// Con idp_subject, se registra antes del hecho: el UPSERT crea la fila si falta.
+	idp := func() error {
+		if p.IdpSubject == "" {
+			return nil
+		}
+		_, err := c.db.Exec(ctx, sqlIdp, p.SujetoID, p.IdpSubject)
+		return err
+	}
 	switch s.Tipo {
 	case TipoRolAsignado:
 		if p.Rol == "" || p.AsignadoEn.IsZero() {
 			return nil
 		}
-		_, err = c.db.Exec(ctx, sqlAsignado, p.SujetoID, p.Rol, p.AsignadoEn.UTC())
+		if err = idp(); err == nil {
+			_, err = c.db.Exec(ctx, sqlAsignado, p.SujetoID, p.Rol, p.AsignadoEn.UTC())
+		}
 	case TipoRolRevocado:
 		if p.Rol == "" || p.RevocadoEn.IsZero() {
 			return nil
 		}
-		_, err = c.db.Exec(ctx, sqlRevocado, p.SujetoID, p.Rol, p.RevocadoEn.UTC())
+		if err = idp(); err == nil {
+			_, err = c.db.Exec(ctx, sqlRevocado, p.SujetoID, p.Rol, p.RevocadoEn.UTC())
+		}
 	case TipoSujetoDesactivado:
 		if p.DesactivadoEn.IsZero() {
 			return nil
 		}
-		_, err = c.db.Exec(ctx, sqlActivo, p.SujetoID, false, p.DesactivadoEn.UTC())
+		if err = idp(); err == nil {
+			_, err = c.db.Exec(ctx, sqlActivo, p.SujetoID, false, p.DesactivadoEn.UTC())
+		}
 	case TipoSujetoReactivado:
 		if p.ReactivadoEn.IsZero() {
 			return nil
 		}
-		_, err = c.db.Exec(ctx, sqlActivo, p.SujetoID, true, p.ReactivadoEn.UTC())
+		if err = idp(); err == nil {
+			_, err = c.db.Exec(ctx, sqlActivo, p.SujetoID, true, p.ReactivadoEn.UTC())
+		}
 	default:
 		return nil
 	}

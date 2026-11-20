@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 2026-11-20 17:00 — El destino de una transferencia se resuelve por `idp_subject` (DEC-148 #31; tracer.46)
+
+**Para quién:** `pf-svc-identidad` (debe emitir `idp_subject` en los cuatro eventos de rol; PR paralelo) y quien opere la base de mensajeria.
+
+**Resumen:** cierra la pregunta abierta de «El pool de `cotizacion`». El reclamo guarda el `sub` del token (`actor_real`), y `responsable_destino_id` es ese `sub`; `rol_sujeto` se buscaba por `sujeto_id`, así que un destino válido no coincidía. Ahora la validación busca por `idp_subject`.
+
+**Comportamiento:**
+- `rol_sujeto` guarda `idp_subject` y la transferencia en `tipo=solicitud` busca por él. `sujeto_id` sigue siendo la clave de la proyección, porque es lo que traen los eventos.
+- Falla cerrado: un sujeto sin `idp_subject` conocido no es destino válido (`409 destino_no_es_cotizacion`). Un `sujeto_id` pasado como destino tampoco lo es.
+- **Backfill sin script.** Las filas existentes quedan con `idp_subject` NULL y se completan solas con el siguiente evento de identidad del sujeto (`rol.asignado`, `rol.revocado`, `sujeto.desactivado` o `sujeto.reactivado`) que lo traiga. Un evento sin `idp_subject` (publicado antes de tracer.46) no borra uno ya conocido. El `idp_subject` se escribe sin guarda de tiempo: es un atributo fijo, no un hecho que se reordene. Hasta que un sujeto emita un evento nuevo, no es destino de transferencia. Alternativa descartada: reiniciar el durable `mensajeria-roles` para releer el historial; no sirve, porque los eventos ya publicados no traen `idp_subject`.
+
+**Cambios:**
+- `migrations/mensajeria/0013_rol_sujeto_idp_subject.sql`: columna `idp_subject` e índice. Aditiva e idempotente, sin cambio de grants.
+- `internal/pool/roles.go`: lee `idp_subject` y lo registra antes de aplicar el hecho (UPSERT; crea la fila si falta).
+- `internal/reclamos/reclamos.go`: la consulta del rol del destino filtra por `idp_subject`.
+- Pin de `pf-pkg-contracts/api-client-go` a `v0.1.0-tracer.46` (sin renombres de constantes; `go build` limpio).
+- Pruebas: unitarias del consumidor (`internal/pool/roles_test.go`) e integración (`TestPoolCotizacion`: sin `idp_subject` falla cerrado, el siguiente evento lo completa, uno viejo no lo borra, `sujeto_id` no vale como destino).
+
 ## 2026-11-20 15:30 — El pool de `cotizacion` atiende la conversación de la solicitud (DEC-148 #20, #28, #31, #45 a #47, #54; tracer.45)
 
 **Para quién:** `pf-svc-bff` y `pf-svc-core` (reclamo, liberación y transferencia ya valen para `tipo=solicitud`), el panel interno (bandeja de `cotizacion`, aviso de mensaje sin respuesta) y `pf-svc-identidad` (debe publicar los eventos de rol hacia el durable nuevo). Se apila sobre «La conversación de la solicitud».

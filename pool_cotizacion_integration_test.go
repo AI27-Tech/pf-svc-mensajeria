@@ -75,7 +75,7 @@ func TestPoolCotizacion(t *testing.T) {
 	hecho := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
 	asignar := func(sujeto, rol string, en time.Time) {
 		t.Helper()
-		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: sujeto, TenantId: "ai27", Rol: rol, AsignadoEn: timestamppb.New(en)})
+		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: sujeto, IdpSubject: sujeto, TenantId: "ai27", Rol: rol, AsignadoEn: timestamppb.New(en)})
 		publicar(pool.TipoRolAsignado, js)
 	}
 	for _, c := range [][2]string{{cot1, "cotizacion"}, {cot2, "cotizacion"}, {eje, "ejecutivo"}, {adm, "administrador"}} {
@@ -382,6 +382,33 @@ func TestPoolCotizacion(t *testing.T) {
 			actor != nuevo.ResponsableId.String() || ver != nuevo.Version {
 			t.Errorf("el reclamo cambió: %s v%d (err %v)", actor, ver, err)
 		}
+	})
+
+	t.Run("el destino se resuelve por idp_subject (el sub del token), no por sujeto_id", func(t *testing.T) {
+		dueno := como(nuevo.ResponsableId.String(), "cotizacion")
+		sujeto, sub := uuid.NewString(), uuid.NewString() // el contrato exige uuid en responsable_destino_id
+		transferir := func(destino string) int {
+			return dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": destino}).code
+		}
+		asignarCon := func(idp string) {
+			js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: sujeto, IdpSubject: idp, TenantId: "ai27", Rol: "cotizacion", AsignadoEn: timestamppb.New(hecho)})
+			publicar(pool.TipoRolAsignado, js)
+		}
+		asignarCon("") // evento anterior a tracer.46: sin idp_subject
+		for _, destino := range []string{sujeto, sub} {
+			if got := transferir(destino); got != http.StatusConflict {
+				t.Errorf("sin idp_subject, destino %s: %d, quiere 409 (falla cerrado)", destino, got)
+			}
+		}
+		asignarCon(sub) // el siguiente evento del sujeto lo completa
+		asignarCon("")  // un evento viejo posterior no lo borra
+		if got := transferir(sujeto); got != http.StatusConflict {
+			t.Errorf("destino por sujeto_id: %d, quiere 409", got)
+		}
+		if got := transferir(sub); got != http.StatusCreated {
+			t.Fatalf("destino por sub: %d, quiere 201", got)
+		}
+		nuevo = reclamoActivo(t, ctx, rp, convSol)
 	})
 
 	t.Run("un destino al que se le revoca el rol o se desactiva deja de ser válido", func(t *testing.T) {
