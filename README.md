@@ -63,7 +63,7 @@ GRANT). 15 tablas: `conversacion`, `bandeja`, `pool_membresia`,
 `ruta_conversacion`, `reclamo`, `mensaje`, `cursor_participante`,
 `estado_atendido`, `adjunto`, `plantilla`, `trabajo_notificacion`,
 `intento_entrega`, `auditoria_mensajeria`, **`outbox`** e `inbox_evento`. Cuatro
-índices únicos parciales: una conversación activa por `(tenant_id, viaje_id)`; un
+índices únicos parciales: una conversación activa por `(tenant_id, viaje_id, tipo)` (`viaje` o `solicitud`, que comparten `viaje_id`); un
 reclamo activo por conversación; una ruta activa por conversación; un mensaje por
 `(conversacion_id, actor_real, client_message_id)`. Privilegio mínimo en `0002`
 (sin DELETE; `mensaje`/auditoría/`intento_entrega` append-only).

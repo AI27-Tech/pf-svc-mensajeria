@@ -131,7 +131,7 @@ func (s *Servicio) Trabajo(ctx context.Context, tenantID, bandejaID, lector stri
 	if err != nil {
 		return nil, 0, err
 	}
-	items, err := s.consultar(ctx, lector,
+	items, err := s.consultar(ctx, TipoViaje, lector,
 		`r.bandeja_id = $1 AND r.tenant_id = $2 AND r.activa`, bandejaID, tenantID)
 	if err != nil {
 		return nil, 0, err
@@ -153,7 +153,7 @@ func (s *Servicio) CambiosDesde(ctx context.Context, tenantID, bandejaID, lector
 	if err != nil {
 		return nil, 0, false, err
 	}
-	items, err := s.consultar(ctx, lector,
+	items, err := s.consultar(ctx, TipoViaje, lector,
 		`r.bandeja_id = $1 AND r.tenant_id = $2 AND r.revision > $3`, bandejaID, tenantID, desde)
 	if err != nil {
 		return nil, 0, false, err
@@ -174,7 +174,7 @@ func (s *Servicio) TrabajoChat(ctx context.Context, lector string) ([]msgclient.
 	if err != nil {
 		return nil, 0, err
 	}
-	items, err := s.consultar(ctx, lector, `b.tipo = 'chat' AND r.activa`)
+	items, err := s.consultar(ctx, TipoViaje, lector, `b.tipo = 'chat' AND r.activa`)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -195,12 +195,50 @@ func (s *Servicio) CambiosChatDesde(ctx context.Context, lector string, desde in
 	if err != nil {
 		return nil, 0, false, err
 	}
-	items, err := s.consultar(ctx, lector, `b.tipo = 'chat' AND r.revision > $1`, desde)
+	items, err := s.consultar(ctx, TipoViaje, lector, `b.tipo = 'chat' AND r.revision > $1`, desde)
 	if err != nil {
 		return nil, 0, false, err
 	}
 	return items, rev, false, nil
 }
+
+// TrabajoSolicitudes es el BOOTSTRAP de la bandeja de solicitudes del pool de
+// `cotizacion` (listarTrabajoMiBandejaSolicitudes, DEC-148 #31): las
+// conversaciones `tipo=solicitud` de todos los tenants, con su revisión. Comparte
+// con la de chat la ruta, la bandeja física y la revisión (EnrutarABandejaUnica
+// estampa ambas), así que el catch-up es el mismo. Sin lector: no hay conversaciones
+// de solicitud dirigidas a nadie, el pool es uno solo.
+func (s *Servicio) TrabajoSolicitudes(ctx context.Context) ([]msgclient.Conversacion, int64, error) {
+	rev, err := s.revisionChat(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	items, err := s.consultar(ctx, TipoSolicitud, "", `b.tipo = 'chat' AND r.activa`)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, rev, nil
+}
+
+// CambiosSolicitudesDesde es el CATCH-UP de TrabajoSolicitudes: rutas con
+// revisión mayor a `desde`, incluidas las inactivas.
+func (s *Servicio) CambiosSolicitudesDesde(ctx context.Context, desde int64) ([]msgclient.Conversacion, int64, bool, error) {
+	rev, err := s.revisionChat(ctx)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	items, err := s.consultar(ctx, TipoSolicitud, "", `b.tipo = 'chat' AND r.revision > $1`, desde)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return items, rev, false, nil
+}
+
+// Tipos de conversación que cada bandeja de trabajo sirve.
+const (
+	TipoViaje     = "viaje"
+	TipoSolicitud = "solicitud"
+)
 
 // revisionChat es la revisión de la unión de bandejas de chat: la máxima (0 si
 // no hay ninguna).
@@ -238,14 +276,19 @@ func (s *Servicio) revisionColeccion(ctx context.Context, tenantID, bandejaID st
 // que se reclama desde el pool. El filtro y sus args los pone el llamador
 // (bootstrap: activa; catch-up: revision > desde); consultar le agrega la
 // visibilidad del lector (vinculo.CondicionVisible). b es la bandeja de la ruta.
-func (s *Servicio) consultar(ctx context.Context, lector, filtro string, args ...any) ([]msgclient.Conversacion, error) {
+func (s *Servicio) consultar(ctx context.Context, tipo, lector, filtro string, args ...any) ([]msgclient.Conversacion, error) {
+	// El tipo se filtra siempre: la conversación de la solicitud y la del viaje
+	// comparten bandeja de chat y viaje_id, pero cada bandeja de trabajo sirve
+	// solo la suya (DEC-148 #12, #28).
+	args = append(args, tipo)
+	filtro += fmt.Sprintf(` AND c.tipo = $%d`, len(args))
 	n := len(args)
 	donde := `WHERE ` + filtro + ` AND ` +
 		vinculo.CondicionVisible(fmt.Sprintf("$%d", n+1), fmt.Sprintf("$%d", n+2)) +
 		` ORDER BY r.revision, r.id`
 	args = append(args, lector, s.Ventana.Segundos())
 	rows, err := s.db.Query(ctx,
-		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.siguiente_secuencia,
+		`SELECT c.id, c.viaje_id, c.cliente_id, c.estado, c.tipo, c.siguiente_secuencia,
 		        c.escritura_hasta, c.creado_en, r.bandeja_id,
 		        COALESCE(rec.version,
 		                 (SELECT max(h.version) FROM mensajeria.reclamo h
@@ -268,12 +311,12 @@ func (s *Servicio) consultar(ctx context.Context, lector, filtro string, args ..
 	var items []msgclient.Conversacion
 	for rows.Next() {
 		var (
-			id, viajeID, clienteID, estado, bandejaCol string
-			siguienteSeq, versionReclamo               int64
-			escrituraHasta                             *time.Time
-			creadoEn                                   time.Time
+			id, viajeID, clienteID, estado, tipoCol, bandejaCol string
+			siguienteSeq, versionReclamo                        int64
+			escrituraHasta                                      *time.Time
+			creadoEn                                            time.Time
 		)
-		if err := rows.Scan(&id, &viajeID, &clienteID, &estado, &siguienteSeq,
+		if err := rows.Scan(&id, &viajeID, &clienteID, &estado, &tipoCol, &siguienteSeq,
 			&escrituraHasta, &creadoEn, &bandejaCol, &versionReclamo); err != nil {
 			return nil, fmt.Errorf("bandejas: escanear conversación: %w", err)
 		}
@@ -281,6 +324,7 @@ func (s *Servicio) consultar(ctx context.Context, lector, filtro string, args ..
 		conv := msgclient.Conversacion{
 			Id:              uuid.MustParse(id),
 			ViajeId:         uuid.MustParse(viajeID),
+			Tipo:            &tipoCol,
 			ClienteId:       uuid.MustParse(clienteID),
 			BandejaId:       &bid,
 			Estado:          msgclient.EstadoConversacion(estado),

@@ -116,6 +116,9 @@ type Module struct {
 	// sin Subscriber.
 	consumidorHabilitada worker.Worker
 	consumidorCerrado    worker.Worker
+	// consumidorSolicitud es el worker durable de la conversación de la solicitud
+	// (solicitud.creada y solicitud.estado_cambiado). nil sin Subscriber.
+	consumidorSolicitud worker.Worker
 	// alcance es la proyección de alcance.cambiado (sujeto → clientes efectivos,
 	// DEC-149) en mensajeria.alcance_sujeto. La lee la guarda de alcance de las
 	// emergencias del viaje; la escribe consumidorAlcance. Siempre existe: sin
@@ -207,6 +210,20 @@ func New(p Pools, d Deps) (*Module, error) {
 		}
 		m.consumidorCerrado = wCer
 
+		// Conversación de la solicitud (DEC-148 #5, #30, #48): los dos eventos en
+		// una sola suscripción para conservar el orden por solicitud_id.
+		consSol := consumidores.NuevoConsumidorSolicitud(m.conversacion)
+		wSol, err := d.Subscriber.Subscribe(
+			"mensajeria-conversacion-solicitud",
+			bus.SensibilidadAmplia,
+			consumidores.TiposSolicitud,
+			consSol.Procesar,
+		)
+		if err != nil {
+			return nil, err
+		}
+		m.consumidorSolicitud = wSol
+
 		// Consumidor durable de alcance.cambiado (DEC-149 #20): mantiene la
 		// proyección en Postgres, compartida por las réplicas. Con Alcances, la
 		// reconstrucción por snapshot + cursor lo envuelve y deja la réplica
@@ -260,6 +277,8 @@ func (m *Module) Routes(mux *http.ServeMux) {
 //   - el consumidor durable de catalogo.actualizado (invalida caché de clientes);
 //   - los dos consumidores durables del ciclo de vida de la conversación por
 //     evento del viaje (E3-T1): viaje.mensajeria_habilitada y viaje.cerrado;
+//   - el consumidor durable de la conversación de la solicitud
+//     (solicitud.creada y solicitud.estado_cambiado, DEC-148);
 //   - el consumidor durable de alcance.cambiado (DEC-149 #20), envuelto por la
 //     reconstrucción con listarAlcances si hay Deps.Alcances: su Ready es
 //     not-ready hasta converger (worker alcance.NombreWorker).
@@ -283,6 +302,9 @@ func (m *Module) Workers() []worker.Worker {
 	}
 	if m.consumidorCerrado != nil {
 		ws = append(ws, m.consumidorCerrado)
+	}
+	if m.consumidorSolicitud != nil {
+		ws = append(ws, m.consumidorSolicitud)
 	}
 	if m.consumidorAlcance != nil {
 		ws = append(ws, m.consumidorAlcance)

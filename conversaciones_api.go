@@ -38,6 +38,8 @@ type ConversacionesAPI interface {
 	ListarMensajes(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarMensajesParams) (*msgclient.PaginaMensajes, error)
 	EnviarMensaje(ctx context.Context, conversacionID msgclient.Id, body msgclient.EnviarMensajeEntrada) (*msgclient.Mensaje, error)
 	ListarTrabajoBandeja(ctx context.Context, params msgclient.ListarTrabajoMiBandejaParams) (*msgclient.TrabajoBandeja, error)
+	ObtenerConversacionDeSolicitud(ctx context.Context, solicitudID msgclient.Id) (*msgclient.Conversacion, error)
+	ListarTrabajoMiBandejaSolicitudes(ctx context.Context, params msgclient.ListarTrabajoMiBandejaSolicitudesParams) (*msgclient.TrabajoBandeja, error)
 	ReclamarConversacion(ctx context.Context, conversacionID msgclient.Id, body msgclient.VersionEsperadaEntrada) (*msgclient.Reclamo, error)
 	LiberarReclamo(ctx context.Context, conversacionID, reclamoID msgclient.Id, params msgclient.LiberarReclamoParams) error
 	TransferirConversacion(ctx context.Context, conversacionID msgclient.Id, body msgclient.TransferenciaEntrada) (*msgclient.Reclamo, error)
@@ -94,6 +96,50 @@ func (a *conversacionesAPI) ObtenerConversacionDeViaje(ctx context.Context, viaj
 		return nil, err
 	}
 	return a.conv.ObtenerDeViaje(ctx, claims, viajeID.String())
+}
+
+// ObtenerConversacionDeSolicitud recorre el MISMO camino que su handler
+// (convhttp.Handlers.ObtenerDeSolicitud): resolver por solicitud → acceso → lectura.
+func (a *conversacionesAPI) ObtenerConversacionDeSolicitud(ctx context.Context, solicitudID msgclient.Id) (*msgclient.Conversacion, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return a.conv.ObtenerDeSolicitud(ctx, claims, solicitudID.String())
+}
+
+// ListarTrabajoMiBandejaSolicitudes es la bandeja de solicitudes del pool de
+// `cotizacion` (DEC-148 #31), igual que su handler. Cursor se ignora, como en
+// ListarTrabajoBandeja.
+func (a *conversacionesAPI) ListarTrabajoMiBandejaSolicitudes(ctx context.Context, params msgclient.ListarTrabajoMiBandejaSolicitudesParams) (*msgclient.TrabajoBandeja, error) {
+	claims, err := claimsDe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Audiencia == auth.AudienciaCliente || !autorizacion.LeeBandejaSolicitudes(claims.Rol) {
+		return nil, platformerrors.NewNoEncontrado(bandejashttp.SinBandejaSolicitudes)
+	}
+
+	var (
+		items []msgclient.Conversacion
+		rev   int64
+		fuera bool
+	)
+	if params.DesdeRevision == nil {
+		items, rev, err = a.bandeja.Bandeja.TrabajoSolicitudes(ctx)
+	} else {
+		items, rev, fuera, err = a.bandeja.Bandeja.CambiosSolicitudesDesde(ctx, *params.DesdeRevision)
+	}
+	if err != nil {
+		return nil, traducir(err)
+	}
+	if fuera {
+		return nil, platformerrors.NewConflictoCodigo("stream_resync_required", "mensajeria: stream_resync_required")
+	}
+	if items == nil {
+		items = []msgclient.Conversacion{}
+	}
+	return &msgclient.TrabajoBandeja{Items: items, Revision: rev}, nil
 }
 
 func (a *conversacionesAPI) ListarMensajes(ctx context.Context, conversacionID msgclient.Id, params msgclient.ListarMensajesParams) (*msgclient.PaginaMensajes, error) {
