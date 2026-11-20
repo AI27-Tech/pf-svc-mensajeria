@@ -378,12 +378,14 @@ func (s *Servicio) transferir(ctx context.Context, tenantID, conversacionID, ori
 	}
 	// En la solicitud el destino debe ser `cotizacion` (DEC-148 #31). Se valida
 	// con el reclamo ya bloqueado y antes de cerrarlo: si falla, la tx se descarta
-	// y el reclamo del llamante no cambia.
+	// y el reclamo del llamante no cambia. `destino` es el `sub` del token
+	// (actor_real del reclamo), no el sujeto_id: se busca por idp_subject, y sin
+	// idp_subject conocido falla cerrado.
 	if tipo == tipoSolicitud {
 		var esCotizacion bool
 		if err := tx.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto
-			                 WHERE sujeto_id = $1 AND rol = 'cotizacion' AND activo)`,
+			                 WHERE idp_subject = $1 AND rol = 'cotizacion' AND activo)`,
 			destino).Scan(&esCotizacion); err != nil {
 			return fmt.Errorf("reclamos: leer el rol del destino: %w", err)
 		}
