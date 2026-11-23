@@ -444,6 +444,65 @@ func TestPoolCotizacion(t *testing.T) {
 	})
 
 	// --- Intervención del administrador ---------------------------------------
+	t.Run("los hechos fuera de orden convergen por tiempo, con idp_subject presente", func(t *testing.T) {
+		marshal := protojson.MarshalOptions{UseProtoNames: true}
+		type fila struct {
+			rol      *string
+			rolEn    *time.Time
+			activo   *bool
+			activoEn *time.Time
+			idp      *string
+		}
+		leer := func(sujeto string) (f fila) {
+			t.Helper()
+			if err := rp.QueryRow(ctx, `SELECT rol, rol_en, activo, activo_en, idp_subject FROM mensajeria.rol_sujeto WHERE sujeto_id = $1`, sujeto).
+				Scan(&f.rol, &f.rolEn, &f.activo, &f.activoEn, &f.idp); err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}
+		// Revocado (t+2h) antes que un asignado más viejo (t+1h): el asignado no reactiva el rol.
+		s1, sub1 := uuid.NewString(), uuid.NewString()
+		js, _ := marshal.Marshal(&eventosv1.RolRevocado{SujetoId: s1, IdpSubject: sub1, TenantId: "ai27", Rol: "cotizacion", RevocadoEn: timestamppb.New(hecho.Add(2 * time.Hour))})
+		publicar(pool.TipoRolRevocado, js)
+		js, _ = marshal.Marshal(&eventosv1.RolAsignado{SujetoId: s1, IdpSubject: sub1, TenantId: "ai27", Rol: "cotizacion", AsignadoEn: timestamppb.New(hecho.Add(time.Hour))})
+		publicar(pool.TipoRolAsignado, js)
+		publicar(pool.TipoRolAsignado, js) // reentrega: idempotente
+		if f := leer(s1); f.rol != nil || f.rolEn == nil || !f.rolEn.Equal(hecho.Add(2*time.Hour)) || f.idp == nil || *f.idp != sub1 {
+			t.Errorf("revocado antes que un asignado viejo: rol=%v rol_en=%v idp=%v; quiere rol NULL, rol_en t+2h, idp %s", f.rol, f.rolEn, f.idp, sub1)
+		}
+		// Un asignado más nuevo (t+3h) sí vuelve a dar el rol.
+		js, _ = marshal.Marshal(&eventosv1.RolAsignado{SujetoId: s1, IdpSubject: sub1, TenantId: "ai27", Rol: "cotizacion", AsignadoEn: timestamppb.New(hecho.Add(3 * time.Hour))})
+		publicar(pool.TipoRolAsignado, js)
+		if f := leer(s1); f.rol == nil || *f.rol != "cotizacion" {
+			t.Errorf("asignado más nuevo: rol=%v, quiere cotizacion", f.rol)
+		}
+		// Un revocado viejo (t+1h) no quita el rol dado en t+3h.
+		js, _ = marshal.Marshal(&eventosv1.RolRevocado{SujetoId: s1, IdpSubject: sub1, TenantId: "ai27", Rol: "cotizacion", RevocadoEn: timestamppb.New(hecho.Add(time.Hour))})
+		publicar(pool.TipoRolRevocado, js)
+		if f := leer(s1); f.rol == nil || *f.rol != "cotizacion" {
+			t.Errorf("revocado viejo: rol=%v, quiere cotizacion", f.rol)
+		}
+
+		// Desactivación/reactivación fuera de orden: reactivado (t+2h) llega antes que desactivado (t+1h).
+		s2, sub2 := uuid.NewString(), uuid.NewString()
+		js, _ = marshal.Marshal(&eventosv1.SujetoReactivado{SujetoId: s2, IdpSubject: sub2, TenantId: "ai27", ReactivadoEn: timestamppb.New(hecho.Add(2 * time.Hour))})
+		publicar(pool.TipoSujetoReactivado, js)
+		js, _ = marshal.Marshal(&eventosv1.SujetoDesactivado{SujetoId: s2, IdpSubject: sub2, TenantId: "ai27", DesactivadoEn: timestamppb.New(hecho.Add(time.Hour))})
+		publicar(pool.TipoSujetoDesactivado, js)
+		if f := leer(s2); f.activo == nil || !*f.activo || f.activoEn == nil || !f.activoEn.Equal(hecho.Add(2*time.Hour)) || f.idp == nil || *f.idp != sub2 {
+			t.Errorf("reactivado antes que un desactivado viejo: activo=%v activo_en=%v idp=%v", f.activo, f.activoEn, f.idp)
+		}
+		// Y al revés: desactivado (t+4h) llega antes que un reactivado viejo (t+3h).
+		js, _ = marshal.Marshal(&eventosv1.SujetoDesactivado{SujetoId: s2, IdpSubject: sub2, TenantId: "ai27", DesactivadoEn: timestamppb.New(hecho.Add(4 * time.Hour))})
+		publicar(pool.TipoSujetoDesactivado, js)
+		js, _ = marshal.Marshal(&eventosv1.SujetoReactivado{SujetoId: s2, IdpSubject: sub2, TenantId: "ai27", ReactivadoEn: timestamppb.New(hecho.Add(3 * time.Hour))})
+		publicar(pool.TipoSujetoReactivado, js)
+		if f := leer(s2); f.activo == nil || *f.activo {
+			t.Errorf("desactivado antes que un reactivado viejo: activo=%v, quiere false", f.activo)
+		}
+	})
+
 	t.Run("el administrador envía y transfiere, y queda auditado como override", func(t *testing.T) {
 		a := como(adm, "administrador")
 		if r := a("POST", rutaSol+"/mensajes", enviar(nil, "interviene")); r.code != http.StatusCreated {

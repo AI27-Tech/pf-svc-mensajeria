@@ -13,10 +13,10 @@
 
 **Cambios:**
 - `migrations/mensajeria/0013_rol_sujeto_idp_subject.sql`: columna `idp_subject` e índice. Aditiva e idempotente, sin cambio de grants.
-- `internal/pool/roles.go`: lee `idp_subject` y lo registra antes de aplicar el hecho (UPSERT; crea la fila si falta).
+- `internal/pool/roles.go`: lee `idp_subject` y lo registra en la MISMA sentencia que aplica el hecho (una por evento, atómica). Escribirlo aparte creaba la fila con `rol_en` NULL y perdía la lápida de un `rol.revocado` fuera de orden: un `rol.asignado` más viejo reactivaba el rol. Ahora la guarda de tiempo decide solo las columnas del hecho (`CASE`), `sqlRevocado` también fija `rol_en` cuando el sujeto no tiene rol (p. ej. fila creada antes por un `sujeto.desactivado`), y el `idp_subject` se escribe aunque el hecho sea viejo.
 - `internal/reclamos/reclamos.go`: la consulta del rol del destino filtra por `idp_subject`.
 - Pin de `pf-pkg-contracts/api-client-go` a `v0.1.0-tracer.46` (sin renombres de constantes; `go build` limpio).
-- Pruebas: unitarias del consumidor (`internal/pool/roles_test.go`) e integración (`TestPoolCotizacion`: sin `idp_subject` falla cerrado, el siguiente evento lo completa, uno viejo no lo borra, `sujeto_id` no vale como destino).
+- Pruebas: unitarias del consumidor (`internal/pool/roles_test.go`) e integración (`TestPoolCotizacion`: hechos fuera de orden con `idp_subject` —revocado antes que un asignado viejo, reactivado/desactivado invertidos—, que falla sin el arreglo; sin `idp_subject` falla cerrado, el siguiente evento lo completa, uno viejo no lo borra, `sujeto_id` no vale como destino).
 
 ## 2026-11-20 15:30 — El pool de `cotizacion` atiende la conversación de la solicitud (DEC-148 #20, #28, #31, #45 a #47, #54; tracer.45)
 
