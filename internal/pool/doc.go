@@ -15,4 +15,10 @@
 // sin implementar y no se abre todavía el consumidor de identidad en Workers().
 //
 // TODO(producto): vínculo Ejecutivo↔cliente para cerrar el cálculo de membresía.
+//
+// Lo único que hoy proyecta es el rol vigente de cada sujeto (roles.go,
+// mensajeria.rol_sujeto), para validar el destino de una transferencia en la
+// conversación de la solicitud: debe ser `cotizacion` (DEC-148 #31). La
+// membresía del pool de `cotizacion` es el rol mismo, sin filas por usuario:
+// un usuario nuevo lee el historial previo (DEC-148 #46).
 package pool

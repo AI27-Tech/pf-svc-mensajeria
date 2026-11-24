@@ -67,6 +67,15 @@ var ErrSinReclamo = errors.New("reclamos: sin reclamo activo")
 // el reclamo activo: solo su responsable lo libera o transfiere (DEC-118).
 var ErrNoEsResponsable = errors.New("reclamos: el actor no es el responsable activo")
 
+// ErrDestinoNoEsCotizacion lo devuelve Transferir en una conversación
+// `tipo=solicitud` cuando el destino no tiene el rol `cotizacion` vigente
+// (DEC-148 #31). No cambia nada: el reclamo del llamante sigue activo. La frontera
+// lo traduce a 409 con `codigo` destino_no_es_cotizacion.
+var ErrDestinoNoEsCotizacion = errors.New("reclamos: el destino no tiene el rol cotizacion")
+
+// tipoSolicitud es Conversacion.tipo de la conversación de la solicitud.
+const tipoSolicitud = "solicitud"
+
 // Begin abre una transacción. El pool de chat de svc_mensajeria la satisface.
 type Begin interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
@@ -172,13 +181,23 @@ func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actor
 	if hay || esperada != actual {
 		return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual}
 	}
-	// Dirigida a su dueño disponible (DEC-128 #2): solo él la reclama.
-	dueno, err := vinculo.DirigidaAOtro(ctx, tx, tenantID, conversacionID, actorReal, s.Ventana)
+	// El vínculo pegajoso (dueño del cliente y su dirección) es del `ejecutivo` y de
+	// la conversación del viaje. El pool de `cotizacion` es uno solo, sin vínculo
+	// por cliente (DEC-148 #31): en `tipo=solicitud` no se dirige ni se toma dueño.
+	tipo, err := tipoDe(ctx, tx, tenantID, conversacionID)
 	if err != nil {
 		return 0, err
 	}
-	if dueno != "" {
-		return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual, DirigidaA: dueno}
+	enSolicitud := tipo == tipoSolicitud
+	if !enSolicitud {
+		// Dirigida a su dueño disponible (DEC-128 #2): solo él la reclama.
+		dueno, err := vinculo.DirigidaAOtro(ctx, tx, tenantID, conversacionID, actorReal, s.Ventana)
+		if err != nil {
+			return 0, err
+		}
+		if dueno != "" {
+			return 0, ErrConflictoVersion{Esperada: esperada, Actual: actual, DirigidaA: dueno}
+		}
 	}
 	nueva := int64(actual) + 1
 	reclamoID, err := abrir(ctx, tx, tenantID, conversacionID, actorReal, nueva)
@@ -194,9 +213,12 @@ func (s *Servicio) reclamar(ctx context.Context, tenantID, conversacionID, actor
 
 	// El reclamo es actividad del Ejecutivo y puede hacerlo dueño del cliente
 	// (DEC-103 #2 y #3). El cambio de dueño queda en la auditoría del reclamo.
-	toma, err := vinculo.Tomar(ctx, tx, tenantID, conversacionID, actorReal, s.Ventana)
-	if err != nil {
-		return 0, err
+	var toma vinculo.Toma
+	if !enSolicitud {
+		toma, err = vinculo.Tomar(ctx, tx, tenantID, conversacionID, actorReal, s.Ventana)
+		if err != nil {
+			return 0, err
+		}
 	}
 	detalle := map[string]any{"reclamo_id": reclamoID, "version_esperada": esperada, "version_reclamo": nueva}
 	if toma.Nuevo {
@@ -271,7 +293,7 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclam
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	activo, err := tomarActivo(ctx, tx, tenantID, conversacionID, actorReal, esperada)
+	activo, err := tomarActivo(ctx, tx, tenantID, conversacionID, actorReal, esperada, false)
 	if err != nil {
 		return err
 	}
@@ -320,6 +342,19 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclam
 // la conversación, de modo que la previa queda obsoleta (P20). El motivo, si
 // viene, se audita (hecho inmutable, addendum §11).
 func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo) error {
+	return s.transferir(ctx, tenantID, conversacionID, origen, destino, motivo, esperada, false)
+}
+
+// TransferirComoAdministrador es Transferir con la intervención del
+// administrador (DEC-148 #20, #47): transfiere el reclamo activo aunque sea de
+// otro responsable. Si el administrador no es el responsable, la intervención
+// queda auditada como el override de Supervisor. Solo la conversación
+// `tipo=solicitud` lo admite; la frontera autoriza el rol antes de llamar aquí.
+func (s *Servicio) TransferirComoAdministrador(ctx context.Context, tenantID, conversacionID, administrador, destino, motivo string, esperada msgtipos.VersionReclamo) error {
+	return s.transferir(ctx, tenantID, conversacionID, administrador, destino, motivo, esperada, true)
+}
+
+func (s *Servicio) transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo, administrador bool) error {
 	if conversacionID == "" || destino == "" {
 		return fmt.Errorf("reclamos: transferencia inválida: faltan conversacion_id o responsable_destino")
 	}
@@ -330,9 +365,33 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, ori
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	anteriorID, err := tomarActivo(ctx, tx, tenantID, conversacionID, origen, esperada)
+	tipo, err := tipoDe(ctx, tx, tenantID, conversacionID)
 	if err != nil {
 		return err
+	}
+	if administrador && tipo != tipoSolicitud {
+		return ErrNoEsResponsable // el override del administrador es solo de la solicitud
+	}
+	anteriorID, err := tomarActivo(ctx, tx, tenantID, conversacionID, origen, esperada, administrador)
+	if err != nil {
+		return err
+	}
+	// En la solicitud el destino debe ser `cotizacion` (DEC-148 #31). Se valida
+	// con el reclamo ya bloqueado y antes de cerrarlo: si falla, la tx se descarta
+	// y el reclamo del llamante no cambia. `destino` es el `sub` del token
+	// (actor_real del reclamo), no el sujeto_id: se busca por idp_subject, y sin
+	// idp_subject conocido falla cerrado.
+	if tipo == tipoSolicitud {
+		var esCotizacion bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto
+			                 WHERE idp_subject = $1 AND rol = 'cotizacion' AND activo)`,
+			destino).Scan(&esCotizacion); err != nil {
+			return fmt.Errorf("reclamos: leer el rol del destino: %w", err)
+		}
+		if !esCotizacion {
+			return ErrDestinoNoEsCotizacion
+		}
 	}
 	actual, _, err := versionConversacion(ctx, tx, tenantID, conversacionID)
 	if err != nil {
@@ -362,6 +421,23 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, ori
 		Accion: auditoria.AccionReclamoTransferido, Detalle: detalle,
 	}); err != nil {
 		return err
+	}
+	// Intervención del administrador sobre un reclamo ajeno: se audita como el
+	// override de Supervisor (DEC-148 #47, E3-HU-016), con el responsable desplazado.
+	if administrador {
+		var anteriorResponsable string
+		if err := tx.QueryRow(ctx, `SELECT actor_real::text FROM mensajeria.reclamo WHERE id = $1`, anteriorID).Scan(&anteriorResponsable); err != nil {
+			return fmt.Errorf("reclamos: leer el responsable desplazado: %w", err)
+		}
+		if anteriorResponsable != origen {
+			if err := auditoria.Registrar(ctx, tx, auditoria.Registro{
+				TenantID: tenantID, ConversacionID: conversacionID, ActorReal: origen,
+				Accion:  auditoria.AccionOverrideAdministrador,
+				Detalle: map[string]any{"intervencion": "transferencia", "responsable_desplazado": anteriorResponsable, "reclamo_anterior_id": anteriorID},
+			}); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Publica conversacion.transferida en la MISMA tx (E3-T3): lleva el reclamo
@@ -450,12 +526,25 @@ func versionConversacion(ctx context.Context, tx pgx.Tx, tenantID, conversacionI
 	return msgtipos.VersionReclamo(v), hay, nil
 }
 
+// tipoDe lee el tipo de la conversación (`viaje` o `solicitud`).
+func tipoDe(ctx context.Context, tx pgx.Tx, tenantID, conversacionID string) (string, error) {
+	var tipo string
+	err := tx.QueryRow(ctx,
+		`SELECT tipo FROM mensajeria.conversacion WHERE id = $1 AND tenant_id = $2`,
+		conversacionID, tenantID).Scan(&tipo)
+	if err != nil {
+		return "", fmt.Errorf("reclamos: leer el tipo de la conversación: %w", err)
+	}
+	return tipo, nil
+}
+
 // tomarActivo bloquea el reclamo activo (FOR UPDATE: una liberación o
 // transferencia concurrente espera a esta tx) y lo valida en este orden: que
 // exista (ErrSinReclamo), que la versión esperada sea la vigente
 // (ErrConflictoVersion: una vista obsoleta se recarga antes de decidir) y que el
-// actor sea su responsable (ErrNoEsResponsable). Devuelve su id.
-func tomarActivo(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actor string, esperada msgtipos.VersionReclamo) (string, error) {
+// actor sea su responsable (ErrNoEsResponsable), salvo que `cualquiera` lo
+// omita (intervención del administrador). Devuelve su id.
+func tomarActivo(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actor string, esperada msgtipos.VersionReclamo, cualquiera bool) (string, error) {
 	var id, responsable string
 	var version int64
 	err := tx.QueryRow(ctx,
@@ -473,7 +562,7 @@ func tomarActivo(ctx context.Context, tx pgx.Tx, tenantID, conversacionID, actor
 	if version != int64(esperada) {
 		return "", ErrConflictoVersion{Esperada: esperada, Actual: msgtipos.VersionReclamo(version)}
 	}
-	if responsable != actor {
+	if responsable != actor && !cualquiera {
 		return "", ErrNoEsResponsable
 	}
 	return id, nil

@@ -35,11 +35,19 @@ type Trabajador interface {
 	// todos los tenants, la bandeja del sujeto interno (DEC-129).
 	TrabajoChat(ctx context.Context, lector string) ([]msgclient.Conversacion, int64, error)
 	CambiosChatDesde(ctx context.Context, lector string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
+	// TrabajoSolicitudes y CambiosSolicitudesDesde sirven la bandeja de
+	// solicitudes del pool de `cotizacion` (DEC-148 #31).
+	TrabajoSolicitudes(ctx context.Context) ([]msgclient.Conversacion, int64, error)
+	CambiosSolicitudesDesde(ctx context.Context, desde int64) ([]msgclient.Conversacion, int64, bool, error)
 }
 
 // SinBandejaChat es el mensaje del 404 de la bandeja del sujeto: rol que no la
 // ve. Lo comparte la superficie en proceso.
 const SinBandejaChat = "el sujeto no pertenece a ningún pool de chat"
+
+// SinBandejaSolicitudes es el mensaje del 404 de la bandeja de solicitudes: rol
+// que no pertenece al pool de `cotizacion` ni hereda su acceso.
+const SinBandejaSolicitudes = "el sujeto no pertenece al pool de solicitudes"
 
 // Handlers agrupa las dependencias del handler de bandejas.
 type Handlers struct {
@@ -51,6 +59,7 @@ type Handlers struct {
 func (h Handlers) Montar(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/bandejas/{id}/trabajo", h.trabajo)
 	mux.HandleFunc("GET /api/v1/bandeja/trabajo", h.miTrabajo)
+	mux.HandleFunc("GET /api/v1/bandeja/solicitudes", h.miTrabajoSolicitudes)
 }
 
 // trabajo sirve el trabajo de una bandeja NOMBRADA por {id} (uso administrativo).
@@ -99,6 +108,27 @@ func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
 		func() ([]msgclient.Conversacion, int64, error) { return h.Bandeja.TrabajoChat(r.Context(), lector) },
 		func(desde int64) ([]msgclient.Conversacion, int64, bool, error) {
 			return h.Bandeja.CambiosChatDesde(r.Context(), lector, desde)
+		})
+}
+
+// miTrabajoSolicitudes sirve la bandeja de solicitudes del sujeto, sin {id}
+// (listarTrabajoMiBandejaSolicitudes): solo conversaciones `tipo=solicitud`, de
+// todos los tenants. La ven `cotizacion` y, por herencia, el `administrador`;
+// cualquier otro rol y el cliente reciben 404 (DEC-148 #12, #28, #31).
+func (h Handlers) miTrabajoSolicitudes(w http.ResponseWriter, r *http.Request) {
+	claims := boundary.Claims(r.Context())
+	if claims == nil {
+		escribirError(w, platformerrors.NewNoAutorizado("sin claims"))
+		return
+	}
+	if claims.Audiencia == auth.AudienciaCliente || !autorizacion.LeeBandejaSolicitudes(claims.Rol) {
+		escribirError(w, platformerrors.NewNoEncontrado(SinBandejaSolicitudes))
+		return
+	}
+	h.servirTrabajo(w, r,
+		func() ([]msgclient.Conversacion, int64, error) { return h.Bandeja.TrabajoSolicitudes(r.Context()) },
+		func(desde int64) ([]msgclient.Conversacion, int64, bool, error) {
+			return h.Bandeja.CambiosSolicitudesDesde(r.Context(), desde)
 		})
 }
 
