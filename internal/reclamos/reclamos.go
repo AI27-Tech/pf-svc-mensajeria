@@ -69,8 +69,10 @@ var ErrNoEsResponsable = errors.New("reclamos: el actor no es el responsable act
 
 // ErrDestinoNoEsCotizacion lo devuelve Transferir en una conversación
 // `tipo=solicitud` cuando el destino no tiene el rol `cotizacion` vigente
-// (DEC-148 #31). No cambia nada: el reclamo del llamante sigue activo. La frontera
-// lo traduce a 409 con `codigo` destino_no_es_cotizacion.
+// (DEC-148 #31): el sujeto destino no existe, no tiene idp_subject conocido, está
+// inactivo o no tiene el rol (DEC-148 #74). No cambia nada: el reclamo del
+// llamante sigue activo. La frontera lo traduce a 409 con `codigo`
+// destino_no_es_cotizacion.
 var ErrDestinoNoEsCotizacion = errors.New("reclamos: el destino no tiene el rol cotizacion")
 
 // tipoSolicitud es Conversacion.tipo de la conversación de la solicitud.
@@ -340,7 +342,8 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclam
 // ErrConflictoVersion; origen que no es el responsable activo,
 // ErrNoEsResponsable (DEC-118). El reclamo nuevo abre en la versión siguiente de
 // la conversación, de modo que la previa queda obsoleta (P20). El motivo, si
-// viene, se audita (hecho inmutable, addendum §11).
+// viene, se audita (hecho inmutable, addendum §11). En `tipo=solicitud`,
+// `destino` es el id del sujeto en identidad y se traduce a su `sub` (DEC-148 #74).
 func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo) error {
 	return s.transferir(ctx, tenantID, conversacionID, origen, destino, motivo, esperada, false)
 }
@@ -376,22 +379,34 @@ func (s *Servicio) transferir(ctx context.Context, tenantID, conversacionID, ori
 	if err != nil {
 		return err
 	}
-	// En la solicitud el destino debe ser `cotizacion` (DEC-148 #31). Se valida
-	// con el reclamo ya bloqueado y antes de cerrarlo: si falla, la tx se descarta
-	// y el reclamo del llamante no cambia. `destino` es el `sub` del token
-	// (actor_real del reclamo), no el sujeto_id: se busca por idp_subject, y sin
-	// idp_subject conocido falla cerrado.
+	// En la solicitud el destino debe ser `cotizacion` (DEC-148 #31). `destino` es
+	// el id del SUJETO en identidad (DEC-148 #74, DT-28), no el `sub`: se traduce a
+	// su idp_subject con la fila de rol_sujeto, y el reclamo del destino guarda ese
+	// `sub` (así el destino actúa sobre su reclamo, que se resuelve por el `sub` del
+	// token). La misma lectura valida el rol y da el `sub`, con FOR SHARE: una
+	// revocación o desactivación concurrente espera a que esta tx termine, así que
+	// no hay ventana entre validar el rol y abrir el reclamo. Se valida con el
+	// reclamo ya bloqueado y antes de cerrarlo: si falla, la tx se descarta y el
+	// reclamo del llamante no cambia. Falla cerrado: sujeto inexistente, sin
+	// idp_subject conocido, inactivo o sin el rol. En `tipo=viaje` el destino no se
+	// valida ni se traduce: sigue siendo el `sub` tal cual (regla vigente; su cambio
+	// queda como duda abierta para el Lead, DT-28).
 	if tipo == tipoSolicitud {
-		var esCotizacion bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto
-			                 WHERE idp_subject = $1 AND rol = 'cotizacion' AND activo)`,
-			destino).Scan(&esCotizacion); err != nil {
-			return fmt.Errorf("reclamos: leer el rol del destino: %w", err)
-		}
-		if !esCotizacion {
+		var sub, rol *string
+		var activo bool
+		err := tx.QueryRow(ctx,
+			`SELECT idp_subject, rol, activo FROM mensajeria.rol_sujeto WHERE sujeto_id = $1 FOR SHARE`,
+			destino).Scan(&sub, &rol, &activo)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrDestinoNoEsCotizacion
 		}
+		if err != nil {
+			return fmt.Errorf("reclamos: leer el rol del destino: %w", err)
+		}
+		if sub == nil || *sub == "" || rol == nil || *rol != "cotizacion" || !activo {
+			return ErrDestinoNoEsCotizacion
+		}
+		destino = *sub
 	}
 	actual, _, err := versionConversacion(ctx, tx, tenantID, conversacionID)
 	if err != nil {

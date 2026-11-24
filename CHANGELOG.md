@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-11-24 17:48 — El destino de una transferencia es el id del sujeto (DEC-148 #74, DT-28)
+
+**Para quién:** `pf-pkg-contracts` (la ola `tracer.47` documenta el nuevo significado), `pf-svc-bff` y el panel interno (ya pueden mandar el `UsuarioAdmin.id` como destino).
+
+**Resumen:** en una conversación `tipo=solicitud`, `responsable_destino_id` es el id del sujeto en `identidad`, no el `sub` del token. `mensajeria` lo traduce a `idp_subject` con `rol_sujeto` y el reclamo del destino sigue guardando el `sub` en `responsable_id`, así el destino actúa sobre su reclamo.
+
+**Comportamiento:**
+- La traducción y la validación del rol salen de la MISMA lectura (`SELECT idp_subject, rol, activo ... FOR SHARE`) dentro de la transacción de la transferencia. Una revocación o desactivación concurrente espera a que la transferencia confirme, así que no hay ventana entre validar el rol y abrir el reclamo.
+- Falla cerrado con el error de siempre (`409 destino_no_es_cotizacion`): sujeto inexistente, sin `idp_subject` conocido (filas anteriores a tracer.46 que aún no emiten un evento), inactivo o sin el rol `cotizacion`. Un `sub` recibido como destino ya no resuelve a nadie (409).
+- Aplica a `Transferir` y a `TransferirComoAdministrador`.
+- **`tipo=viaje` no cambia:** hoy no valida el destino y lo guarda tal cual como responsable. Con el nuevo significado del campo, el viaje recibiría un id de sujeto como `responsable_id` y el destino no podría actuar; queda como duda abierta para el Lead (necesita decidir si el viaje traduce y con qué código falla).
+- Sin cambio de contrato, de migraciones ni de `Reclamo.responsable_id`. La transferencia de emergencias (`internal/emergencias`) no cambia.
+
+**Cambios:**
+- `internal/reclamos/reclamos.go`: la validación del destino en la solicitud lee `rol_sujeto` por `sujeto_id`, exige `idp_subject`, rol y activo, y abre el reclamo con el `sub`.
+- `pool_cotizacion_integration_test.go`: el fixture usa un id de sujeto distinto del `sub`; pruebas nuevas (id del sujeto, 201 con el `sub` guardado; sujeto inexistente, sin `idp_subject`, `sub` en lugar del id; carrera contra la revocación; `tipo=viaje` sin validar) y las de #70 ajustadas para pasar el id del sujeto. Cada una falla al mutar el cambio.
+- `README.md`: sección del destino de la transferencia.
+
+**Archivos modificados:**
+- `internal/reclamos/reclamos.go`
+- `pool_cotizacion_integration_test.go`
+- `README.md`, `CHANGELOG.md`
+
 ## 2026-11-20 17:00 — El destino de una transferencia se resuelve por `idp_subject` (DEC-148 #31; tracer.46)
 
 **Para quién:** `pf-svc-identidad` (debe emitir `idp_subject` en los cuatro eventos de rol; PR paralelo) y quien opere la base de mensajeria.
