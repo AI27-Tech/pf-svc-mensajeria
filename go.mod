@@ -12,10 +12,11 @@ go 1.27
 // Versiones fijadas por el prompt 07 (DEC-089): la conversación de mensajería
 // entró en contracts v0.1.0-tracer.7; la emergencia espera tracer.9.
 require (
-	github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.42
+	github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go v0.1.0-tracer.46
 	github.com/AI27-Tech/pf-pkg-platform-go v0.1.9
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -49,6 +50,5 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/grpc v1.83.1 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

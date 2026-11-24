@@ -224,3 +224,45 @@ func TestWorkersAlcance(t *testing.T) {
 	}
 	t.Error("con Alcances: falta el worker mensajeria-alcance")
 }
+
+// TestWorkersConversacionSolicitud fija el cableado del consumidor de la
+// conversación de la solicitud: UNA suscripción durable con los dos eventos, para
+// conservar el orden por solicitud_id (DEC-148 #5, #30, #48).
+func TestWorkersConversacionSolicitud(t *testing.T) {
+	sub := &suscriptorFake{}
+	m, err := New(Pools{}, Deps{Subscriber: sub})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := sub.por("mensajeria-conversacion-solicitud")
+	if s == nil || s.superficie != bus.SensibilidadAmplia ||
+		len(s.filtro) != 2 || s.filtro[0] != "solicitud.creada" || s.filtro[1] != "solicitud.estado_cambiado" {
+		t.Fatalf("suscripción de la solicitud: %+v; abiertas: %v", s, sub.subs)
+	}
+	var tiene bool
+	for _, w := range m.Workers() {
+		tiene = tiene || w.Name() == "bus-durable:mensajeria-conversacion-solicitud"
+	}
+	if !tiene {
+		t.Error("falta el consumidor de la solicitud en Workers()")
+	}
+}
+
+// TestWorkersRoles fija el cableado del consumidor del rol vigente de cada
+// sujeto, con el que se valida el destino de una transferencia en la solicitud.
+func TestWorkersRoles(t *testing.T) {
+	sub := &suscriptorFake{}
+	if _, err := New(Pools{}, Deps{Subscriber: sub}); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s := sub.por("mensajeria-roles")
+	want := []string{"rol.asignado", "rol.revocado", "sujeto.desactivado", "sujeto.reactivado"}
+	if s == nil || s.superficie != bus.SensibilidadAmplia || len(s.filtro) != len(want) {
+		t.Fatalf("suscripción de roles: %+v; abiertas: %v", s, sub.subs)
+	}
+	for i, tipo := range want {
+		if s.filtro[i] != tipo {
+			t.Errorf("filtro[%d] = %q, want %q", i, s.filtro[i], tipo)
+		}
+	}
+}

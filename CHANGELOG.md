@@ -1,5 +1,99 @@
 # CHANGELOG
 
+## 2026-11-20 17:00 — El destino de una transferencia se resuelve por `idp_subject` (DEC-148 #31; tracer.46)
+
+**Para quién:** `pf-svc-identidad` (debe emitir `idp_subject` en los cuatro eventos de rol; PR paralelo) y quien opere la base de mensajeria.
+
+**Resumen:** cierra la pregunta abierta de «El pool de `cotizacion`». El reclamo guarda el `sub` del token (`actor_real`), y `responsable_destino_id` es ese `sub`; `rol_sujeto` se buscaba por `sujeto_id`, así que un destino válido no coincidía. Ahora la validación busca por `idp_subject`.
+
+**Comportamiento:**
+- `rol_sujeto` guarda `idp_subject` y la transferencia en `tipo=solicitud` busca por él. `sujeto_id` sigue siendo la clave de la proyección, porque es lo que traen los eventos.
+- Falla cerrado: un sujeto sin `idp_subject` conocido no es destino válido (`409 destino_no_es_cotizacion`). Un `sujeto_id` pasado como destino tampoco lo es.
+- **Backfill sin script.** Las filas existentes quedan con `idp_subject` NULL y se completan solas con el siguiente evento de identidad del sujeto (`rol.asignado`, `rol.revocado`, `sujeto.desactivado` o `sujeto.reactivado`) que lo traiga. Un evento sin `idp_subject` (publicado antes de tracer.46) no borra uno ya conocido. El `idp_subject` se escribe sin guarda de tiempo: es un atributo fijo, no un hecho que se reordene. Hasta que un sujeto emita un evento nuevo, no es destino de transferencia. Alternativa descartada: reiniciar el durable `mensajeria-roles` para releer el historial; no sirve, porque los eventos ya publicados no traen `idp_subject`.
+
+**Cambios:**
+- `migrations/mensajeria/0013_rol_sujeto_idp_subject.sql`: columna `idp_subject` e índice. Aditiva e idempotente, sin cambio de grants.
+- `internal/pool/roles.go`: lee `idp_subject` y lo registra en la MISMA sentencia que aplica el hecho (una por evento, atómica). Escribirlo aparte creaba la fila con `rol_en` NULL y perdía la lápida de un `rol.revocado` fuera de orden: un `rol.asignado` más viejo reactivaba el rol. Ahora la guarda de tiempo decide solo las columnas del hecho (`CASE`), `sqlRevocado` también fija `rol_en` cuando el sujeto no tiene rol (p. ej. fila creada antes por un `sujeto.desactivado`), y el `idp_subject` se escribe aunque el hecho sea viejo.
+- `internal/reclamos/reclamos.go`: la consulta del rol del destino filtra por `idp_subject`.
+- Pin de `pf-pkg-contracts/api-client-go` a `v0.1.0-tracer.46` (sin renombres de constantes; `go build` limpio).
+- Pruebas: unitarias del consumidor (`internal/pool/roles_test.go`) e integración (`TestPoolCotizacion`: hechos fuera de orden con `idp_subject` —revocado antes que un asignado viejo, reactivado/desactivado invertidos—, que falla sin el arreglo; sin `idp_subject` falla cerrado, el siguiente evento lo completa, uno viejo no lo borra, `sujeto_id` no vale como destino).
+
+## 2026-11-20 15:30 — El pool de `cotizacion` atiende la conversación de la solicitud (DEC-148 #20, #28, #31, #45 a #47, #54; tracer.45)
+
+**Para quién:** `pf-svc-bff` y `pf-svc-core` (reclamo, liberación y transferencia ya valen para `tipo=solicitud`), el panel interno (bandeja de `cotizacion`, aviso de mensaje sin respuesta) y `pf-svc-identidad` (debe publicar los eventos de rol hacia el durable nuevo). Se apila sobre «La conversación de la solicitud».
+
+**Resumen:** todos los usuarios con rol `cotizacion` forman un solo pool que reclama, responde, libera y transfiere con el mismo mecanismo del `ejecutivo`, sin vínculo por cliente. El `administrador` interviene por herencia y queda auditado. La audiencia de cada operación por `{id}` depende del tipo de la conversación.
+
+**Comportamiento:**
+- `tipo=solicitud`: leen y escriben `cotizacion` y `administrador`; solo `cotizacion` reclama (contrato `reclamarConversacion`); `ejecutivo`, `supervisor`, `coordinador`, `jefe_operativo`, `monitorista` y `reaccion` reciben `403` en obtener, mensajes, enviar, reclamar, liberar, transferir, atendida y recibos. `tipo=viaje` no cambia. No hay membresía por usuario: un usuario nuevo de `cotizacion` lee el historial previo.
+- Reclamo: mismo mecanismo y versión que el `ejecutivo`. Dos reclamos concurrentes producen un ganador y un `409 conflicto_version_reclamo`. En la solicitud no se dirige la conversación a un dueño ni se toma dueño del cliente (`dueno_cliente` queda intacto).
+- Solo el reclamante responde; sin reclamo, `409 conflicto_version_reclamo`.
+- Transferir en `tipo=solicitud` solo admite destino con rol `cotizacion` vigente: otro destino (`ejecutivo`, `administrador`, desconocido o desactivado), `409` con `codigo` `destino_no_es_cotizacion` y el reclamo del llamante no cambia. El cierre del reclamo y la apertura del siguiente son una sola transacción.
+- Intervención del `administrador`: envía sin reclamo propio y transfiere el reclamo de otro (si él es el responsable de un reclamo, envía como cualquier responsable y una versión obsoleta da `409 conflicto_version_reclamo`, no un override; el envío en la solicitud no toca el vínculo pegajoso del Ejecutivo, ADR 36; el responsable desplazado se lee con `FOR UPDATE`); cada una queda en la auditoría como `override.administrador` (el override de Supervisor, DEC-148 #47) con el responsable desplazado. Liberar, marcar atendida y recibos siguen siendo del responsable.
+- `Conversacion.sin_respuesta`: verdadero si el último mensaje aceptado es del cliente. Se deriva del orden canónico de mensajes, así que se activa en la misma transacción que acepta el mensaje y se apaga en la que acepta la respuesta, sin estado aparte. Aparece en `obtenerConversacion` y en las bandejas de trabajo; se omite para el Cliente. En V1 no existía código de la alerta de E3-HU-016, no había nada que reutilizar.
+- Identidad "AI27 Operations": mensajeria sigue guardando `actor_real`, `rol_al_enviar` y `alias_mostrado` inmutables; el alias que ve el cliente lo presenta el `bff` (DEC-021), igual que con el `ejecutivo`.
+
+**Cambios:**
+- `migrations/mensajeria/0012_rol_sujeto.sql`: tabla `rol_sujeto`. Aditiva e idempotente.
+- `internal/pool/roles.go`: consumidor durable `mensajeria-roles` de `rol.asignado`, `rol.revocado`, `sujeto.desactivado` y `sujeto.reactivado`; un evento más viejo no pisa a uno más nuevo.
+- `internal/reclamos`: `ErrDestinoNoEsCotizacion`, `TransferirComoAdministrador`; el vínculo (dirigir, tomar dueño) solo en `tipo=viaje`.
+- `internal/conversacion`: el administrador envía sin reclamo en la solicitud, con auditoría; `sin_respuesta` en `ObtenerConversacion`.
+- `internal/bandejas`: `CondicionSinRespuesta` y `sin_respuesta` en cada elemento.
+- `internal/autorizacion`: `cotizacion` y `administrador` escriben en `tipo=solicitud`; solo `cotizacion` reclama.
+- `adapters/http/conversacion` y `conversaciones_api.go`: transferencia por rol, `409 destino_no_es_cotizacion`, `sin_respuesta` omitido para el Cliente.
+- `mensajeria.go`: suscripción `mensajeria-roles`.
+
+**Para `pf-svc-core` e `identidad`:** `identidad` debe publicar `rol.asignado`, `rol.revocado`, `sujeto.desactivado` y `sujeto.reactivado` hacia el durable `mensajeria-roles`. Sin esos eventos ningún destino es válido y toda transferencia de una solicitud responde `409` (falla cerrado).
+
+**Pregunta abierta (contrato):** `responsable_destino_id` se compara con el `sujeto_id` de esos eventos. Los eventos de rol no traen `idp_subject` y el reclamo guarda el `sub` del token (`actor_real`). Si `sub` y `sujeto_id` difieren en producción, el destino válido no coincidirá con quien luego responde: hace falta `idp_subject` en `rol.asignado` o aclarar qué id lleva `responsable_destino_id`.
+
+**Archivos modificados:**
+- `migrations/mensajeria/0012_rol_sujeto.sql` (nuevo)
+- `internal/pool/roles.go` (nuevo), `internal/pool/doc.go`
+- `internal/reclamos/reclamos.go`, `internal/auditoria/auditoria.go`
+- `internal/conversacion/conversacion.go`, `internal/bandejas/bandejas.go`, `internal/autorizacion/autorizacion.go`
+- `adapters/http/conversacion/conversacion.go`, `conversaciones_api.go`, `mensajeria.go`
+- `pool_cotizacion_integration_test.go` (nuevo), `workers_test.go`
+
+## 2026-11-20 14:15 — La conversación de la solicitud: tipo de conversación, eventos y bandeja de solicitudes (DEC-148 #3, #5, #12, #28 a #31, #48; tracer.45)
+
+**Para quién:** `pf-svc-bff` y `pf-svc-core` (nuevas operaciones de `ConversacionesAPI`), el panel interno y el portal del cliente. Cambia lo que ve cada rol: `ejecutivo`, `supervisor` y `coordinador` siguen viendo solo conversaciones de viaje; `cotizacion` y `administrador` ven las de solicitud.
+
+**Resumen:** el viaje hereda el id de la solicitud, así que ahora existen dos conversaciones con el mismo `viaje_id`: la de la solicitud (cliente ↔ `cotizacion`) y la del viaje (cliente ↔ `ejecutivo`). `mensajeria` las distingue con `Conversacion.tipo`, crea la de la solicitud al recibir `solicitud.creada` y fija su ventana de escritura con `solicitud.estado_cambiado`. Este PR NO abre el reclamo, la liberación ni la transferencia del pool de `cotizacion` (siguiente PR): mientras tanto nadie interno responde en una conversación de solicitud.
+
+**Comportamiento:**
+- `tipo` se expone en `Conversacion` (`viaje` o `solicitud`). Las existentes valen `viaje`.
+- `solicitud.creada` crea o reutiliza, de forma idempotente, la conversación `tipo=solicitud` (`tenant_id = cliente_id`), enrutada a la bandeja única del tenant y sin dirigirla a un dueño: no hay vínculo por cliente para `cotizacion`.
+- `solicitud.estado_cambiado`: en `APROBADO`, `RECHAZADO_POR_AI27`, `RECHAZADO_POR_CLIENTE`, `CANCELADO_POR_CLIENTE` y `VENCIDA` la ventana de escritura corre 3 días desde `cambiado_en`; en `SOLICITADO`, `COTIZADO` y `PAGADO` (por ejemplo `VENCIDA → PAGADO`) la conversación se reabre; un estado que el contrato no declara no toca la ventana y se registra en el log (falla cerrado). Un evento más viejo que el último aplicado no lo pisa. Si llega antes que `solicitud.creada`, crea la conversación.
+- Los dos eventos van en UNA suscripción durable (`mensajeria-conversacion-solicitud`) para conservar el orden por `solicitud_id`.
+- `obtenerConversacionDeSolicitud` (`GET /api/v1/solicitudes/{id}/conversacion`): el Cliente dueño, `cotizacion` y `administrador`; el cliente de otra empresa recibe `404`; `ejecutivo`, `supervisor`, `coordinador`, `jefe_operativo`, `monitorista` y `reaccion`, `403`.
+- `listarTrabajoMiBandejaSolicitudes` (`GET /api/v1/bandeja/solicitudes`): `cotizacion` y `administrador`; otro rol y el cliente reciben `404`. Mismo bootstrap y catch-up por revisión que la bandeja de chat.
+- `listarTrabajoMiBandeja`, `listarTrabajoBandeja` (por `{id}`), `obtenerConversacionDeViaje` y la activación de emergencias devuelven solo `tipo=viaje`.
+- Las operaciones por `{id}` de conversación leen según el tipo: en `solicitud`, solo `cotizacion` y `administrador` leen; escribir y reclamar quedan cerrados hasta el siguiente PR.
+- `Servicio.Ahora`: reloj inyectable de la guarda de escritura (antes `now()` de SQL), para probar la ventana en su frontera.
+
+**Cambios:**
+- Pin `api-client-go` de `v0.1.0-tracer.42` a `v0.1.0-tracer.45`; compila sin cambios (sin constantes renombradas).
+- `migrations/mensajeria/0011_tipo_conversacion.sql`: columnas `tipo` (con `CHECK`) y `ventana_aplicada_en`; el índice único `una_conversacion_activa_por_viaje` pasa a `(tenant_id, viaje_id, tipo)` conservando su nombre, porque `0001` lo recrea con `IF NOT EXISTS` en cada `cmd/migrate`. Aditiva e idempotente; verificada dos veces con datos de los dos tipos.
+- `internal/consumidores/solicitud.go`: `ConsumidorSolicitud`; un `solicitud_id` o `cliente_id` que no es UUID se acusa sin efecto y se registra, en vez de reintentarse sin fin. `mensajeria.go`: suscripción y worker.
+- `internal/conversacion`: `CrearSolicitudPorEvento`, `AplicarEstadoSolicitud`, `ConversacionDeSolicitud`; `ObtenerConversacion` llena `tipo`; `CerrarVentana` (viaje.cerrado) filtra `tipo='viaje'`.
+- `internal/bandejas`: `consultar` filtra por tipo; `TrabajoSolicitudes` y `CambiosSolicitudesDesde`.
+- `internal/autorizacion`: la audiencia interna depende del tipo; `LeeBandejaSolicitudes`; `ClienteDelViaje` y la empresa del viaje de emergencias filtran `tipo='viaje'`.
+- `conversaciones_api.go` y `adapters/http`: `ObtenerConversacionDeSolicitud` y `ListarTrabajoMiBandejaSolicitudes` (firmas de COSTURAS §3) y sus rutas.
+
+**Migración:** `0011_tipo_conversacion.sql`. Ver arriba.
+
+**Para `pf-svc-core` y el `bff`:** `ConversacionesAPI` gana dos métodos. `operacion` debe publicar `solicitud.creada` y `solicitud.estado_cambiado` hacia la suscripción durable `mensajeria-conversacion-solicitud` (registro de tipos del bus).
+
+**Archivos modificados:**
+- `go.mod`, `go.sum`
+- `migrations/mensajeria/0011_tipo_conversacion.sql` (nuevo)
+- `internal/consumidores/solicitud.go`, `solicitud_test.go` (nuevos)
+- `internal/conversacion/conversacion.go`, `solicitud_integration_test.go` (nuevo)
+- `internal/bandejas/bandejas.go`, `internal/autorizacion/autorizacion.go`, `internal/emergencias/emergencias.go`
+- `adapters/http/conversacion/conversacion.go`, `adapters/http/bandejas/bandejas.go`, `adapters/http/bandejas/bandejas_test.go`
+- `conversaciones_api.go`, `mensajeria.go`, `workers_test.go`, `conversacion_de_solicitud_integration_test.go` (nuevo)
+
 ## 2026-11-18 13:05 — Alcance del monitoreo por cliente en las emergencias del viaje (DEC-149 #6, #18, #20 y #22; tracer.42)
 
 **Para quién:** el panel interno (emergencias del viaje del monitoreo), el `bff` y `pf-svc-core` en proceso. Cambia lo que observan `monitorista`, `supervisor` y `coordinador`: ya no operan sobre casos de viajes de clientes que no están en sus clientes efectivos; reciben `404`. `pf-svc-core` debe cablear el snapshot de alcances (ver abajo); sin él la proyección arranca vacía y el monitoreo no ve ningún caso.
