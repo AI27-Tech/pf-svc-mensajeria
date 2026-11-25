@@ -47,7 +47,10 @@ cerrado, también para un `sub` pasado como destino). El reclamo del destino
 guarda el `sub` en `responsable_id`. En `tipo=viaje` el destino sigue siendo el `sub`
 (no se traduce ni se valida el rol), salvo que sea el id de un sujeto que no es
 un `sub` conocido: `409 destino_invalido_en_viaje` sin tocar el reclamo (DEC-148
-#76). Un `sub`, conocido o no, se acepta como en V1.
+#76). Un `sub`, conocido o no, se acepta como en V1. La transferencia de
+emergencias (`transferirEmergencia` y `transferirEmergenciaPorId`) aplica la misma
+guarda con el mismo código, tras verificar al responsable y la versión y antes de
+escribir (DEC-148 #77); su destino sigue siendo el `sub` y no se valida su rol.
 
 ## Las cuatro contabilidades (la trampa del contrato)
 
