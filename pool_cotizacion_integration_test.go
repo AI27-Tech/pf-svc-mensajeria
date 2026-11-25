@@ -73,9 +73,19 @@ func TestPoolCotizacion(t *testing.T) {
 		}
 	}
 	hecho := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
-	asignar := func(sujeto, rol string, en time.Time) {
+	// Cada usuario tiene un `sub` (el del token; es lo que guarda el reclamo) y un
+	// id de sujeto distinto (lo que conoce el panel y lleva responsable_destino_id,
+	// DEC-148 #74). `sj` da el id del sujeto de un `sub`.
+	sujetos := map[string]string{}
+	sj := func(sub string) string {
+		if sujetos[sub] == "" {
+			sujetos[sub] = uuid.NewString()
+		}
+		return sujetos[sub]
+	}
+	asignar := func(sub, rol string, en time.Time) {
 		t.Helper()
-		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: sujeto, IdpSubject: sujeto, TenantId: "ai27", Rol: rol, AsignadoEn: timestamppb.New(en)})
+		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: sj(sub), IdpSubject: sub, TenantId: "ai27", Rol: rol, AsignadoEn: timestamppb.New(en)})
 		publicar(pool.TipoRolAsignado, js)
 	}
 	for _, c := range [][2]string{{cot1, "cotizacion"}, {cot2, "cotizacion"}, {eje, "ejecutivo"}, {adm, "administrador"}} {
@@ -351,7 +361,7 @@ func TestPoolCotizacion(t *testing.T) {
 		if rec.ResponsableId.String() == cot2 {
 			destino = cot1
 		}
-		r := ganador("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": rec.Version, "responsable_destino_id": destino, "motivo": "turno"})
+		r := ganador("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": rec.Version, "responsable_destino_id": sj(destino), "motivo": "turno"})
 		nuevo = reclamoDe(r)
 		if nuevo.ResponsableId.String() != destino || nuevo.Version != rec.Version+1 {
 			t.Fatalf("reclamo nuevo = %+v", nuevo)
@@ -370,7 +380,7 @@ func TestPoolCotizacion(t *testing.T) {
 
 	t.Run("transferir a un ejecutivo es 409 destino_no_es_cotizacion y el reclamo no cambia", func(t *testing.T) {
 		dueno := como(nuevo.ResponsableId.String(), "cotizacion")
-		for _, destino := range []string{eje, adm, uuid.NewString()} { // ejecutivo, administrador, desconocido
+		for _, destino := range []string{sj(eje), sj(adm), uuid.NewString()} { // ejecutivo, administrador, desconocido
 			r := dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": destino})
 			if r.code != http.StatusConflict || codigo(r) != "destino_no_es_cotizacion" {
 				t.Errorf("destino %s: %d %s; quiere 409 destino_no_es_cotizacion", destino, r.code, r.cuerpo)
@@ -384,31 +394,152 @@ func TestPoolCotizacion(t *testing.T) {
 		}
 	})
 
-	t.Run("el destino se resuelve por idp_subject (el sub del token), no por sujeto_id", func(t *testing.T) {
+	// DEC-148 #74 / DT-28: responsable_destino_id es el id del SUJETO; mensajeria lo
+	// traduce a su idp_subject y el reclamo nuevo guarda el `sub`.
+	t.Run("el destino es el id del sujeto: se traduce al sub y el reclamo nuevo guarda el sub", func(t *testing.T) {
 		dueno := como(nuevo.ResponsableId.String(), "cotizacion")
-		sujeto, sub := uuid.NewString(), uuid.NewString() // el contrato exige uuid en responsable_destino_id
-		transferir := func(destino string) int {
-			return dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": destino}).code
+		sub := uuid.NewString()
+		sujeto := sj(sub)
+		transferir := func(destino string) resp {
+			return dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": destino})
 		}
-		asignarCon := func(idp string) {
+		rechazado := func(motivo string, destino string) {
+			t.Helper()
+			if r := transferir(destino); r.code != http.StatusConflict || codigo(r) != "destino_no_es_cotizacion" {
+				t.Errorf("%s: %d %s; quiere 409 destino_no_es_cotizacion", motivo, r.code, r.cuerpo)
+			}
+		}
+		asignarCon := func(idp string) { // evento de rol con o sin idp_subject
 			js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: sujeto, IdpSubject: idp, TenantId: "ai27", Rol: "cotizacion", AsignadoEn: timestamppb.New(hecho)})
 			publicar(pool.TipoRolAsignado, js)
 		}
-		asignarCon("") // evento anterior a tracer.46: sin idp_subject
-		for _, destino := range []string{sujeto, sub} {
-			if got := transferir(destino); got != http.StatusConflict {
-				t.Errorf("sin idp_subject, destino %s: %d, quiere 409 (falla cerrado)", destino, got)
-			}
-		}
+		rechazado("sujeto inexistente", sujeto)
+		asignarCon("") // evento anterior a tracer.46: sujeto con rol pero sin idp_subject
+		rechazado("sujeto sin idp_subject conocido", sujeto)
+		rechazado("sub como destino sin idp_subject", sub)
 		asignarCon(sub) // el siguiente evento del sujeto lo completa
 		asignarCon("")  // un evento viejo posterior no lo borra
-		if got := transferir(sujeto); got != http.StatusConflict {
-			t.Errorf("destino por sujeto_id: %d, quiere 409", got)
+		rechazado("un sub en lugar del id del sujeto", sub)
+		anterior := nuevo
+		r := transferir(sujeto)
+		if r.code != http.StatusCreated {
+			t.Fatalf("destino por id del sujeto: %d %s, quiere 201", r.code, r.cuerpo)
 		}
-		if got := transferir(sub); got != http.StatusCreated {
-			t.Fatalf("destino por sub: %d, quiere 201", got)
+		if got := reclamoDe(r); got.ResponsableId.String() != sub {
+			t.Errorf("responsable_id del reclamo nuevo = %s, quiere el sub %s", got.ResponsableId, sub)
 		}
 		nuevo = reclamoActivo(t, ctx, rp, convSol)
+		if nuevo.ResponsableId.String() != sub || nuevo.Version != anterior.Version+1 {
+			t.Errorf("reclamo activo = %s v%d, quiere %s v%d", nuevo.ResponsableId, nuevo.Version, sub, anterior.Version+1)
+		}
+		// El destino actúa sobre su reclamo con su sub.
+		if r := como(sub, "cotizacion")("POST", rutaSol+"/mensajes", enviar(&nuevo.Version, "tomo la solicitud")); r.code != http.StatusCreated {
+			t.Errorf("el destino responde con su sub: %d %s", r.code, r.cuerpo)
+		}
+	})
+
+	// La validación del rol y la apertura del reclamo son una sola transacción: una
+	// revocación en curso sobre la fila del destino hace esperar a la transferencia,
+	// que luego ve el rol revocado. Sin el candado la transferencia leía el rol
+	// vigente (aún sin confirmar la revocación) y abría el reclamo.
+	t.Run("transferir contra la revocación del rol del destino: espera y falla cerrado", func(t *testing.T) {
+		dueno := como(nuevo.ResponsableId.String(), "cotizacion")
+		sub := uuid.NewString()
+		asignar(sub, "cotizacion", hecho)
+		tx, err := rp.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `UPDATE mensajeria.rol_sujeto SET rol = NULL, rol_en = $2 WHERE sujeto_id = $1`, sj(sub), hecho.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		hecha := make(chan resp, 1)
+		go func() {
+			hecha <- dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": sj(sub)})
+		}()
+		select {
+		case r := <-hecha:
+			t.Fatalf("la transferencia no esperó a la revocación en curso: %d %s", r.code, r.cuerpo)
+		case <-time.After(500 * time.Millisecond):
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r := <-hecha; r.code != http.StatusConflict || codigo(r) != "destino_no_es_cotizacion" {
+			t.Errorf("transferir tras la revocación: %d %s; quiere 409 destino_no_es_cotizacion", r.code, r.cuerpo)
+		}
+		if got := reclamoActivo(t, ctx, rp, convSol); got.ResponsableId != nuevo.ResponsableId || got.Version != nuevo.Version {
+			t.Errorf("el reclamo cambió: %s v%d", got.ResponsableId, got.Version)
+		}
+	})
+
+	// DEC-148 #76: en el viaje el destino sigue siendo el `sub` (V1, no se traduce),
+	// salvo que sea el id de un SUJETO que no es un `sub` conocido: eso se rechaza.
+	// Valores a mano: el id del sujeto de cot2 es distinto de su sub.
+	t.Run("tipo=viaje: un id de sujeto se rechaza y un sub se acepta como en V1", func(t *testing.T) {
+		if r := como(eje, "ejecutivo")("POST", rutaViaje+"/reclamos", version(0)); r.code != http.StatusCreated {
+			t.Fatalf("el ejecutivo reclama el viaje: %d %s", r.code, r.cuerpo)
+		}
+		contar := func(sql string) int {
+			t.Helper()
+			var n int
+			if err := rp.QueryRow(ctx, sql).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		transferir := func(sub, rol string, ver int64, destino string) resp {
+			return como(sub, rol)("POST", rutaViaje+"/transferencias", map[string]any{"version_esperada": ver, "responsable_destino_id": destino})
+		}
+		rechazado := func(motivo, destino string) {
+			t.Helper()
+			salidas := contar(`SELECT count(*) FROM mensajeria.outbox`)
+			auditadas := contar(`SELECT count(*) FROM mensajeria.auditoria_mensajeria`)
+			if r := transferir(eje, "ejecutivo", 1, destino); r.code != http.StatusConflict || codigo(r) != "destino_invalido_en_viaje" {
+				t.Errorf("%s: %d %s; quiere 409 destino_invalido_en_viaje", motivo, r.code, r.cuerpo)
+			}
+			if got := reclamoActivo(t, ctx, rp, convViaje); got.ResponsableId.String() != eje || got.Version != 1 {
+				t.Errorf("%s: el reclamo del llamante cambió: %s v%d", motivo, got.ResponsableId, got.Version)
+			}
+			if n := contar(`SELECT count(*) FROM mensajeria.outbox`); n != salidas {
+				t.Errorf("%s: outbox pasó de %d a %d filas", motivo, salidas, n)
+			}
+			if n := contar(`SELECT count(*) FROM mensajeria.auditoria_mensajeria`); n != auditadas {
+				t.Errorf("%s: la auditoría pasó de %d a %d filas", motivo, auditadas, n)
+			}
+		}
+		rechazado("id de sujeto con rol y sub", sj(cot2))
+		huerfano := uuid.NewString() // sujeto cuyo evento aún no trae idp_subject
+		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: huerfano, TenantId: "ai27", Rol: "ejecutivo", AsignadoEn: timestamppb.New(hecho)})
+		publicar(pool.TipoRolAsignado, js)
+		rechazado("id de sujeto sin idp_subject conocido", huerfano)
+		// El administrador no interviene en el viaje: sin cambio (403).
+		if r := transferir(adm, "administrador", 1, sj(cot2)); r.code != http.StatusForbidden {
+			t.Errorf("administrador transfiere el viaje: %d, quiere 403", r.code)
+		}
+
+		// Un valor que es a la vez id de un sujeto y `sub` de otro es un sub conocido:
+		// se acepta (la regla rechaza solo lo que NO resuelve como idp_subject).
+		ambos := uuid.NewString()
+		for _, f := range [][2]string{{uuid.NewString(), ambos}, {ambos, uuid.NewString()}} { // {sujeto_id, idp_subject}
+			js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: f[0], IdpSubject: f[1], TenantId: "ai27", Rol: "ejecutivo", AsignadoEn: timestamppb.New(hecho)})
+			publicar(pool.TipoRolAsignado, js)
+		}
+		if r := transferir(eje, "ejecutivo", 1, ambos); r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != ambos {
+			t.Fatalf("transferir el viaje a un valor que es sujeto y sub: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, ambos)
+		}
+		// Un sub conocido (el de otro ejecutivo, con su fila en rol_sujeto) se acepta.
+		eje2 := uuid.NewString()
+		asignar(eje2, "ejecutivo", hecho)
+		if r := transferir(ambos, "ejecutivo", 2, eje2); r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != eje2 {
+			t.Errorf("transferir el viaje a un sub conocido: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, eje2)
+		}
+		// Un UUID que no es ni sujeto ni sub tampoco se valida, como en V1.
+		desconocido := uuid.NewString()
+		if r := transferir(eje2, "ejecutivo", 3, desconocido); r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != desconocido {
+			t.Errorf("transferir el viaje a un sub desconocido: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, desconocido)
+		}
 	})
 
 	t.Run("un destino al que se le revoca el rol o se desactiva deja de ser válido", func(t *testing.T) {
@@ -418,20 +549,20 @@ func TestPoolCotizacion(t *testing.T) {
 			otro = cot2
 		}
 		transferible := func() int {
-			return dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": otro}).code
+			return dueno("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": sj(otro)}).code
 		}
 		desactivar := func(en time.Time) {
-			js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.SujetoDesactivado{SujetoId: otro, TenantId: "ai27", DesactivadoEn: timestamppb.New(en)})
+			js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.SujetoDesactivado{SujetoId: sj(otro), IdpSubject: otro, TenantId: "ai27", DesactivadoEn: timestamppb.New(en)})
 			publicar(pool.TipoSujetoDesactivado, js)
 		}
 		desactivar(hecho.Add(time.Hour))
 		if got := transferible(); got != http.StatusConflict {
 			t.Errorf("destino desactivado: %d, quiere 409", got)
 		}
-		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.SujetoReactivado{SujetoId: otro, TenantId: "ai27", ReactivadoEn: timestamppb.New(hecho.Add(2 * time.Hour))})
+		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.SujetoReactivado{SujetoId: sj(otro), IdpSubject: otro, TenantId: "ai27", ReactivadoEn: timestamppb.New(hecho.Add(2 * time.Hour))})
 		publicar(pool.TipoSujetoReactivado, js)
 		desactivar(hecho.Add(time.Hour)) // reentrega vieja: no pisa a la reactivación
-		js, _ = protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolRevocado{SujetoId: otro, TenantId: "ai27", Rol: "cotizacion", RevocadoEn: timestamppb.New(hecho.Add(3 * time.Hour))})
+		js, _ = protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolRevocado{SujetoId: sj(otro), IdpSubject: otro, TenantId: "ai27", Rol: "cotizacion", RevocadoEn: timestamppb.New(hecho.Add(3 * time.Hour))})
 		publicar(pool.TipoRolRevocado, js)
 		if got := transferible(); got != http.StatusConflict {
 			t.Errorf("destino sin rol: %d, quiere 409", got)
@@ -512,7 +643,7 @@ func TestPoolCotizacion(t *testing.T) {
 		if nuevo.ResponsableId.String() == cot3 {
 			destino = cot1
 		}
-		r := a("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": destino})
+		r := a("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": sj(destino)})
 		if got := reclamoDe(r); got.ResponsableId.String() != destino {
 			t.Errorf("transferido a %s, quiere %s", got.ResponsableId, destino)
 		}
@@ -523,7 +654,7 @@ func TestPoolCotizacion(t *testing.T) {
 			t.Errorf("filas de override del administrador: %d (err %v); quiere 2 (envío y transferencia)", n, err)
 		}
 		// El administrador no transfiere con una versión vieja ni a un ejecutivo.
-		if r := a("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": cot1}); r.code != http.StatusConflict {
+		if r := a("POST", rutaSol+"/transferencias", map[string]any{"version_esperada": nuevo.Version, "responsable_destino_id": sj(cot1)}); r.code != http.StatusConflict {
 			t.Errorf("versión vieja: %d, quiere 409", r.code)
 		}
 	})
