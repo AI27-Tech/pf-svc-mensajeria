@@ -8,8 +8,6 @@ import (
 
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/google/uuid"
-
-	"github.com/AI27-Tech/pf-svc-mensajeria/internal/dbtest"
 )
 
 // TestTransferirEmergenciaDestinoIdDeSujetoHTTP cubre DEC-148 #77 (DT-28) en las
@@ -92,6 +90,38 @@ func TestTransferirEmergenciaDestinoIdDeSujetoHTTP(t *testing.T) {
 		rechazado(op.nombre, op.f, "id de sujeto sin sub conocido", huerfano, 1)
 	}
 
+	// La guarda corre DESPUÉS de tomarActivo: con versión vencida o sin ser el
+	// responsable ni tener mando, el id de sujeto responde igual que un `sub`
+	// (conflicto de versión / 403), nunca destino_invalido_en_viaje; si no, se
+	// sondearía qué valores son ids de sujeto. Valores esperados a mano.
+	for _, op := range []struct {
+		nombre string
+		f      func(string, int64) *httpResp
+	}{{"por viaje", porViaje}, {"por id", porId}} {
+		for _, destino := range []struct{ motivo, id string }{{"id de sujeto", s1}, {"sub", uuid.NewString()}} {
+			if r := op.f(destino.id, 99); r.code != http.StatusConflict || r.codigo != "conflicto_version_reclamo" {
+				t.Errorf("%s/versión vieja/%s: %d %q %s; quiere 409 conflicto_version_reclamo", op.nombre, destino.motivo, r.code, r.codigo, r.cuerpo)
+			}
+		}
+	}
+	sinPermiso := func(destino string) *httpResp {
+		return mandar(e.transferir(reaccionB, "reaccion", destino, 1))
+	}
+	sinPermisoPorId := func(destino string) *httpResp {
+		return mandar(e.pedir(reaccionB, "reaccion", http.MethodPost, e.porID(e.caso)+"/transferencias",
+			msgclient.TransferenciaEntrada{ResponsableDestinoId: uuid.MustParse(destino), VersionEsperada: 1}))
+	}
+	for nombre, f := range map[string]func(string) *httpResp{"por viaje": sinPermiso, "por id": sinPermisoPorId} {
+		for _, destino := range []struct{ motivo, id string }{{"id de sujeto", s1}, {"sub", uuid.NewString()}} {
+			if r := f(destino.id); r.code != http.StatusForbidden || r.codigo != "prohibido" {
+				t.Errorf("%s/sin permiso/%s: %d %q %s; quiere 403 prohibido", nombre, destino.motivo, r.code, r.codigo, r.cuerpo)
+			}
+		}
+	}
+	if _, a, ver := e.activo(t); a != reaccionA || ver != 1 {
+		t.Fatalf("tras los rechazos previos: responsable %q v%d, quiere %q v1", a, ver, reaccionA)
+	}
+
 	// Cada aceptación avanza la versión; se alternan las dos operaciones.
 	aceptado("por viaje", porViaje, "sub conocido", p1, 1)
 	rechazado("por id", porId, "id de sujeto tras transferir", s1, 2)
@@ -99,7 +129,6 @@ func TestTransferirEmergenciaDestinoIdDeSujetoHTTP(t *testing.T) {
 	aceptado("por viaje", porViaje, "ni sujeto ni sub", uuid.NewString(), 3)
 	aceptado("por id", porId, "sujeto de uno y sub de otro", ambos, 4)
 	aceptado("por viaje", porViaje, "sujeto de uno y sub de otro (viaje)", uuid.NewString(), 5)
-	_ = dbtest.Role
 }
 
 type httpResp struct {

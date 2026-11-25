@@ -16,12 +16,13 @@
 - `internal/reclamos/reclamos.go`: la consulta de #72 pasa a `ExigirSubEnViaje`, que usan la transferencia del viaje y la de emergencias (sin duplicar lógica).
 - `internal/emergencias/emergencias.go`: `Transferir` llama a la guarda tras `tomarActivo`.
 - `emergencias_api.go`: `traducirEmergencia` mapea `reclamos.ErrDestinoInvalidoEnViaje` a `409 destino_invalido_en_viaje` y se actualiza el comentario del destino.
-- `adapters/http/emergencias/destino_integration_test.go`: prueba con valores a mano de las dos operaciones.
+- `adapters/http/emergencias/destino_integration_test.go`: prueba con valores a mano de las dos operaciones, con el orden de la guarda: un id de sujeto con versión vieja responde `conflicto_version_reclamo` y sin ser responsable ni tener mando responde 403 `prohibido`, igual que un `sub` (mover la guarda antes de `tomarActivo` rompe ambos casos).
+- `internal/emergencias/emergencias_integration_test.go`: `TestTransferirDestinoIdDeSujeto` prueba la guarda directo sobre `Servicio.Transferir` (error, orden y sin efecto), sin pasar por el mapeo HTTP.
 - `README.md`: la sección del destino cubre emergencias.
 
 **Archivos modificados:**
 - `internal/reclamos/reclamos.go`, `internal/emergencias/emergencias.go`, `emergencias_api.go`
-- `adapters/http/emergencias/destino_integration_test.go`
+- `adapters/http/emergencias/destino_integration_test.go`, `internal/emergencias/emergencias_integration_test.go`
 - `README.md`, `CHANGELOG.md`
 
 ## 2026-11-24 17:48 — El destino de una transferencia es el id del sujeto (DEC-148 #74, DT-28)

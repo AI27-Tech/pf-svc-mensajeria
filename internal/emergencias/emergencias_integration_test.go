@@ -12,6 +12,7 @@ import (
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/dbtest"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 )
 
 const (
@@ -530,5 +531,47 @@ func TestActivarTomaLaEmpresaDelViaje(t *testing.T) {
 	}
 	if casos != 2 {
 		t.Fatalf("casos = %d, quiere 2: los rechazos no crean nada", casos)
+	}
+}
+
+// TestTransferirDestinoIdDeSujeto cubre la guarda del destino (DEC-148 #77) sobre
+// Servicio.Transferir, sin pasar por HTTP: un id de sujeto es ErrDestinoInvalidoEnViaje
+// sin efecto; con versión vencida o sin ser responsable ni tener mando responde lo
+// mismo que un `sub` (la guarda corre después de tomarActivo).
+func TestTransferirDestinoIdDeSujeto(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	svc, teardown := setup(t, ctx)
+	defer teardown()
+	admin, closeAdmin := dbtest.AdminConn(t, ctx)
+	defer closeAdmin()
+
+	const sujeto, sub, otroSub = "a1111111-1111-1111-1111-111111111111", "a2222222-2222-2222-2222-222222222222", "a3333333-3333-3333-3333-333333333333"
+	dbtest.Exec(t, ctx, admin, `INSERT INTO mensajeria.rol_sujeto (sujeto_id, idp_subject, rol)
+		VALUES ('`+sujeto+`', '`+sub+`', 'reaccion')`)
+	id := activar(t, ctx, svc, activacn1).EmergenciaID
+	if _, err := svc.Reclamar(ctx, tenant, id, actorA, 0); err != nil {
+		t.Fatalf("A reclama: %v", err)
+	}
+
+	if err := svc.Transferir(ctx, tenant, id, actorA, sujeto, 1, false); !errors.Is(err, reclamos.ErrDestinoInvalidoEnViaje) {
+		t.Fatalf("destino id de sujeto: %v, quiere ErrDestinoInvalidoEnViaje", err)
+	}
+	if err := svc.Transferir(ctx, tenant, id, actorA, sujeto, 99, false); !esConflicto(err) {
+		t.Fatalf("id de sujeto con versión vieja: %v, quiere conflicto de versión", err)
+	}
+	if err := svc.Transferir(ctx, tenant, id, actorB, sujeto, 1, false); !errors.Is(err, emergencias.ErrNoEsResponsable) {
+		t.Fatalf("id de sujeto sin ser responsable: %v, quiere ErrNoEsResponsable", err)
+	}
+	var n, v int
+	if err := admin.QueryRow(ctx, `SELECT count(*), max(version) FROM mensajeria.reclamo_emergencia`).Scan(&n, &v); err != nil || n != 1 || v != 1 {
+		t.Fatalf("tras los rechazos: %d reclamos, versión %d, err %v; quiere 1 y 1", n, v, err)
+	}
+	// El `sub` del mismo sujeto y uno desconocido pasan.
+	if err := svc.Transferir(ctx, tenant, id, actorA, sub, 1, false); err != nil {
+		t.Fatalf("A→sub: %v", err)
+	}
+	if err := svc.Transferir(ctx, tenant, id, sub, otroSub, 2, false); err != nil {
+		t.Fatalf("sub→desconocido: %v", err)
 	}
 }
