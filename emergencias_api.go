@@ -12,6 +12,7 @@ import (
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/alcance"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/autorizacion"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/emergencias"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 	"github.com/google/uuid"
 )
@@ -444,8 +445,8 @@ func (a *emergenciasAPI) transferir(ctx context.Context, emergenciaID msgclient.
 		}
 	}
 	// shortcut: no se verifica que el destino tenga rol `reaccion` (contrato,
-	// DEC-130): mensajeria no conoce los roles de otros usuarios; se verifica
-	// cuando haya proyección de identidad o el bff lo valide antes.
+	// DEC-130): se verifica cuando el bff lo valide antes o se decida. Sí se
+	// rechaza un id de sujeto que no es `sub` conocido (DEC-148 #77, en Transferir).
 	err = a.emergencias.Transferir(ctx, tenant, eid, claims.Subject, body.ResponsableDestinoId.String(),
 		msgtipos.VersionReclamo(body.VersionEsperada), conMando(claims))
 	if err != nil {
@@ -642,7 +643,7 @@ func conMando(c *auth.Claims) bool {
 // conflicto de versión → 409 conflicto_version_reclamo; transición inválida →
 // 409; caso cerrado → 409 emergencia_cerrada; sin reclamo, caso o viaje
 // inexistente (o de otra empresa, DEC-133) → 404; no es el responsable → 403
-// (DEC-126). nil pasa como nil.
+// (DEC-126); destino que es id de sujeto → 409 destino_invalido_en_viaje (DEC-148 #77). nil pasa como nil.
 func traducirEmergencia(err error) error {
 	var conflicto emergencias.ErrConflictoVersion
 	switch {
@@ -662,6 +663,8 @@ func traducirEmergencia(err error) error {
 		return platformerrors.NewNoEncontrado("viaje no encontrado")
 	case errors.Is(err, emergencias.ErrNoEsResponsable):
 		return platformerrors.NewProhibido("el actor no es el responsable del caso")
+	case errors.Is(err, reclamos.ErrDestinoInvalidoEnViaje):
+		return platformerrors.NewConflictoCodigo("destino_invalido_en_viaje", "mensajeria: destino_invalido_en_viaje")
 	}
 	return traducir(err)
 }

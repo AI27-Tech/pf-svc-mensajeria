@@ -23,6 +23,7 @@ import (
 	msgclient "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/mensajeria"
 	"github.com/AI27-Tech/pf-pkg-platform-go/outbox"
 	"github.com/AI27-Tech/pf-svc-mensajeria/internal/auditoria"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/reclamos"
 	msgtipos "github.com/AI27-Tech/pf-svc-mensajeria/internal/tipos"
 )
 
@@ -482,6 +483,9 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, emergenciaID, reclamoI
 // caso, así que la previa queda obsoleta (P20). Mismas guardas que Liberar: sin
 // reclamo activo → ErrSinReclamo; versión no vigente → ErrConflictoVersion; actor
 // que no es el responsable y no tiene mando → ErrNoEsResponsable (DEC-126).
+// Después de esas guardas y antes de escribir, un destino que es id de sujeto y no
+// `sub` conocido (rol_sujeto) → reclamos.ErrDestinoInvalidoEnViaje (DEC-148 #77,
+// DT-28); un `sub`, conocido o no, pasa. El rol del destino no se valida.
 func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, actor, destino string, esperada msgtipos.VersionReclamo, mando bool) error {
 	if emergenciaID == "" || destino == "" {
 		return fmt.Errorf("emergencias: transferencia inválida: faltan emergencia_id o destino")
@@ -495,6 +499,9 @@ func (s *Servicio) Transferir(ctx context.Context, tenantID, emergenciaID, actor
 
 	anteriorID, err := tomarActivo(ctx, tx, tenantID, emergenciaID, actor, esperada, mando)
 	if err != nil {
+		return err
+	}
+	if err := reclamos.ExigirSubEnViaje(ctx, tx, destino); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx,
