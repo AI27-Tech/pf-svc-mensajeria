@@ -474,16 +474,71 @@ func TestPoolCotizacion(t *testing.T) {
 		}
 	})
 
-	// El viaje no valida ni traduce el destino (regla vigente; DT-28 queda abierta
-	// para el viaje): el valor entra tal cual como responsable del reclamo.
-	t.Run("tipo=viaje: el destino no se valida ni se traduce", func(t *testing.T) {
+	// DEC-148 #76: en el viaje el destino sigue siendo el `sub` (V1, no se traduce),
+	// salvo que sea el id de un SUJETO que no es un `sub` conocido: eso se rechaza.
+	// Valores a mano: el id del sujeto de cot2 es distinto de su sub.
+	t.Run("tipo=viaje: un id de sujeto se rechaza y un sub se acepta como en V1", func(t *testing.T) {
 		if r := como(eje, "ejecutivo")("POST", rutaViaje+"/reclamos", version(0)); r.code != http.StatusCreated {
 			t.Fatalf("el ejecutivo reclama el viaje: %d %s", r.code, r.cuerpo)
 		}
-		desconocido := uuid.NewString() // sin fila en rol_sujeto
-		r := como(eje, "ejecutivo")("POST", rutaViaje+"/transferencias", map[string]any{"version_esperada": 1, "responsable_destino_id": desconocido})
-		if r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != desconocido {
-			t.Errorf("transferir el viaje: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, desconocido)
+		contar := func(sql string) int {
+			t.Helper()
+			var n int
+			if err := rp.QueryRow(ctx, sql).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+		transferir := func(sub, rol string, ver int64, destino string) resp {
+			return como(sub, rol)("POST", rutaViaje+"/transferencias", map[string]any{"version_esperada": ver, "responsable_destino_id": destino})
+		}
+		rechazado := func(motivo, destino string) {
+			t.Helper()
+			salidas := contar(`SELECT count(*) FROM mensajeria.outbox`)
+			auditadas := contar(`SELECT count(*) FROM mensajeria.auditoria_mensajeria`)
+			if r := transferir(eje, "ejecutivo", 1, destino); r.code != http.StatusConflict || codigo(r) != "destino_invalido_en_viaje" {
+				t.Errorf("%s: %d %s; quiere 409 destino_invalido_en_viaje", motivo, r.code, r.cuerpo)
+			}
+			if got := reclamoActivo(t, ctx, rp, convViaje); got.ResponsableId.String() != eje || got.Version != 1 {
+				t.Errorf("%s: el reclamo del llamante cambió: %s v%d", motivo, got.ResponsableId, got.Version)
+			}
+			if n := contar(`SELECT count(*) FROM mensajeria.outbox`); n != salidas {
+				t.Errorf("%s: outbox pasó de %d a %d filas", motivo, salidas, n)
+			}
+			if n := contar(`SELECT count(*) FROM mensajeria.auditoria_mensajeria`); n != auditadas {
+				t.Errorf("%s: la auditoría pasó de %d a %d filas", motivo, auditadas, n)
+			}
+		}
+		rechazado("id de sujeto con rol y sub", sj(cot2))
+		huerfano := uuid.NewString() // sujeto cuyo evento aún no trae idp_subject
+		js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: huerfano, TenantId: "ai27", Rol: "ejecutivo", AsignadoEn: timestamppb.New(hecho)})
+		publicar(pool.TipoRolAsignado, js)
+		rechazado("id de sujeto sin idp_subject conocido", huerfano)
+		// El administrador no interviene en el viaje: sin cambio (403).
+		if r := transferir(adm, "administrador", 1, sj(cot2)); r.code != http.StatusForbidden {
+			t.Errorf("administrador transfiere el viaje: %d, quiere 403", r.code)
+		}
+
+		// Un valor que es a la vez id de un sujeto y `sub` de otro es un sub conocido:
+		// se acepta (la regla rechaza solo lo que NO resuelve como idp_subject).
+		ambos := uuid.NewString()
+		for _, f := range [][2]string{{uuid.NewString(), ambos}, {ambos, uuid.NewString()}} { // {sujeto_id, idp_subject}
+			js, _ := protojson.MarshalOptions{UseProtoNames: true}.Marshal(&eventosv1.RolAsignado{SujetoId: f[0], IdpSubject: f[1], TenantId: "ai27", Rol: "ejecutivo", AsignadoEn: timestamppb.New(hecho)})
+			publicar(pool.TipoRolAsignado, js)
+		}
+		if r := transferir(eje, "ejecutivo", 1, ambos); r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != ambos {
+			t.Fatalf("transferir el viaje a un valor que es sujeto y sub: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, ambos)
+		}
+		// Un sub conocido (el de otro ejecutivo, con su fila en rol_sujeto) se acepta.
+		eje2 := uuid.NewString()
+		asignar(eje2, "ejecutivo", hecho)
+		if r := transferir(ambos, "ejecutivo", 2, eje2); r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != eje2 {
+			t.Errorf("transferir el viaje a un sub conocido: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, eje2)
+		}
+		// Un UUID que no es ni sujeto ni sub tampoco se valida, como en V1.
+		desconocido := uuid.NewString()
+		if r := transferir(eje2, "ejecutivo", 3, desconocido); r.code != http.StatusCreated || reclamoDe(r).ResponsableId.String() != desconocido {
+			t.Errorf("transferir el viaje a un sub desconocido: %d %s; quiere 201 con responsable %s", r.code, r.cuerpo, desconocido)
 		}
 	})
 
