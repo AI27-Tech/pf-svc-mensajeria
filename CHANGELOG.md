@@ -6,7 +6,7 @@
 
 **Cambios:**
 - La activación interna conserva el origen `operacion` y se guarda bajo la empresa del viaje. No cambia ningún otro permiso de emergencia.
-- La bandeja del sujeto sigue listando solo conversaciones de viaje y omite las dirigidas a otro. El Administrador no puede abrir el chat dirigido a otro ni el que tiene un reclamo activo ajeno. Enviar y liberar mantienen las guardas de reclamo propio y versión vigente.
+- La bandeja del sujeto sigue listando solo conversaciones de viaje y omite las dirigidas a otro. El Administrador puede abrir un chat visible aunque otro lo esté atendiendo. Enviar y liberar mantienen las guardas de reclamo propio y versión vigente.
 - No se habilita transferir, marcar atendida, registrar recibos ni listar el trabajo por id de bandeja para el Administrador. No cambian permisos de la conversación de solicitud, contratos ni migraciones.
 
 **Archivos modificados:**

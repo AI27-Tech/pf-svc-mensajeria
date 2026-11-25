@@ -225,11 +225,8 @@ func (s *Servicio) Conversacion(ctx context.Context, conversacionID string, c *a
 	          AND b.tipo = 'chat'`
 	args := []any{conversacionID, tenant}
 	if adminViaje && a == Leer {
-		// El nuevo permiso no abre el chat dirigido a otro ni el que está atendiendo otro.
-		q += ` AND ` + vinculo.CondicionVisible("$3", "$4") + `
-		       AND NOT EXISTS (SELECT 1 FROM mensajeria.reclamo rec
-		                        WHERE rec.conversacion_id = r.conversacion_id AND rec.tenant_id = r.tenant_id
-		                          AND rec.cerrado_en IS NULL AND rec.actor_real::text <> lower($3::text))`
+		// La lectura usa la visibilidad de la bandeja, no la propiedad del reclamo.
+		q += ` AND ` + vinculo.CondicionVisible("$3", "$4")
 		args = append(args, c.Subject, s.Ventana.Segundos())
 	}
 	var visible bool

@@ -159,7 +159,7 @@ func TestAdministradorChatViaje(t *testing.T) {
 		pedir(t, http.MethodDelete, ruta+"/reclamos/"+r2.Id.String()+"?version_esperada=2", nil, http.StatusNoContent)
 	})
 
-	t.Run("no toma ni usa el reclamo de terceros", func(t *testing.T) {
+	t.Run("lee el chat visible sin usar el reclamo de terceros", func(t *testing.T) {
 		otraEmpresa := uuid.NewString()
 		ajeno := nuevoViaje(otraEmpresa, uuid.New())
 		rutaAjena := "/api/v1/conversaciones/" + ajeno.String()
@@ -167,9 +167,11 @@ func TestAdministradorChatViaje(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pedir(t, http.MethodGet, rutaAjena, nil, http.StatusForbidden)
-		_, err = api.ListarMensajes(ctxAdm, ajeno, msgclient.ListarMensajesParams{})
-		categoria(t, err, platformerrors.CategoryProhibido)
+		pedir(t, http.MethodGet, rutaAjena, nil, http.StatusOK)
+		pag, err := api.ListarMensajes(ctxAdm, ajeno, msgclient.ListarMensajesParams{})
+		if err != nil || len(pag.Items) != 0 {
+			t.Fatalf("historial sin mensajes: %+v, %v; quiere una página vacía", pag, err)
+		}
 		pedir(t, http.MethodPost, rutaAjena+"/mensajes", envio(1), http.StatusConflict)
 		pedir(t, http.MethodDelete, rutaAjena+"/reclamos/"+r.Id.String()+"?version_esperada=1", nil, http.StatusForbidden)
 		c, err := api.ObtenerConversacion(ctxEj, ajeno)
