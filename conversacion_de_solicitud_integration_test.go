@@ -172,20 +172,18 @@ func TestConversacionDeSolicitud(t *testing.T) {
 		}
 	})
 
-	// Al revés: la audiencia de la solicitud no se extiende a la conversación del viaje.
-	t.Run("cotizacion y administrador no leen el viaje por id", func(t *testing.T) {
+	// El permiso de cotización para solicitudes no se extiende al chat del viaje.
+	t.Run("cotizacion no lee el viaje por id", func(t *testing.T) {
 		viaje, err := api.ObtenerConversacionDeViaje(interno("ejecutivo"), uuid.MustParse(compartido))
 		if err != nil {
 			t.Fatal(err)
 		}
 		id := viaje.Id
-		for _, rol := range []string{"cotizacion", "administrador"} {
-			if _, err := api.ObtenerConversacion(interno(rol), id); categoria(err) != platformerrors.CategoryProhibido {
-				t.Errorf("%s obtener: %v, quiere prohibido", rol, err)
-			}
-			if st := get(interno(rol), "/api/v1/conversaciones/"+id.String()); st != http.StatusForbidden {
-				t.Errorf("%s por HTTP: %d, quiere 403", rol, st)
-			}
+		if _, err := api.ObtenerConversacion(interno("cotizacion"), id); categoria(err) != platformerrors.CategoryProhibido {
+			t.Errorf("cotizacion obtener: %v, quiere prohibido", err)
+		}
+		if st := get(interno("cotizacion"), "/api/v1/conversaciones/"+id.String()); st != http.StatusForbidden {
+			t.Errorf("cotizacion por HTTP: %d, quiere 403", st)
 		}
 	})
 

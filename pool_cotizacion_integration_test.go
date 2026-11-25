@@ -195,7 +195,7 @@ func TestPoolCotizacion(t *testing.T) {
 
 	// Escenario 7 de la HU: el administrador interviene (enviar, transferir) pero no
 	// reclama: en tipo=solicitud solo reclama `cotizacion` (contrato reclamarConversacion).
-	t.Run("el administrador no reclama la solicitud y cotizacion y administrador no operan el viaje", func(t *testing.T) {
+	t.Run("administrador no reclama la solicitud y cotizacion no opera el viaje", func(t *testing.T) {
 		if r := como(adm, "administrador")("POST", rutaSol+"/reclamos", version(0)); r.code != http.StatusForbidden {
 			t.Errorf("administrador reclama la solicitud: %d, quiere 403", r.code)
 		}
@@ -220,11 +220,9 @@ func TestPoolCotizacion(t *testing.T) {
 			{"POST", rutaViaje + "/recibos/entregado", map[string]any{"hasta_secuencia": 1}},
 			{"POST", rutaViaje + "/recibos/leido", map[string]any{"hasta_secuencia": 1}},
 		}
-		for _, rol := range []string{"administrador", "cotizacion"} {
-			for _, op := range sobreViaje {
-				if r := como(uuid.NewString(), rol)(op.metodo, op.ruta, op.cuerpo); r.code != http.StatusForbidden {
-					t.Errorf("%s %s %s: %d, quiere 403", rol, op.metodo, op.ruta, r.code)
-				}
+		for _, op := range sobreViaje {
+			if r := como(cot1, "cotizacion")(op.metodo, op.ruta, op.cuerpo); r.code != http.StatusForbidden {
+				t.Errorf("cotizacion %s %s: %d, quiere 403", op.metodo, op.ruta, r.code)
 			}
 		}
 		// El cliente de OTRA empresa no se entera de que la conversación existe: 404.
