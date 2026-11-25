@@ -198,8 +198,8 @@ func (a *emergenciasAPI) ListarEmergencias(ctx context.Context, viajeID msgclien
 }
 
 // ActivarEmergencia crea el caso bajo la empresa del viaje, lo active el cliente
-// o Monitoreo (DEC-133). Un interno necesita rol de monitoreo (DEC-045 #9); si
-// no, 403. Monitoreo sobre un viaje fuera de sus clientes: 404 (DEC-149 #6).
+// o un interno (DEC-133). Solo Monitoreo y Administrador lo activan como internos
+// (DEC-152). Monitoreo sobre un viaje fuera de sus clientes: 404 (DEC-149 #6).
 // Viaje que mensajeria no conoce, o de otra empresa que la del cliente que
 // activa: 404 (DEC-132 #2). Devuelve el caso tal como quedó, proyectado por
 // audiencia, como pide el contrato.

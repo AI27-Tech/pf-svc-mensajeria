@@ -289,8 +289,8 @@ func queryInt(r *http.Request, nombre string) (*int64, error) {
 }
 
 // reclamar toma del pool el reclamo de una conversación. Exige claims, autoriza
-// la escritura con internal/autorizacion (rol `ejecutivo`, DEC-127; supervisor y
-// coordinador solo leen, DEC-131), reclama con la versión esperada y
+// el rol según el tipo de conversación (DEC-127, DEC-148 y DEC-152),
+// reclama con la versión esperada y
 // devuelve 201 con el Reclamo. El conflicto de versión del dominio, también el de
 // una conversación que ya tiene responsable (DEC-123), se traduce a 409
 // (addendum §4 punto 5).
@@ -350,7 +350,7 @@ func (h Handlers) liberar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Liberar)
 	if err != nil {
 		escribirError(w, err)
 		return
@@ -408,7 +408,7 @@ func (h Handlers) transferir(w http.ResponseWriter, r *http.Request) {
 }
 
 // Transferir elige la transferencia según el rol: el administrador interviene
-// (solo la conversación de la solicitud, que la guarda ya le restringe), el resto
+// (solo la conversación de la solicitud, DEC-148), el resto
 // transfiere su propio reclamo. Exportada para que la superficie en proceso siga
 // el MISMO camino.
 func (h Handlers) Transferir(ctx context.Context, claims *auth.Claims, tenant, convID string, entrada msgclient.TransferenciaEntrada, motivo string) error {
@@ -432,7 +432,7 @@ func (h Handlers) enviar(w http.ResponseWriter, r *http.Request) {
 	}
 	convID := r.PathValue("id")
 
-	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Escribir)
+	tenant, err := h.Autz.Conversacion(r.Context(), convID, claims, autorizacion.Enviar)
 	if err != nil {
 		escribirError(w, err)
 		return

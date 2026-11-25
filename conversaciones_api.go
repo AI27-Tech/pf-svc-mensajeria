@@ -172,7 +172,7 @@ func (a *conversacionesAPI) EnviarMensaje(ctx context.Context, conversacionID ms
 		return nil, err
 	}
 	id := conversacionID.String()
-	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Enviar)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +274,7 @@ func (a *conversacionesAPI) LiberarReclamo(ctx context.Context, conversacionID, 
 		return err
 	}
 	id := conversacionID.String()
-	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Escribir)
+	tenant, err := a.conv.Autz.Conversacion(ctx, id, claims, autorizacion.Liberar)
 	if err != nil {
 		return err
 	}

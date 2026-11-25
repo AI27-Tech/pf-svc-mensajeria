@@ -153,6 +153,7 @@ func New(p Pools, d Deps) (*Module, error) {
 	m.alcance = alcance.NuevaProyeccion(p.Chat)
 	ventana := vinculo.Ventana(d.VentanaDisponible)
 	m.conversacion.Ventana, m.reclamos.Ventana, m.bandejas.Ventana = ventana, ventana, ventana
+	m.autz.Ventana = ventana
 
 	if d.Publisher != nil {
 		// Relay de outbox sobre el pool/rol svc_mensajeria (chat). Publica el
