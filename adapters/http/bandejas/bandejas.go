@@ -27,7 +27,7 @@ type Autorizador interface {
 
 // Trabajador sirve el bootstrap y el catch-up de una bandeja (internal/bandejas).
 type Trabajador interface {
-	// lector es autorizacion.LectorDirigidas: el Ejecutivo no ve las
+	// lector es autorizacion.LectorDirigidas: Ejecutivo y Administrador no ven las
 	// conversaciones dirigidas a otro (DEC-128).
 	Trabajo(ctx context.Context, tenantID, bandejaID, lector string) ([]msgclient.Conversacion, int64, error)
 	CambiosDesde(ctx context.Context, tenantID, bandejaID, lector string, desde int64) ([]msgclient.Conversacion, int64, bool, error)
@@ -89,10 +89,9 @@ func (h Handlers) trabajo(w http.ResponseWriter, r *http.Request) {
 }
 
 // miTrabajo sirve el trabajo de la bandeja del SUJETO, sin {id}: la unión de las
-// bandejas de chat de todos los tenants (DEC-127, DEC-129). La ven el Ejecutivo y,
-// en lectura, Supervisor y Coordinador (DEC-131); cualquier otro rol y el cliente
-// reciben 404 (no tienen bandeja, contrato listarTrabajoMiBandeja). El Ejecutivo
-// no ve las conversaciones dirigidas a otro Ejecutivo (DEC-128).
+// bandejas de chat de todos los tenants (DEC-127, DEC-129). La ven Ejecutivo y
+// Administrador, sin las conversaciones dirigidas a otro (DEC-128, DEC-152),
+// y Supervisor y Coordinador en lectura (DEC-131). Los demás reciben 404.
 func (h Handlers) miTrabajo(w http.ResponseWriter, r *http.Request) {
 	claims := boundary.Claims(r.Context())
 	if claims == nil {

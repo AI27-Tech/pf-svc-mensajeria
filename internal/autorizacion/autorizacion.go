@@ -33,6 +33,7 @@ import (
 	roles "github.com/AI27-Tech/pf-pkg-contracts/packages/api-client-go/roles"
 	"github.com/AI27-Tech/pf-pkg-platform-go/auth"
 	platformerrors "github.com/AI27-Tech/pf-pkg-platform-go/errors"
+	"github.com/AI27-Tech/pf-svc-mensajeria/internal/vinculo"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -45,7 +46,8 @@ type Consultor interface {
 
 // Servicio resuelve el acceso a los recursos contra la proyección local.
 type Servicio struct {
-	db Consultor
+	db      Consultor
+	Ventana vinculo.Ventana // La misma disponibilidad del dueño que usa la bandeja.
 }
 
 // NewServicio construye la guarda de autorización sobre el pool de chat.
@@ -59,11 +61,14 @@ type Accion int
 const (
 	// Leer: detalle, mensajes y bandeja.
 	Leer Accion = iota
-	// Escribir: enviar, liberar, transferir, atendida y recibos.
+	// Escribir: transferir, marcar atendida y registrar recibos.
 	Escribir
-	// Reclamar: tomar la conversación del pool. Solo el Ejecutivo; a diferencia
-	// de Escribir, el Cliente tampoco (un reclamo lo haría dueño, DEC-128).
+	// Reclamar: tomar la conversación del pool. El Cliente no reclama (DEC-128).
 	Reclamar
+	// Enviar: escribir un mensaje; el dominio verifica el reclamo.
+	Enviar
+	// Liberar: devolver al pool el reclamo propio.
+	Liberar
 )
 
 // Permiso es lo que un interno pide sobre un caso de emergencia.
@@ -80,7 +85,7 @@ const (
 	// CerrarCaso: monitoreo o Administrador (ADR 21 §5, E8-T18); nunca Reacción
 	// ni Ejecutivo.
 	CerrarCaso
-	// ActivarCaso: activar un caso sobre el viaje; solo monitoreo (DEC-045 #9).
+	// ActivarCaso: activar un caso sobre el viaje; monitoreo o Administrador (DEC-152).
 	ActivarCaso
 	// AnotarCaso: agregar una nota; monitoreo o Administrador. Reacción lee y no
 	// escribe (DEC-121 #4, DEC-135).
@@ -115,7 +120,7 @@ var (
 		AtenderCaso:   {roles.RolReaccion},
 		MoverCaso:     {roles.RolReaccion, roles.RolSupervisor, roles.RolCoordinador},
 		CerrarCaso:    {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
-		ActivarCaso:   {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador},
+		ActivarCaso:   {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
 		AnotarCaso:    {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
 		VerCasosViaje: {roles.RolMonitorista, roles.RolSupervisor, roles.RolCoordinador, roles.RolAdministrador},
 	}
@@ -128,16 +133,16 @@ func tiene(rs []roles.Rol, rol string) bool { return slices.Contains(rs, roles.R
 // sí lo nombran usan Emergencia, que además resuelve el tenant.
 func PuedeEnEmergencias(rol string, p Permiso) bool { return tiene(rolesEmergencia[p], rol) }
 
-// LeeBandejaChat dice si el rol ve la bandeja única de conversaciones: el
-// Ejecutivo por ser miembro (DEC-127) y Supervisor/Coordinador en lectura
-// (DEC-131).
-func LeeBandejaChat(rol string) bool { return tiene(rolesConversacion[Leer], rol) }
+// LeeBandejaChat dice si el rol ve la bandeja de viajes del sujeto, sin {id}.
+func LeeBandejaChat(rol string) bool {
+	return rol == string(roles.RolAdministrador) || tiene(rolesConversacion[Leer], rol)
+}
 
 // LectorDirigidas es el lector de la bandeja de conversaciones para el filtro
-// de dirigidas (DEC-128): el Ejecutivo que lee, que no ve las dirigidas a otro.
+// de dirigidas (DEC-128): Ejecutivo y Administrador no ven las dirigidas a otro.
 // Vacío para Supervisor y Coordinador, que las ven todas en lectura (DEC-131).
 func LectorDirigidas(c *auth.Claims) string {
-	if c.Rol == string(roles.RolEjecutivo) {
+	if c.Rol == string(roles.RolEjecutivo) || c.Rol == string(roles.RolAdministrador) {
 		return c.Subject
 	}
 	return ""
@@ -187,9 +192,8 @@ func (s *Servicio) tenantYTipo(ctx context.Context, conversacionID string, c *au
 
 // Conversacion autoriza la acción sobre la conversación y devuelve su tenant.
 // Cualquier usuario de la empresa cliente dueña lee y escribe (DEC-124), pero
-// no reclama (contrato reclamarConversacion: solo `ejecutivo`): prohibido. Un
-// interno necesita el rol de la acción (rolesConversacion) y que la conversación
-// esté enrutada a la bandeja de conversaciones (DEC-127); si no, prohibido.
+// no reclama. Un interno necesita permiso para la acción y el tipo, y que la
+// conversación esté enrutada a la bandeja de conversaciones (DEC-127).
 func (s *Servicio) Conversacion(ctx context.Context, conversacionID string, c *auth.Claims, a Accion) (string, error) {
 	tenant, tipo, err := s.tenantYTipo(ctx, conversacionID, c)
 	if err == nil && c.Audiencia == auth.AudienciaCliente && a == Reclamar {
@@ -198,29 +202,42 @@ func (s *Servicio) Conversacion(ctx context.Context, conversacionID string, c *a
 	if err != nil || c.Audiencia == auth.AudienciaCliente {
 		return tenant, err
 	}
-	permitidos := rolesConversacion[a]
-	if tipo == "solicitud" {
-		permitidos = rolesSolicitud[a]
+	accionBase := a
+	if a == Enviar || a == Liberar {
+		accionBase = Escribir
 	}
-	if !tiene(permitidos, c.Rol) {
+	permitidos := rolesConversacion[accionBase]
+	if tipo == "solicitud" {
+		permitidos = rolesSolicitud[accionBase]
+	}
+	adminViaje := tipo == "viaje" && c.Rol == string(roles.RolAdministrador)
+	concedida := adminViaje && (a == Leer || a == Enviar || a == Reclamar || a == Liberar)
+	if !concedida && !tiene(permitidos, c.Rol) {
 		return "", platformerrors.NewProhibido("autorizacion: el rol no tiene esa acción sobre la conversación")
 	}
 
-	var enrutada bool
-	err = s.db.QueryRow(ctx,
-		`SELECT EXISTS (
-		   SELECT 1
-		     FROM mensajeria.ruta_conversacion r
-		     JOIN mensajeria.bandeja b
-		       ON b.id = r.bandeja_id AND b.tenant_id = r.tenant_id
-		    WHERE r.conversacion_id = $1 AND r.tenant_id = $2 AND r.activa
-		      AND b.tipo = 'chat')`,
-		conversacionID, tenant,
-	).Scan(&enrutada)
+	q := `SELECT EXISTS (
+	       SELECT 1
+	         FROM mensajeria.ruta_conversacion r
+	         JOIN mensajeria.bandeja b
+	           ON b.id = r.bandeja_id AND b.tenant_id = r.tenant_id
+	        WHERE r.conversacion_id = $1 AND r.tenant_id = $2 AND r.activa
+	          AND b.tipo = 'chat'`
+	args := []any{conversacionID, tenant}
+	if adminViaje && a == Leer {
+		// La lectura usa la visibilidad de la bandeja, no la propiedad del reclamo.
+		q += ` AND ` + vinculo.CondicionVisible("$3", "$4")
+		args = append(args, c.Subject, s.Ventana.Segundos())
+	}
+	var visible bool
+	err = s.db.QueryRow(ctx, q+`)`, args...).Scan(&visible)
 	if err != nil {
 		return "", platformerrors.NewRotoErr(err, "autorizacion: verificar ruta de la conversación")
 	}
-	if !enrutada {
+	if !visible {
+		if adminViaje && a == Leer {
+			return "", platformerrors.NewProhibido("autorizacion: la conversación no está disponible para el actor")
+		}
 		return "", platformerrors.NewProhibido("autorizacion: la conversación no está en la bandeja de conversaciones")
 	}
 	return tenant, nil
@@ -228,7 +245,7 @@ func (s *Servicio) Conversacion(ctx context.Context, conversacionID string, c *a
 
 // Bandeja autoriza a listar el trabajo de una bandeja por su id y devuelve su
 // tenant. Un Cliente no lista bandejas: no_encontrado, sin revelar si existe
-// (DEC-132 #2). La de chat la leen LeeBandejaChat; la de emergencias,
+// (DEC-132 #2). La de chat conserva sus roles anteriores; la de emergencias,
 // VeBandejaEmergencias. Otro rol interno: prohibido.
 func (s *Servicio) Bandeja(ctx context.Context, bandejaID string, c *auth.Claims) (string, error) {
 	if c == nil {
@@ -250,11 +267,11 @@ func (s *Servicio) Bandeja(ctx context.Context, bandejaID string, c *auth.Claims
 	if err != nil {
 		return "", platformerrors.NewRotoErr(err, "autorizacion: verificar bandeja")
 	}
-	puede := VeBandejaEmergencias
+	visible := VeBandejaEmergencias(c.Rol)
 	if tipo == "chat" {
-		puede = LeeBandejaChat
+		visible = tiene(rolesConversacion[Leer], c.Rol)
 	}
-	if !puede(c.Rol) {
+	if !visible {
 		return "", platformerrors.NewProhibido("autorizacion: el rol no ve esta bandeja")
 	}
 	return tenant, nil
