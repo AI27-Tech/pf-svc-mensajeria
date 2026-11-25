@@ -76,11 +76,31 @@ var ErrNoEsResponsable = errors.New("reclamos: el actor no es el responsable act
 var ErrDestinoNoEsCotizacion = errors.New("reclamos: el destino no tiene el rol cotizacion")
 
 // ErrDestinoInvalidoEnViaje lo devuelve Transferir en una conversación
-// `tipo=viaje` cuando el destino es el id de un SUJETO y no un `sub` conocido
+// `tipo=viaje` (y la transferencia de emergencias, DEC-148 #77) cuando el destino es el id de un SUJETO y no un `sub` conocido
 // (DEC-148 #76): guardarlo como responsable dejaría un reclamo que nadie puede
 // ejercer. No cambia nada: el reclamo del llamante sigue activo. La frontera lo
 // traduce a 409 con `codigo` destino_invalido_en_viaje.
 var ErrDestinoInvalidoEnViaje = errors.New("reclamos: el destino del viaje es un id de sujeto, no un sub")
+
+// ExigirSubEnViaje es la guarda de DEC-148 #76 y #77, compartida por la
+// transferencia del viaje y la de emergencias: devuelve ErrDestinoInvalidoEnViaje
+// si destino resuelve como rol_sujeto.sujeto_id y NO como rol_sujeto.idp_subject.
+// Un `sub`, conocido o no, pasa. Una sola sentencia (una foto de las dos
+// búsquedas), sin FOR SHARE: no escribe y la aceptación no depende de ninguna
+// fila. Va dentro de la tx de la transferencia, antes de escribir nada.
+func ExigirSubEnViaje(ctx context.Context, tx pgx.Tx, destino string) error {
+	var esSujeto, esSub bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto WHERE sujeto_id = $1),
+		        EXISTS (SELECT 1 FROM mensajeria.rol_sujeto WHERE idp_subject = $1)`,
+		destino).Scan(&esSujeto, &esSub); err != nil {
+		return fmt.Errorf("reclamos: leer si el destino es un sujeto: %w", err)
+	}
+	if esSujeto && !esSub {
+		return ErrDestinoInvalidoEnViaje
+	}
+	return nil
+}
 
 // tipoSolicitud es Conversacion.tipo de la conversación de la solicitud.
 const tipoSolicitud = "solicitud"
@@ -425,15 +445,8 @@ func (s *Servicio) transferir(ctx context.Context, tenantID, conversacionID, ori
 		}
 		destino = *sub
 	} else if tipo == tipoViaje {
-		var esSujeto, esSub bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto WHERE sujeto_id = $1),
-			        EXISTS (SELECT 1 FROM mensajeria.rol_sujeto WHERE idp_subject = $1)`,
-			destino).Scan(&esSujeto, &esSub); err != nil {
-			return fmt.Errorf("reclamos: leer si el destino es un sujeto: %w", err)
-		}
-		if esSujeto && !esSub {
-			return ErrDestinoInvalidoEnViaje
+		if err := ExigirSubEnViaje(ctx, tx, destino); err != nil {
+			return err
 		}
 	}
 	actual, _, err := versionConversacion(ctx, tx, tenantID, conversacionID)
