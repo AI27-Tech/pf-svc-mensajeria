@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026:11:25 13:07: El Administrador activa emergencias y atiende el chat del viaje (DEC-152)
+
+**Resumen:** El Administrador activa emergencias internas, consulta la bandeja de viajes y puede leer, reclamar, escribir y liberar su propio reclamo en una conversación de viaje.
+
+**Cambios:**
+- La activación interna conserva el origen `operacion` y se guarda bajo la empresa del viaje. No cambia ningún otro permiso de emergencia.
+- La bandeja del sujeto sigue listando solo conversaciones de viaje y omite las dirigidas a otro. El Administrador no puede abrir el chat dirigido a otro ni el que tiene un reclamo activo ajeno. Enviar y liberar mantienen las guardas de reclamo propio y versión vigente.
+- No se habilita transferir, marcar atendida, registrar recibos ni listar el trabajo por id de bandeja para el Administrador. No cambian permisos de la conversación de solicitud, contratos ni migraciones.
+
+**Archivos modificados:**
+- `internal/autorizacion/autorizacion.go`, `mensajeria.go`, `conversaciones_api.go`, `emergencias_api.go`
+- `adapters/http/bandejas/bandejas.go`, `adapters/http/conversacion/conversacion.go`
+- `administrador_viaje_integration_test.go`, `conversacion_de_solicitud_integration_test.go`, `pool_cotizacion_integration_test.go`, `emergencias_api_test.go`, `adapters/http/emergencias/emergencias_integration_test.go`
+- `CHANGELOG.md`
+
 ## 2026-11-25 — La guarda del destino se extiende a la transferencia de emergencias (DEC-148 #77, DT-28)
 
 **Para quién:** `pf-svc-bff` y el panel interno (una transferencia de emergencia con un id de sujeto ya no se acepta en silencio).

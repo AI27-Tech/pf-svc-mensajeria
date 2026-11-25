@@ -111,7 +111,7 @@ func ctxConRol(aud auth.Audiencia, rol string) context.Context {
 }
 
 // TestEmergencias_RolesDelMonitoreo: listar por viaje lo hacen monitoreo y
-// Administrador; activar, solo monitoreo (DEC-045 #9, DEC-135). Los demás roles
+// Administrador, igual que activar (DEC-135, DEC-152). Los demás roles
 // internos reciben 403 antes de tocar el dominio (el doble entra en pánico si se
 // llamara a Activar).
 func TestEmergencias_RolesDelMonitoreo(t *testing.T) {
@@ -127,7 +127,7 @@ func TestEmergencias_RolesDelMonitoreo(t *testing.T) {
 			t.Errorf("listar como %s: err %v, quiere prohibido", rol, err)
 		}
 	}
-	for _, rol := range []string{"administrador", "reaccion", "ejecutivo", "jefe_operativo"} {
+	for _, rol := range []string{"reaccion", "ejecutivo", "jefe_operativo"} {
 		_, _, err := api.ActivarEmergencia(ctxConRol(auth.AudienciaInterno, rol), uuid.New(),
 			msgclient.ActivarEmergenciaEntrada{ActivacionId: uuid.New()})
 		if platformerrors.AsCategory(err) != platformerrors.CategoryProhibido {

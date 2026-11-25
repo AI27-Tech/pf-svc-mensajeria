@@ -399,8 +399,8 @@ func TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP(t *testing.T) {
 	if rec := activar(monit, "monitorista", noExiste); rec.Code != http.StatusNotFound {
 		t.Fatalf("Monitorista activa sobre un viaje desconocido: status %d, quiere 404; cuerpo %s", rec.Code, rec.Body.String())
 	}
-	// Reacción, Ejecutivo y Administrador no activan (DEC-045 #9): 403 sin crear caso.
-	for _, rol := range []string{"reaccion", "ejecutivo", "administrador", "jefe_operativo"} {
+	// Reacción, Ejecutivo y Jefe Operativo no activan: 403 sin crear caso.
+	for _, rol := range []string{"reaccion", "ejecutivo", "jefe_operativo"} {
 		if rec := activar(uuid.New().String(), rol, emViaje); rec.Code != http.StatusForbidden {
 			t.Fatalf("%s activa: status %d, quiere 403; cuerpo %s", rol, rec.Code, rec.Body.String())
 		}
@@ -441,5 +441,18 @@ func TestCasoDeMonitoreoBajoLaEmpresaDelViajeHTTP(t *testing.T) {
 	if err := e.admin.QueryRow(e.ctx, `SELECT count(*) FROM mensajeria.nota_emergencia WHERE emergencia_id = $1`,
 		porMonitoreo.Id).Scan(&notas); err != nil || notas != 2 {
 		t.Fatalf("notas = %d (err %v), quiere 2: los rechazos no escriben", notas, err)
+	}
+
+	// DEC-152: el Administrador activa sin asignación de monitoreo.
+	adm := uuid.NewString()
+	rec = activar(adm, "administrador", emViaje)
+	var caso msgclient.CasoEmergencia
+	if rec.Code != http.StatusCreated || json.Unmarshal(rec.Body.Bytes(), &caso) != nil {
+		t.Fatalf("administrador activa: status %d, quiere 201 con caso; cuerpo %s", rec.Code, rec.Body)
+	}
+	if caso.ViajeId.String() != emViaje || caso.ClienteId.String() != emTenant ||
+		caso.Origen != msgclient.OrigenActivacionOperacion || caso.Estado != "abierta" ||
+		caso.ActorReal == nil || caso.ActorReal.String() != adm {
+		t.Fatalf("caso del administrador: %+v; quiere viaje, empresa, origen operacion y actor real", caso)
 	}
 }
