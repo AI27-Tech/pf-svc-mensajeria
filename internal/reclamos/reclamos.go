@@ -69,12 +69,24 @@ var ErrNoEsResponsable = errors.New("reclamos: el actor no es el responsable act
 
 // ErrDestinoNoEsCotizacion lo devuelve Transferir en una conversación
 // `tipo=solicitud` cuando el destino no tiene el rol `cotizacion` vigente
-// (DEC-148 #31). No cambia nada: el reclamo del llamante sigue activo. La frontera
-// lo traduce a 409 con `codigo` destino_no_es_cotizacion.
+// (DEC-148 #31): el sujeto destino no existe, no tiene idp_subject conocido, está
+// inactivo o no tiene el rol (DEC-148 #74). No cambia nada: el reclamo del
+// llamante sigue activo. La frontera lo traduce a 409 con `codigo`
+// destino_no_es_cotizacion.
 var ErrDestinoNoEsCotizacion = errors.New("reclamos: el destino no tiene el rol cotizacion")
+
+// ErrDestinoInvalidoEnViaje lo devuelve Transferir en una conversación
+// `tipo=viaje` cuando el destino es el id de un SUJETO y no un `sub` conocido
+// (DEC-148 #76): guardarlo como responsable dejaría un reclamo que nadie puede
+// ejercer. No cambia nada: el reclamo del llamante sigue activo. La frontera lo
+// traduce a 409 con `codigo` destino_invalido_en_viaje.
+var ErrDestinoInvalidoEnViaje = errors.New("reclamos: el destino del viaje es un id de sujeto, no un sub")
 
 // tipoSolicitud es Conversacion.tipo de la conversación de la solicitud.
 const tipoSolicitud = "solicitud"
+
+// tipoViaje es Conversacion.tipo de la conversación del viaje.
+const tipoViaje = "viaje"
 
 // Begin abre una transacción. El pool de chat de svc_mensajeria la satisface.
 type Begin interface {
@@ -340,7 +352,8 @@ func (s *Servicio) Liberar(ctx context.Context, tenantID, conversacionID, reclam
 // ErrConflictoVersion; origen que no es el responsable activo,
 // ErrNoEsResponsable (DEC-118). El reclamo nuevo abre en la versión siguiente de
 // la conversación, de modo que la previa queda obsoleta (P20). El motivo, si
-// viene, se audita (hecho inmutable, addendum §11).
+// viene, se audita (hecho inmutable, addendum §11). En `tipo=solicitud`,
+// `destino` es el id del sujeto en identidad y se traduce a su `sub` (DEC-148 #74).
 func (s *Servicio) Transferir(ctx context.Context, tenantID, conversacionID, origen, destino, motivo string, esperada msgtipos.VersionReclamo) error {
 	return s.transferir(ctx, tenantID, conversacionID, origen, destino, motivo, esperada, false)
 }
@@ -376,21 +389,51 @@ func (s *Servicio) transferir(ctx context.Context, tenantID, conversacionID, ori
 	if err != nil {
 		return err
 	}
-	// En la solicitud el destino debe ser `cotizacion` (DEC-148 #31). Se valida
-	// con el reclamo ya bloqueado y antes de cerrarlo: si falla, la tx se descarta
-	// y el reclamo del llamante no cambia. `destino` es el `sub` del token
-	// (actor_real del reclamo), no el sujeto_id: se busca por idp_subject, y sin
-	// idp_subject conocido falla cerrado.
+	// En la solicitud el destino debe ser `cotizacion` (DEC-148 #31). `destino` es
+	// el id del SUJETO en identidad (DEC-148 #74, DT-28), no el `sub`: se traduce a
+	// su idp_subject con la fila de rol_sujeto, y el reclamo del destino guarda ese
+	// `sub` (así el destino actúa sobre su reclamo, que se resuelve por el `sub` del
+	// token). La misma lectura valida el rol y da el `sub`, con FOR SHARE: una
+	// revocación o desactivación concurrente espera a que esta tx termine, así que
+	// no hay ventana entre validar el rol y abrir el reclamo. Se valida con el
+	// reclamo ya bloqueado y antes de cerrarlo: si falla, la tx se descarta y el
+	// reclamo del llamante no cambia. Falla cerrado: sujeto inexistente, sin
+	// idp_subject conocido, inactivo o sin el rol.
+	//
+	// En `tipo=viaje` el destino sigue siendo el `sub` tal cual (V1: no se traduce,
+	// no se valida el rol), con UN rechazo (DEC-148 #76): si el valor es el id de un
+	// sujeto (rol_sujeto.sujeto_id) y no un `sub` conocido (rol_sujeto.idp_subject),
+	// 409 destino_invalido_en_viaje; un `sub`, conocido o no, pasa como siempre. Sin
+	// FOR SHARE a propósito: es una sola sentencia (una sola foto de las dos
+	// búsquedas), el rechazo no escribe nada y la aceptación no depende de ningún rol
+	// ni activo de la fila, así que bloquearla no protege nada (una fila que aún no
+	// existe no se puede bloquear) y solo haría esperar al consumidor de roles.
 	if tipo == tipoSolicitud {
-		var esCotizacion bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto
-			                 WHERE idp_subject = $1 AND rol = 'cotizacion' AND activo)`,
-			destino).Scan(&esCotizacion); err != nil {
+		var sub, rol *string
+		var activo bool
+		err := tx.QueryRow(ctx,
+			`SELECT idp_subject, rol, activo FROM mensajeria.rol_sujeto WHERE sujeto_id = $1 FOR SHARE`,
+			destino).Scan(&sub, &rol, &activo)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrDestinoNoEsCotizacion
+		}
+		if err != nil {
 			return fmt.Errorf("reclamos: leer el rol del destino: %w", err)
 		}
-		if !esCotizacion {
+		if sub == nil || *sub == "" || rol == nil || *rol != "cotizacion" || !activo {
 			return ErrDestinoNoEsCotizacion
+		}
+		destino = *sub
+	} else if tipo == tipoViaje {
+		var esSujeto, esSub bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM mensajeria.rol_sujeto WHERE sujeto_id = $1),
+			        EXISTS (SELECT 1 FROM mensajeria.rol_sujeto WHERE idp_subject = $1)`,
+			destino).Scan(&esSujeto, &esSub); err != nil {
+			return fmt.Errorf("reclamos: leer si el destino es un sujeto: %w", err)
+		}
+		if esSujeto && !esSub {
+			return ErrDestinoInvalidoEnViaje
 		}
 	}
 	actual, _, err := versionConversacion(ctx, tx, tenantID, conversacionID)

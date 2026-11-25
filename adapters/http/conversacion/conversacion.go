@@ -548,6 +548,8 @@ func TraducirReclamo(err error) error {
 		return platformerrors.NewProhibido("solo el responsable activo libera o transfiere")
 	case errors.Is(err, reclamos.ErrDestinoNoEsCotizacion):
 		return platformerrors.NewConflictoCodigo("destino_no_es_cotizacion", "mensajeria: destino_no_es_cotizacion")
+	case errors.Is(err, reclamos.ErrDestinoInvalidoEnViaje):
+		return platformerrors.NewConflictoCodigo("destino_invalido_en_viaje", "mensajeria: destino_invalido_en_viaje")
 	}
 	return traducir(err)
 }
